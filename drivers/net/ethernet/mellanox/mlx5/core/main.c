@@ -74,6 +74,7 @@
 #include "mlx5_irq.h"
 #include "hwmon.h"
 #include "lag/lag.h"
+#include "vfmig.h"
 
 MODULE_AUTHOR("Eli Cohen <eli@mellanox.com>");
 MODULE_DESCRIPTION("Mellanox 5th generation network adapters (ConnectX series) core driver");
@@ -1152,9 +1153,15 @@ static void mlx5_cleanup_once(struct mlx5_core_dev *dev)
 	mlx5_devcom_unregister_device(dev->priv.devc);
 }
 
-static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeout)
+static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeout,
+				bool *restored_out)
 {
+	u16 restored_vhca_id = 0;
+	bool restored = false;
 	int err;
+
+	if (restored_out)
+		*restored_out = false;
 
 	mlx5_core_info(dev, "firmware version: %d.%d.%d\n", fw_rev_maj(dev),
 		       fw_rev_min(dev), fw_rev_sub(dev));
@@ -1185,6 +1192,78 @@ static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeou
 
 	dev->caps.embedded_cpu = mlx5_read_embedded_cpu(dev);
 	mlx5_cmd_set_state(dev, MLX5_CMDIF_STATE_UP);
+
+	/*
+	 * Restored VF bring-up.
+	 *
+	 * Order rationale (bisected on CX-7, FW 28.48.1000):
+	 *
+	 *   - LOAD_VHCA_STATE only works on a VHCA that has been
+	 *     enabled by the PF (during sriov_numvfs) and has had no
+	 *     other firmware command issued against it. Any pre-LOAD
+	 *     VHCA-side command -- ENABLE_HCA(function_id=0), SET_ISSI,
+	 *     MANAGE_PAGES (SATISFY_STARTUP_PAGES) or INIT_HCA --
+	 *     mutates VHCA state off the saved-blob shape and FW
+	 *     returns LOAD with bad parameter (syndrome 0x2c9bb0).
+	 *
+	 *   - LOAD_VHCA_STATE succeeds in the cleared state above, but
+	 *     the destination's own command interface is afterwards
+	 *     non-functional on a native (non-VFIO, non-VM) probe: FW
+	 *     silently drops commands on the destination's cmd ring
+	 *     because the blob captured the source's host-ownership
+	 *     view of that ring. ENABLE_HCA(self) issued post-LOAD
+	 *     also times out. This is the FW design constraint
+	 *     documented at the top of vfmig.h; resolving it requires
+	 *     deterministic IOVAs (i.e. an IOMMU) so the destination
+	 *     can reproduce the source's address layout.
+	 *
+	 * For now we still take the LOAD path so the SAVE+LOAD plumbing
+	 * is exercised end-to-end and the architectural finding stays
+	 * reproducible. We then attempt ENABLE_HCA(self) on the cleared-
+	 * VHCA cmd ring; on FW versions where the post-LOAD cmd ring is
+	 * dead, that times out and the bind fails -- which is the
+	 * correct loud failure to expose to userspace.
+	 *
+	 * SET_ISSI / SATISFY_STARTUP_PAGES / INIT_HCA stay skipped: the
+	 * blob already carries ISSI version, all VHCA pages and
+	 * INIT_HCA-equivalent state from the source.
+	 */
+	if (mlx5_vfmig_vf_consume_restored(dev, &restored_vhca_id)) {
+		restored = true;
+		if (restored_out)
+			*restored_out = true;
+
+		err = mlx5_vfmig_vf_apply_pending_load(dev);
+		if (err) {
+			mlx5_core_err(dev,
+				      "vfmig: apply LOAD_VHCA_STATE failed for vhca_id 0x%04x: %d\n",
+				      restored_vhca_id, err);
+			goto err_cmd_cleanup;
+		}
+
+		err = mlx5_core_enable_hca(dev, 0);
+		if (err) {
+			/*
+			 * Any error here is informational: either FW
+			 * reports "already enabled" (LOAD restored a VHCA
+			 * the source had already brought up), or the
+			 * post-LOAD cmd ring is dead and this command
+			 * timed out. Either way, log and let the next
+			 * VHCA-targeted command (mlx5_query_hca_caps in
+			 * mlx5_function_open) surface the real state.
+			 */
+			mlx5_core_warn(dev,
+				       "vfmig: post-LOAD ENABLE_HCA(self) returned %d for vhca_id 0x%04x; continuing\n",
+				       err, restored_vhca_id);
+		}
+
+		mlx5_start_health_poll(dev);
+
+		mlx5_core_info(dev,
+			       "vfmig: VF (vhca_id 0x%04x) restored; SET_ISSI/boot-pages/INIT_HCA skipped\n",
+			       restored_vhca_id);
+		return 0;
+	}
 
 	err = mlx5_core_enable_hca(dev, 0);
 	if (err) {
@@ -1235,9 +1314,20 @@ static void mlx5_function_disable(struct mlx5_core_dev *dev, bool boot)
 	mlx5_cmd_disable(dev);
 }
 
-static int mlx5_function_open(struct mlx5_core_dev *dev)
+static int mlx5_function_open(struct mlx5_core_dev *dev, bool restored)
 {
 	int err;
+
+	/*
+	 * Restored VFs take a different bring-up path. Their entire VHCA
+	 * state (caps, pages, queues) lives in the LOAD blob that was
+	 * already applied inside mlx5_function_enable. Skip every command
+	 * that would re-mutate VHCA state (set_hca_ctrl, set_hca_cap,
+	 * satisfy_startup_pages, INIT_HCA); mlx5_query_hca_caps still runs
+	 * so the kernel learns the post-restore cap layout.
+	 */
+	if (restored)
+		goto post_init_hca;
 
 	err = set_hca_ctrl(dev);
 	if (err) {
@@ -1263,6 +1353,7 @@ static int mlx5_function_open(struct mlx5_core_dev *dev)
 		return err;
 	}
 
+post_init_hca:
 	mlx5_set_driver_version(dev);
 
 	err = mlx5_query_hca_caps(dev);
@@ -1289,13 +1380,14 @@ static int mlx5_function_close(struct mlx5_core_dev *dev)
 
 static int mlx5_function_setup(struct mlx5_core_dev *dev, bool boot, u64 timeout)
 {
+	bool restored = false;
 	int err;
 
-	err = mlx5_function_enable(dev, boot, timeout);
+	err = mlx5_function_enable(dev, boot, timeout, &restored);
 	if (err)
 		return err;
 
-	err = mlx5_function_open(dev);
+	err = mlx5_function_open(dev, restored);
 	if (err)
 		mlx5_function_disable(dev, boot);
 	return err;
@@ -1496,6 +1588,16 @@ int mlx5_init_one_devl_locked(struct mlx5_core_dev *dev)
 		mlx5_core_err(dev, "mlx5_hwmon_dev_register failed with error code %d\n", err);
 
 	mutex_unlock(&dev->intf_state_mutex);
+
+	/*
+	 * Register the per-PF /dev/mlx5_vfmig cdev. Done after dropping
+	 * intf_state_mutex to keep cdev / device class APIs out of any
+	 * mlx5 lock ordering. No-ops on VFs. Failure is non-fatal: the
+	 * device works without the host-driven migration interface.
+	 */
+	if (mlx5_vfmig_pf_init(dev))
+		mlx5_core_warn(dev, "vfmig: cdev init failed; migration knob unavailable\n");
+
 	return 0;
 
 err_register:
@@ -1531,6 +1633,13 @@ int mlx5_init_one(struct mlx5_core_dev *dev)
 void mlx5_uninit_one(struct mlx5_core_dev *dev)
 {
 	struct devlink *devlink = priv_to_devlink(dev);
+
+	/*
+	 * Drop the cdev before any device-state cleanup so that userspace
+	 * opens of /dev/mlx5_vfmig/<bdf> are sealed off first. No-op on VFs
+	 * and on PFs where pf_init failed or wasn't called.
+	 */
+	mlx5_vfmig_pf_cleanup(dev);
 
 	devl_lock(devlink);
 	mutex_lock(&dev->intf_state_mutex);
@@ -1690,7 +1799,7 @@ int mlx5_init_one_light(struct mlx5_core_dev *dev)
 	devl_lock(devlink);
 	devl_register(devlink);
 	dev->state = MLX5_DEVICE_STATE_UP;
-	err = mlx5_function_enable(dev, true, mlx5_tout_ms(dev, FW_PRE_INIT_TIMEOUT));
+	err = mlx5_function_enable(dev, true, mlx5_tout_ms(dev, FW_PRE_INIT_TIMEOUT), NULL);
 	if (err) {
 		mlx5_core_warn(dev, "mlx5_function_enable err=%d\n", err);
 		goto out;
@@ -2381,6 +2490,10 @@ static int __init mlx5_init(void)
 	if (err)
 		goto err_sf;
 
+	err = mlx5_vfmig_module_init();
+	if (err)
+		goto err_vfmig;
+
 	err = pci_register_driver(&mlx5_core_driver);
 	if (err)
 		goto err_pci;
@@ -2388,6 +2501,8 @@ static int __init mlx5_init(void)
 	return 0;
 
 err_pci:
+	mlx5_vfmig_module_exit();
+err_vfmig:
 	mlx5_sf_driver_unregister();
 err_sf:
 	mlx5e_cleanup();
@@ -2399,6 +2514,7 @@ err_debug:
 static void __exit mlx5_cleanup(void)
 {
 	pci_unregister_driver(&mlx5_core_driver);
+	mlx5_vfmig_module_exit();
 	mlx5_sf_driver_unregister();
 	mlx5e_cleanup();
 	mlx5_unregister_debugfs();
