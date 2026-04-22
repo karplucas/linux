@@ -116,4 +116,48 @@ struct mlx5_vfmig_load_state {
 #define MLX5_VFMIG_IOC_LOAD_VHCA_STATE \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x04, struct mlx5_vfmig_load_state)
 
+/*
+ * MLX5_VFMIG_IOC_SAVE_VHCA_STATE:
+ *   Open a read-only data session that captures a VF's current firmware
+ *   state into a blob byte-compatible with LOAD_VHCA_STATE's input.
+ *
+ *   On the ioctl call, the driver synchronously:
+ *     - queries the VF's vhca_id via QUERY_HCA_CAP(other_function=1)
+ *     - SUSPEND_VHCA(INITIATOR), SUSPEND_VHCA(RESPONDER) to quiesce
+ *     - QUERY_VHCA_MIGRATION_STATE to size the snapshot
+ *     - allocates a PD + image pages + MKEY (DMA_FROM_DEVICE)
+ *     - SAVE_VHCA_STATE to populate the pages
+ *   then returns @save_fd, an anon-inode fd. Userspace read()s the blob
+ *   from it (any chunk size) until EOF. The first read also emits a
+ *   16-byte FW_DATA record header (record_size, flags=0, tag=0) so the
+ *   resulting byte stream can be fed verbatim back into
+ *   MLX5_VFMIG_IOC_LOAD_VHCA_STATE.
+ *
+ *   Resume policy on close():
+ *     By default the driver issues RESUME_VHCA(RESPONDER) and
+ *     RESUME_VHCA(INITIATOR) when the fd is released, leaving the source
+ *     VF runnable again. Set MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED to
+ *     skip the resume (e.g. CRIU dump-then-destroy where the VF is
+ *     about to be torn down via sriov_numvfs=0 anyway).
+ *
+ *   Returns 0 with @save_fd populated on success, -EINVAL if vf_id is
+ *   out of range or @flags has unknown bits, -EBUSY if a save session
+ *   already exists for this vf_id, -ENODEV if the PF is gone, or any
+ *   firmware error code (negated) if a SUSPEND/QUERY/SAVE step fails.
+ *   On firmware failure no fd is returned and the VHCA is left as
+ *   undisturbed as possible (failed SUSPENDs are not "undone").
+ */
+#define MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED	(1u << 0)
+#define MLX5_VFMIG_SAVE_FLAG_ALL \
+	(MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED)
+
+struct mlx5_vfmig_save_state {
+	__u32 vf_id;	/* in  */
+	__u32 flags;	/* in: subset of MLX5_VFMIG_SAVE_FLAG_* */
+	__s32 save_fd;	/* out */
+	__u32 reserved;
+};
+#define MLX5_VFMIG_IOC_SAVE_VHCA_STATE \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x05, struct mlx5_vfmig_save_state)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */
