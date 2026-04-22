@@ -1,21 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * mlx5_vfmig - tiny userspace helper for the M1' /dev/mlx5_vfmig/<bdf>
- * cdev. Intended for development and triage; production users should
- * speak the ioctls from a real CRIU plugin.
+ * mlx5_vfmig - tiny userspace helper for the /dev/mlx5_vfmig/<bdf> cdev.
+ * Intended for development and triage; production users should speak the
+ * ioctls from a real CRIU plugin.
  *
  * Build:
  *   cc -O2 -Wall -o mlx5_vfmig mlx5_vfmig.c
  *
  * Use:
- *   mlx5_vfmig <pf-bdf> {mark_restored|mark-restored} <vf_id>
- *   mlx5_vfmig <pf-bdf> {get_vhca_id|get-vhca-id}     <vf_id>
- *   mlx5_vfmig <pf-bdf> {query_vf|query-vf}           <vf_id>
+ *   mlx5_vfmig <pf-bdf> mark_restored    <vf_id>
+ *   mlx5_vfmig <pf-bdf> get_vhca_id      <vf_id>
+ *   mlx5_vfmig <pf-bdf> query_vf         <vf_id>
  *   mlx5_vfmig <pf-bdf> list
+ *   mlx5_vfmig <pf-bdf> load_vhca_state  <vf_id> <blob_path>
+ *
+ * Verbs accept either '_' or '-' between words.
  *
  * Examples:
- *   mlx5_vfmig 0000:00:08.0 mark_restored 0
  *   mlx5_vfmig 0000:00:08.0 list
+ *   mlx5_vfmig 0000:00:08.0 load_vhca_state 0 /tmp/vf.blob
+ *   mlx5_vfmig 0000:00:08.0 mark_restored 0
  */
 
 #include <errno.h>
@@ -25,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "../../../include/uapi/linux/mlx5_vfmig.h"
@@ -98,10 +103,6 @@ static int do_list(int fd)
 	unsigned int i, n;
 	int err;
 
-	/*
-	 * vf 0 may not exist (PF has 0 VFs). Use ERANGE handling: the
-	 * kernel always returns num_vfs even on out-of-range.
-	 */
 	err = query_one(fd, 0, &info);
 	if (err && err != -ERANGE) {
 		errno = -err;
@@ -126,6 +127,98 @@ static int do_list(int fd)
 		printf("%-6u 0x%04x    %u\n",
 		       i, info.vhca_id, info.restored);
 	}
+	return 0;
+}
+
+static int pump_blob(int load_fd, int blob_fd, size_t *out_bytes)
+{
+	/*
+	 * Use a moderately large buffer so the FSM in the kernel sees
+	 * full records in fewer write() syscalls; partial writes are
+	 * also fine.
+	 */
+	enum { CHUNK = 1u << 16 };
+	char *buf = malloc(CHUNK);
+	size_t total = 0;
+
+	if (!buf)
+		return -ENOMEM;
+
+	for (;;) {
+		ssize_t r = read(blob_fd, buf, CHUNK);
+		ssize_t off = 0;
+
+		if (r == 0)
+			break;
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			free(buf);
+			return -errno;
+		}
+		while (off < r) {
+			ssize_t w = write(load_fd, buf + off, r - off);
+
+			if (w < 0) {
+				if (errno == EINTR)
+					continue;
+				free(buf);
+				return -errno;
+			}
+			if (w == 0) {
+				free(buf);
+				return -EIO;
+			}
+			off += w;
+			total += w;
+		}
+	}
+
+	free(buf);
+	*out_bytes = total;
+	return 0;
+}
+
+static int do_load(int fd, unsigned int vf_id, const char *blob_path)
+{
+	struct mlx5_vfmig_load_state arg = { .vf_id = vf_id };
+	int blob_fd, load_fd, err;
+	size_t bytes = 0;
+	struct stat st;
+
+	blob_fd = open(blob_path, O_RDONLY);
+	if (blob_fd < 0) {
+		fprintf(stderr, "open %s: %s\n", blob_path, strerror(errno));
+		return 1;
+	}
+	if (fstat(blob_fd, &st) == 0)
+		fprintf(stderr,
+			"vfmig: streaming %lld bytes from %s into vf %u\n",
+			(long long)st.st_size, blob_path, vf_id);
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_LOAD_VHCA_STATE, &arg) < 0) {
+		perror("LOAD_VHCA_STATE");
+		close(blob_fd);
+		return 1;
+	}
+	load_fd = arg.load_fd;
+
+	err = pump_blob(load_fd, blob_fd, &bytes);
+	close(blob_fd);
+	if (err) {
+		errno = -err;
+		fprintf(stderr,
+			"vfmig: write failed after %zu bytes: %s\n",
+			bytes, strerror(errno));
+		close(load_fd);
+		return 1;
+	}
+
+	if (close(load_fd) < 0) {
+		perror("close(load_fd)");
+		return 1;
+	}
+	printf("loaded %zu bytes of state into vf %u\n", bytes, vf_id);
 	return 0;
 }
 
@@ -155,9 +248,13 @@ static int looks_like_bdf(const char *s)
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-		"usage: %s <pf-bdf> <verb> [vf_id]\n"
-		"  verbs: mark_restored | get_vhca_id | query_vf  (require vf_id)\n"
-		"         list                                     (no vf_id)\n",
+		"usage: %s <pf-bdf> <verb> [args]\n"
+		"  mark_restored    <vf_id>\n"
+		"  get_vhca_id      <vf_id>\n"
+		"  query_vf         <vf_id>\n"
+		"  list\n"
+		"  load_vhca_state  <vf_id> <blob_path>\n"
+		"verbs accept '-' or '_' interchangeably\n",
 		argv0);
 }
 
@@ -167,26 +264,12 @@ int main(int argc, char **argv)
 	const char *target;
 	const char *verb;
 	int fd, ret;
-	unsigned int vf_id = 0;
-	int needs_vf_id;
 
 	if (argc < 3) {
 		usage(argv[0]);
 		return 2;
 	}
 	verb = argv[2];
-	needs_vf_id = !verb_eq(verb, "list");
-
-	if (needs_vf_id) {
-		if (argc != 4) {
-			usage(argv[0]);
-			return 2;
-		}
-		vf_id = strtoul(argv[3], NULL, 0);
-	} else if (argc != 3) {
-		usage(argv[0]);
-		return 2;
-	}
 
 	if (looks_like_bdf(argv[1])) {
 		snprintf(path, sizeof(path), "/dev/mlx5_vfmig/%s", argv[1]);
@@ -201,19 +284,36 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (verb_eq(verb, "mark_restored"))
-		ret = do_mark(fd, vf_id);
-	else if (verb_eq(verb, "get_vhca_id"))
-		ret = do_get(fd, vf_id);
-	else if (verb_eq(verb, "query_vf"))
-		ret = do_query(fd, vf_id);
-	else if (verb_eq(verb, "list"))
+	if (verb_eq(verb, "list")) {
+		if (argc != 3)
+			goto badargs;
 		ret = do_list(fd);
-	else {
+	} else if (verb_eq(verb, "mark_restored")) {
+		if (argc != 4)
+			goto badargs;
+		ret = do_mark(fd, strtoul(argv[3], NULL, 0));
+	} else if (verb_eq(verb, "get_vhca_id")) {
+		if (argc != 4)
+			goto badargs;
+		ret = do_get(fd, strtoul(argv[3], NULL, 0));
+	} else if (verb_eq(verb, "query_vf")) {
+		if (argc != 4)
+			goto badargs;
+		ret = do_query(fd, strtoul(argv[3], NULL, 0));
+	} else if (verb_eq(verb, "load_vhca_state")) {
+		if (argc != 5)
+			goto badargs;
+		ret = do_load(fd, strtoul(argv[3], NULL, 0), argv[4]);
+	} else {
 		fprintf(stderr, "unknown verb: %s\n", verb);
 		ret = 2;
 	}
 
 	close(fd);
 	return ret;
+
+badargs:
+	close(fd);
+	usage(argv[0]);
+	return 2;
 }

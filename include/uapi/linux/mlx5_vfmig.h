@@ -9,14 +9,22 @@
  * subsequently bound to mlx5_core, their probe path skips INIT_HCA and
  * instead adopts the firmware state previously installed by LOAD_VHCA_STATE.
  *
- * Lifecycle (destination side, prototype - M1'):
+ * Lifecycle (destination side):
  *   1. sriov_drivers_autoprobe = 0 on the PF
  *   2. sriov_numvfs = N on the PF        (VFs created, unbound)
  *   3. open /dev/mlx5_vfmig/<pf_bdf>
- *   4. ioctl(MLX5_VFMIG_IOC_MARK_RESTORED, vf_id)
- *      [M2: ioctl(MLX5_VFMIG_IOC_LOAD_STATE, ...) which includes the above]
- *   5. driver_override + bind on the VF
- *   6. mlx5_core probe skips INIT_HCA for that VF
+ *   4. ioctl(MLX5_VFMIG_IOC_LOAD_VHCA_STATE, vf_id)
+ *      -> returns a write-only anon-inode fd. Userspace write()s a
+ *         VFIO-mlx5-format state blob to it and close()s it.
+ *   5. ioctl(MLX5_VFMIG_IOC_MARK_RESTORED, vf_id)
+ *   6. driver_override + bind on the VF
+ *   7. mlx5_core probe skips INIT_HCA for that VF; subsequent firmware
+ *      commands see the state previously installed by step 4.
+ *
+ * Step 4 is optional in pure M1' tests: skip it if you only care about
+ * the INIT_HCA elision. The probe will then succeed up to INIT_HCA but
+ * fail at QUERY_ADAPTER with "bad system state" because the firmware
+ * refuses post-INIT_HCA commands without state being loaded.
  */
 
 #ifndef _UAPI_LINUX_MLX5_VFMIG_H
@@ -73,5 +81,39 @@ struct mlx5_vfmig_query_vf {
 };
 #define MLX5_VFMIG_IOC_QUERY_VF \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x03, struct mlx5_vfmig_query_vf)
+
+/*
+ * MLX5_VFMIG_IOC_LOAD_VHCA_STATE:
+ *   Open a write-only data session that consumes a previously-saved VF
+ *   state blob and installs it into the firmware via LOAD_VHCA_STATE.
+ *
+ *   The returned @load_fd is an anon-inode fd. Userspace write()s the
+ *   blob to it (chunked or whole; partial writes are fine) and close()s
+ *   it. The driver runs LOAD_VHCA_STATE per parsed image record.
+ *
+ *   Wire format:
+ *     The blob is byte-compatible with the migration data stream
+ *     produced by the VFIO mlx5 variant driver in
+ *     drivers/vfio/pci/mlx5/. It is a sequence of records, each
+ *     prefixed by a 16-byte header (record_size:le64, flags:le32,
+ *     tag:le32). Records carrying firmware state use tag 0
+ *     (MLX5_MIGF_HEADER_TAG_FW_DATA, kernel-internal name) and are
+ *     mandatory; unknown tags marked optional in flags are skipped,
+ *     unknown mandatory tags fail the write with -EOPNOTSUPP.
+ *     Userspace should treat the entire byte stream as opaque.
+ *
+ *   Returns 0 with @load_fd populated on success, -EINVAL if vf_id is
+ *   out of range or @flags is non-zero, -ENODEV if the PF is gone.
+ *   Closing the fd without writing anything is a no-op (no firmware
+ *   commands issued).
+ */
+struct mlx5_vfmig_load_state {
+	__u32 vf_id;	/* in  */
+	__u32 flags;	/* in: must be 0 for now */
+	__s32 load_fd;	/* out */
+	__u32 reserved;
+};
+#define MLX5_VFMIG_IOC_LOAD_VHCA_STATE \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x04, struct mlx5_vfmig_load_state)
 
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */
