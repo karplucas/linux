@@ -469,6 +469,19 @@ struct mlx5_vf_context {
 	 */
 	u8	port_guid_valid:1;
 	u8	node_guid_valid:1;
+	/*
+	 * Set by /dev/mlx5_vfmig MARK_RESTORED ioctl on the PF mdev. Read
+	 * (and consumed) by the next mlx5_core probe of this VF in
+	 * mlx5_function_open(), which uses it to skip INIT_HCA so that
+	 * firmware state previously installed by LOAD_VHCA_STATE survives.
+	 * @restored_vhca_id is captured at MARK_RESTORED time via
+	 * QUERY_HCA_CAP(other_function=1) and surfaced in the probe-time
+	 * log so that the VF-side message can identify the firmware vHCA
+	 * by id rather than just BDF (the BDF is already in the dev_info
+	 * prefix). See drivers/net/ethernet/mellanox/mlx5/core/vfmig.c.
+	 */
+	u8	restored:1;
+	u16	restored_vhca_id;
 	enum port_state_policy	policy;
 	struct blocking_notifier_head notifier;
 };
@@ -487,6 +500,7 @@ struct mlx5_lag;
 struct mlx5_devcom_dev;
 struct mlx5_fw_reset;
 struct mlx5_eq_table;
+struct mlx5_vfmig_pf;
 struct mlx5_irq_table;
 struct mlx5_sf_dev_table;
 struct mlx5_sf_hw_table;
@@ -629,6 +643,14 @@ struct mlx5_priv {
 	struct mlx5_sf_table *sf_table;
 #endif
 	struct blocking_notifier_head lag_nh;
+
+	/*
+	 * Per-PF state for the host-driven VF migration / CRIU restore cdev
+	 * (/dev/mlx5_vfmig/<bdf>). NULL on VFs and on PFs that haven't yet
+	 * registered the cdev. Owned by drivers/net/ethernet/mellanox/mlx5/
+	 * core/vfmig.c.
+	 */
+	struct mlx5_vfmig_pf *vfmig;
 };
 
 enum mlx5_device_state {
