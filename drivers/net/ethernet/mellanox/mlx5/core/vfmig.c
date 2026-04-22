@@ -837,7 +837,10 @@ out:
 	produced = (ssize_t)(count - left);
 	if (!produced && err)
 		return err;
-	*ppos += produced;
+	/*
+	 * stream_open() set FMODE_STREAM, so ksys_write() passes ppos==NULL.
+	 * Don't touch it.
+	 */
 	return produced;
 }
 
