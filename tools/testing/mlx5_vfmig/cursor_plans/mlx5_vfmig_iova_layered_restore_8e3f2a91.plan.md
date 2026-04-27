@@ -73,24 +73,21 @@ Layer ordering is not negotiable: each layer's success criterion presupposes the
 
 ## Layer 0: IOMMU domain + deterministic allocator + page registry
 
-### Layer 0 prereq A -- Kconfig
+### Layer 0 prereq A -- Kconfig (LANDED)
 
 We add `CONFIG_MLX5_VFMIG` in `drivers/net/ethernet/mellanox/mlx5/core/Kconfig`, default `y` when `MLX5_CORE=y` for development convenience but cleanly tristate so distros / production can disable. Files newly gated:
 
-- `drivers/net/ethernet/mellanox/mlx5/core/vfmig.c` (already present, currently unconditional -- closing this gap is a prereq, not new code)
-- `drivers/net/ethernet/mellanox/mlx5/core/vfmig.h`
-- `drivers/net/ethernet/mellanox/mlx5/core/vfmig_iova.{c,h}` (new in this plan)
-- The vfmig cdev registration in `dev.c` / `main.c`
-- The restored-VF branches in `mlx5_function_enable` / `mlx5_function_open`
-- The `MLX5_VFMIG_IOC_*` ioctls in `include/uapi/linux/mlx5_vfmig.h`
+- `drivers/net/ethernet/mellanox/mlx5/core/vfmig.c` -- now `mlx5_core-$(CONFIG_MLX5_VFMIG)` in the Makefile.
+- `drivers/net/ethernet/mellanox/mlx5/core/vfmig.h` -- the API surface stays declared either way; static-inline stubs in the disabled branch keep callers (`main.c`, `sriov.c`) free of `#ifdef`.
+- `drivers/net/ethernet/mellanox/mlx5/core/vfmig_iova.{c,h}` -- planned, will be gated the same way.
 
-When `CONFIG_MLX5_VFMIG=n`, `mlx5_core` builds and runs identically to a tree without any of this work; no cdev appears, no per-VF state, no probe-path branches.
+When `CONFIG_MLX5_VFMIG=n`, `mlx5_core` builds and runs identically to a tree without any of this work: no cdev appears, no per-VF state is allocated, no probe-path branches. Verified by toggling the symbol both ways and confirming clean `make drivers/net/ethernet/mellanox/mlx5/core/`.
 
-### Layer 0 prereq B -- per-VF tracked mode at probe time
+### Layer 0 prereq B -- per-VF tracked mode at probe time (LANDED, IOMMU attach stubbed)
 
 The existing `MLX5_VFMIG_IOC_ENABLE_MIGRATABLE` ioctl sets the firmware's "migratable" capability bit on a VF before probe. That is *necessary but not sufficient*: it tells FW that migration commands are allowed, but says nothing about whether mlx5_core's host-side allocators should use our IOVA layer or the stock DMA layer.
 
-We introduce a separate per-VF flag, `vfs_ctx[vf_id].vfmig_tracked`, settable via a new ioctl:
+We introduce a separate per-VF flag, `vfs_ctx[vf_id].vfmig_tracked`, settable via a new ioctl. Code as landed:
 
 ```c
 struct mlx5_vfmig_set_tracked {
@@ -100,15 +97,19 @@ struct mlx5_vfmig_set_tracked {
     __u32 reserved;
 };
 #define MLX5_VFMIG_IOC_SET_TRACKED \
-    _IOWR(MLX5_VFMIG_IOC_MAGIC, 0x06, struct mlx5_vfmig_set_tracked)
+    _IOW(MLX5_VFMIG_IOC_MAGIC, 0x07, struct mlx5_vfmig_set_tracked)
 ```
 
-Semantics:
+Note the ioctl number is **`0x07`**, not `0x06` -- `0x06` was already taken by `ENABLE_MIGRATABLE`. The struct has no out-fields, so `_IOW` is sufficient.
+
+Semantics (target):
 
 - **Must be called before the VF binds to mlx5_core.** Returns `-EBUSY` if a driver is currently bound to the VF.
 - On `enable=1`: allocates the per-VF IOMMU domain (if not already present), attaches it to the VF's `pci_dev`, sets `vfs_ctx[vf_id].vfmig_tracked = true`. Persists until either `enable=0` or PF unload.
 - On `enable=0`: detaches and frees the domain. Returns `-EBUSY` if the VF is currently bound (caller must unbind first).
 - The existing `ENABLE_MIGRATABLE` ioctl is unchanged. The two flags are orthogonal in the kernel; userspace will typically call both.
+
+What's currently in the kernel: just the flag toggle and the `mlx5_vf_is_vfmig_tracked()` helper. The IOMMU domain alloc/attach/detach + bind-state validation land together with the `vfmig_iova` module in the next step (it makes no sense to enforce "VF must be unbound" until there's a domain whose state would be at risk). Userspace can already issue `set_tracked 0 1` and `set_tracked 0 0` against the new ioctl and observe the `mlx5_core_info` log line; no behavioural change to the existing SAVE/LOAD path.
 
 Probe-side consumers:
 

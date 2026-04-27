@@ -50,6 +50,22 @@ static int do_enable_migratable(int fd, unsigned int vf_id)
 	return 0;
 }
 
+static int do_set_tracked(int fd, unsigned int vf_id, unsigned int enable)
+{
+	struct mlx5_vfmig_set_tracked arg = {
+		.vf_id  = vf_id,
+		.enable = enable ? 1 : 0,
+	};
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_SET_TRACKED, &arg) < 0) {
+		perror("SET_TRACKED");
+		return 1;
+	}
+	printf("vf %u: vfmig tracked=%u (call before driver bind)\n",
+	       vf_id, arg.enable);
+	return 0;
+}
+
 static int do_mark(int fd, unsigned int vf_id)
 {
 	struct mlx5_vfmig_mark_restored arg = { .vf_id = vf_id };
@@ -357,6 +373,7 @@ static void usage(const char *argv0)
 		"  load_vhca_state  <vf_id> <blob_path>\n"
 		"  save_vhca_state  <vf_id> <blob_path> [keep_suspended]\n"
 		"  enable_migratable <vf_id>\n"
+		"  set_tracked       <vf_id> <0|1>\n"
 		"verbs accept '-' or '_' interchangeably\n",
 		argv0);
 }
@@ -424,6 +441,11 @@ int main(int argc, char **argv)
 		if (argc != 4)
 			goto badargs;
 		ret = do_enable_migratable(fd, strtoul(argv[3], NULL, 0));
+	} else if (verb_eq(verb, "set_tracked")) {
+		if (argc != 5)
+			goto badargs;
+		ret = do_set_tracked(fd, strtoul(argv[3], NULL, 0),
+				     strtoul(argv[4], NULL, 0));
 	} else {
 		fprintf(stderr, "unknown verb: %s\n", verb);
 		ret = 2;

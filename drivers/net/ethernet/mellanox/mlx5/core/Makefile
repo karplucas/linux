@@ -17,8 +17,15 @@ mlx5_core-y :=	main.o cmd.o debugfs.o fw.o eq.o uar.o pagealloc.o \
 		fs_counters.o fs_ft_pool.o rl.o lag/debugfs.o lag/lag.o dev.o events.o wq.o lib/gid.o \
 		lib/devcom.o lib/pci_vsc.o lib/dm.o lib/fs_ttc.o diag/fs_tracepoint.o \
 		diag/fw_tracer.o diag/crdump.o devlink.o diag/rsc_dump.o diag/reporter_vnic.o \
-		fw_reset.o qos.o lib/tout.o lib/aso.o wc.o fs_pool.o lib/nv_param.o \
-		vfmig.o
+		fw_reset.o qos.o lib/tout.o lib/aso.o wc.o fs_pool.o lib/nv_param.o
+
+#
+# Host-driven VF migration / CRIU restore plumbing (cdev + ioctls +
+# deferred-load infrastructure). Compiles out cleanly when disabled --
+# stub inlines in vfmig.h keep the call sites in main.c / sriov.c
+# building either way.
+#
+mlx5_core-$(CONFIG_MLX5_VFMIG) += vfmig.o
 
 #
 # Netdev basic
