@@ -141,11 +141,15 @@ cmd_alloc_ent(struct mlx5_cmd *cmd, struct mlx5_cmd_msg *in,
 	ent->op         = in_to_opcode(in->first.data);
 	refcount_set(&ent->refcnt, 1);
 
+	pr_info("vfmig_dbg: cmd_alloc_ent ent=%px op=0x%x size=%zu\n",
+		ent, ent->op, sizeof(*ent));
 	return ent;
 }
 
 static void cmd_free_ent(struct mlx5_cmd_work_ent *ent)
 {
+	pr_info("vfmig_dbg: cmd_free_ent ent=%px op=0x%x idx=%d state=0x%lx\n",
+		ent, ent->op, ent->idx, ent->state);
 	kfree(ent);
 }
 
@@ -177,12 +181,15 @@ static int cmd_alloc_index(struct mlx5_cmd *cmd, struct mlx5_cmd_work_ent *ent)
 	}
 	spin_unlock_irqrestore(&cmd->alloc_lock, flags);
 
+	pr_info("vfmig_dbg: cmd_alloc_index op=0x%x idx=%d ent=%px refcnt=%d\n",
+		ent->op, ret, ent, refcount_read(&ent->refcnt));
 	return ret < cmd->vars.max_reg_cmds ? ret : -ENOMEM;
 }
 
 static void cmd_free_index(struct mlx5_cmd *cmd, int idx)
 {
 	lockdep_assert_held(&cmd->alloc_lock);
+	pr_info("vfmig_dbg: cmd_free_index idx=%d ent=%px\n", idx, cmd->ent_arr[idx]);
 	cmd->ent_arr[idx] = NULL;
 	set_bit(idx, &cmd->vars.bitmask);
 }
@@ -1801,6 +1808,14 @@ static void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec, bool force
 	for (i = 0; i < (1 << cmd->vars.log_sz); i++) {
 		if (test_bit(i, &vector)) {
 			ent = cmd->ent_arr[i];
+			pr_info("vfmig_dbg: comp_handler i=%d ent=%px forced=%d state=0x%lx ret=%d\n",
+				i, ent, forced, ent ? ent->state : 0,
+				ent ? ent->ret : 0);
+			if (!ent) {
+				pr_warn("vfmig_dbg: comp_handler ent_arr[%d]=NULL forced=%d vec=0x%llx\n",
+					i, forced, vec);
+				continue;
+			}
 
 			if (forced && ent->ret == -ETIMEDOUT)
 				set_bit(MLX5_CMD_ENT_STATE_TIMEDOUT,
@@ -1816,6 +1831,10 @@ static void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec, bool force
 				if (!forced) {
 					mlx5_core_err(dev, "Command completion arrived after timeout (entry idx = %d).\n",
 						      ent->idx);
+					pr_info("vfmig_dbg: AFTER_TIMEOUT idx=%d ent=%px op=0x%x state=0x%lx refcnt=%d\n",
+						ent->idx, ent, ent->op,
+						ent->state,
+						refcount_read(&ent->refcnt));
 					cmd_ent_put(ent);
 				}
 				continue;
