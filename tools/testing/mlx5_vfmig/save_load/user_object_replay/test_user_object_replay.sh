@@ -37,13 +37,35 @@
 # and the harness expects total = N_MR + N_CQ + N_QP + N_SRQ + N_DBR
 # matching what the probe reports.
 #
+# Multi-page MR regression
+# ------------------------
+# NUM_UNALIGNED_MRS=U adds U MRs whose umem straddles two pages
+# (4 KiB at byte offset 0x800 inside a 2-page buffer). Each
+# unaligned MR contributes 1 (rare, physically-contiguous backing
+# pages) or 2 (typical, anonymous user pages aren't contiguous)
+# external entries that share a single VFMIG_HUOBJ_KEY(KIND_MR,
+# mkey_index). When U > 0 the harness switches the MR / TOTAL
+# assertions from exact-match to range-match
+# [expected_min, expected_max], where the bounds are derived from
+# the probe's expected_mr / expected_mr_max manifest lines. A
+# regression that re-introduces the secondary-index multi-page bug
+# manifests as obs_mr == NUM_MRS (i.e. obs_mr < expected_min: the
+# unaligned MRs were silently dropped) and trips a loud failure.
+#
 # Optional knobs:
 #   BLOB       SAVE blob path (default /tmp/user_object_replay.blob).
-#   NUM_MRS    How many MRs the probe registers (default 4).
+#   NUM_MRS    How many page-aligned MRs the probe registers
+#              (default 4).
+#   NUM_UNALIGNED_MRS  How many additional multi-page MRs the probe
+#              registers (default 0). When > 0 the MR and TOTAL
+#              assertions widen to a [min, max] range.
 #   TOOL       mlx5_vfmig CLI (default $ROOT_DIR/tools/mlx5_vfmig).
 #   PROBE      user_object_replay_probe (default $SCRIPT_DIR/...).
 #   EXPECT_*_COUNT  Override the auto-calibrated value for any of MR,
 #                   CQ, QP, SRQ, DBR. Useful for negative controls.
+#                   For MR / TOTAL with NUM_UNALIGNED_MRS > 0,
+#                   setting EXPECT_*_COUNT pins the range to a single
+#                   value (exact-match).
 #   EXPECT_TOTAL  If set, overrides the sum of the per-kind expectations.
 
 set -euo pipefail
@@ -56,6 +78,7 @@ TOOL=${TOOL:-$ROOT_DIR/tools/mlx5_vfmig}
 PROBE=${PROBE:-$SCRIPT_DIR/user_object_replay_probe}
 BLOB=${BLOB:-/tmp/user_object_replay.blob}
 NUM_MRS=${NUM_MRS:-4}
+NUM_UNALIGNED_MRS=${NUM_UNALIGNED_MRS:-0}
 
 # EXPECT_*_COUNT defaults are deferred to after Phase B captures the
 # probe's manifest, so they pick up the probe-emitted expected_*
@@ -138,12 +161,15 @@ find_ib_dev_for_pci() {
 start_src_probe() {
     local ibdev=$1
     local num_mrs=$2
+    local num_unaligned_mrs=$3
     local fifo_in="$WORKDIR/src.in"
     local fifo_out="$WORKDIR/src.out"
 
     mkfifo "$fifo_in" "$fifo_out"
-    echo "=== source probe: $PROBE $ibdev --num-mrs $num_mrs ==="
-    sudo "$PROBE" "$ibdev" --num-mrs "$num_mrs" \
+    echo "=== source probe: $PROBE $ibdev --num-mrs $num_mrs --num-unaligned-mrs $num_unaligned_mrs ==="
+    sudo "$PROBE" "$ibdev" \
+        --num-mrs "$num_mrs" \
+        --num-unaligned-mrs "$num_unaligned_mrs" \
         < "$fifo_in" > "$fifo_out" 2>&1 &
     SRC_PROBE_PID=$!
     exec 7> "$fifo_in"
@@ -194,27 +220,36 @@ echo "source ibdev: $SRC_IBDEV"
 
 # --- Phase B: source probe ------------------------------------------
 
-echo "=== Phase B: source probe (registers $NUM_MRS MRs + CQ + QP +/- SRQ) ==="
+echo "=== Phase B: source probe (registers $NUM_MRS aligned + $NUM_UNALIGNED_MRS unaligned MRs + CQ + QP +/- SRQ) ==="
 sudo dmesg -C
-start_src_probe "$SRC_IBDEV" "$NUM_MRS"
+start_src_probe "$SRC_IBDEV" "$NUM_MRS" "$NUM_UNALIGNED_MRS"
 
 # Quick sanity dump of what the probe registered.
 echo "captured manifest:"
-echo "  src_pdn         = ${src_pdn:-?}"
-echo "  src_num_mrs     = ${src_num_mrs:-?}"
-echo "  src_cqn         = ${src_cqn:-?}"
-echo "  src_qpn         = ${src_qpn:-?}"
-echo "  src_srqn        = ${src_srqn:-?}"
-echo "  src_expected_mr = ${src_expected_mr:-?}"
-echo "  src_expected_cq = ${src_expected_cq:-?}"
-echo "  src_expected_qp = ${src_expected_qp:-?}"
-echo "  src_expected_srq= ${src_expected_srq:-?}"
+echo "  src_pdn               = ${src_pdn:-?}"
+echo "  src_num_mrs           = ${src_num_mrs:-?}"
+echo "  src_num_unaligned_mrs = ${src_num_unaligned_mrs:-?}"
+echo "  src_cqn               = ${src_cqn:-?}"
+echo "  src_qpn               = ${src_qpn:-?}"
+echo "  src_srqn              = ${src_srqn:-?}"
+echo "  src_expected_mr       = ${src_expected_mr:-?}"
+echo "  src_expected_mr_max   = ${src_expected_mr_max:-?}"
+echo "  src_expected_cq       = ${src_expected_cq:-?}"
+echo "  src_expected_qp       = ${src_expected_qp:-?}"
+echo "  src_expected_srq      = ${src_expected_srq:-?}"
 
 # Self-calibrate expectations against the probe-emitted manifest.
 # Env-var overrides on the harness command line still win (the inner
 # ${EXPECT_X:-...} expansion preserves any value already set in the
 # environment); only unset variables default to the probe's view.
+#
+# For MR specifically the probe emits both expected_mr (lower bound,
+# 1 entry per unaligned MR if backing pages happened to be contiguous)
+# and expected_mr_max (upper bound, 2 entries per unaligned MR --
+# typical for anonymous user pages). When U == 0 these collapse to
+# the same value and the assertion is exact-match.
 EXPECT_MR_COUNT=${EXPECT_MR_COUNT:-${src_expected_mr:-0}}
+EXPECT_MR_MAX=${EXPECT_MR_MAX:-${src_expected_mr_max:-$EXPECT_MR_COUNT}}
 EXPECT_CQ_COUNT=${EXPECT_CQ_COUNT:-${src_expected_cq:-0}}
 EXPECT_QP_COUNT=${EXPECT_QP_COUNT:-${src_expected_qp:-0}}
 EXPECT_SRQ_COUNT=${EXPECT_SRQ_COUNT:-${src_expected_srq:-0}}
@@ -272,13 +307,19 @@ done <<<"$QUERY_OUT"
 
 # --- Verdict --------------------------------------------------------
 
-# Sum the per-kind expectations into a default total. Allow
-# EXPECT_TOTAL override for the corner case where the user wants to
-# assert the aggregate without specifying per-kind.
-expected_total_default=$(( EXPECT_MR_COUNT + EXPECT_CQ_COUNT +
-                           EXPECT_QP_COUNT + EXPECT_SRQ_COUNT +
-                           EXPECT_DBR_COUNT ))
-EXPECT_TOTAL=${EXPECT_TOTAL:-$expected_total_default}
+# Sum the per-kind expectations into a default total band. The MR
+# axis carries a range [EXPECT_MR_COUNT, EXPECT_MR_MAX] when unaligned
+# MRs are in play; collapse to a single value when the bounds match
+# (the legacy U=0 path). EXPECT_TOTAL / EXPECT_TOTAL_MAX are computed
+# the same way -- one number when MR is exact, a range when MR ranges.
+expected_total_min_default=$(( EXPECT_MR_COUNT + EXPECT_CQ_COUNT +
+                               EXPECT_QP_COUNT + EXPECT_SRQ_COUNT +
+                               EXPECT_DBR_COUNT ))
+expected_total_max_default=$(( EXPECT_MR_MAX + EXPECT_CQ_COUNT +
+                               EXPECT_QP_COUNT + EXPECT_SRQ_COUNT +
+                               EXPECT_DBR_COUNT ))
+EXPECT_TOTAL=${EXPECT_TOTAL:-$expected_total_min_default}
+EXPECT_TOTAL_MAX=${EXPECT_TOTAL_MAX:-$expected_total_max_default}
 
 obs_total=${obs_total:-?}
 obs_mr=${obs_by_kind_MR:-?}
@@ -290,33 +331,82 @@ obs_dbr=${obs_by_kind_DBR:-?}
 overall_rc=0
 fail_one() { echo "  FAIL: $1"; overall_rc=1; }
 
+# Render an [min, max] range as either "N" (when min==max) or
+# "[min..max]". Used in the verdict table so legacy exact-match runs
+# stay terse and only multi-page runs widen to the range form.
+fmt_range() {
+    local lo=$1 hi=$2
+    if [ "$lo" = "$hi" ]; then
+        printf "%s" "$lo"
+    else
+        printf "[%s..%s]" "$lo" "$hi"
+    fi
+}
+
+# Range-aware checker. Pass observed value, lo, hi, label.
+check_range() {
+    local obs=$1 lo=$2 hi=$3 label=$4
+    if [ "$obs" -lt "$lo" ] || [ "$obs" -gt "$hi" ]; then
+        if [ "$lo" = "$hi" ]; then
+            fail_one "$label: observed=$obs expected=$lo"
+        else
+            fail_one "$label: observed=$obs expected in [$lo, $hi]"
+        fi
+    fi
+}
+
+mr_expected_str=$(fmt_range "$EXPECT_MR_COUNT" "$EXPECT_MR_MAX")
+total_expected_str=$(fmt_range "$EXPECT_TOTAL" "$EXPECT_TOTAL_MAX")
+
 echo
 echo "================ STAGE-2 USER OBJECT REPLAY VERDICT ====="
 echo "  source (probe-emitted):"
-echo "    pdn         = ${src_pdn:-?}"
-echo "    num_mrs     = ${src_num_mrs:-?}"
-echo "    cqn         = ${src_cqn:-?}, qpn = ${src_qpn:-?}, srqn = ${src_srqn:-?}"
+echo "    pdn               = ${src_pdn:-?}"
+echo "    num_mrs (aligned) = ${src_num_mrs:-?}"
+echo "    num_unaligned_mrs = ${src_num_unaligned_mrs:-?}"
+echo "    cqn               = ${src_cqn:-?}, qpn = ${src_qpn:-?}, srqn = ${src_srqn:-?}"
 echo
 echo "  destination (QUERY_AWAITING_BIND on dst vf 0):"
-printf "    %-12s %-8s %-8s\n" "kind" "observed" "expected"
-printf "    %-12s %-8s %-8s\n" "----" "--------" "--------"
-printf "    %-12s %-8s %-8s\n" "MR"    "$obs_mr"  "$EXPECT_MR_COUNT"
-printf "    %-12s %-8s %-8s\n" "CQ"    "$obs_cq"  "$EXPECT_CQ_COUNT"
-printf "    %-12s %-8s %-8s\n" "QP"    "$obs_qp"  "$EXPECT_QP_COUNT"
-printf "    %-12s %-8s %-8s\n" "SRQ"   "$obs_srq" "$EXPECT_SRQ_COUNT"
-printf "    %-12s %-8s %-8s\n" "DBR"   "$obs_dbr" "$EXPECT_DBR_COUNT"
-printf "    %-12s %-8s %-8s\n" "TOTAL" "$obs_total" "$EXPECT_TOTAL"
+printf "    %-12s %-10s %s\n" "kind" "observed" "expected"
+printf "    %-12s %-10s %s\n" "----" "--------" "--------"
+printf "    %-12s %-10s %s\n" "MR"    "$obs_mr"    "$mr_expected_str"
+printf "    %-12s %-10s %s\n" "CQ"    "$obs_cq"    "$EXPECT_CQ_COUNT"
+printf "    %-12s %-10s %s\n" "QP"    "$obs_qp"    "$EXPECT_QP_COUNT"
+printf "    %-12s %-10s %s\n" "SRQ"   "$obs_srq"   "$EXPECT_SRQ_COUNT"
+printf "    %-12s %-10s %s\n" "DBR"   "$obs_dbr"   "$EXPECT_DBR_COUNT"
+printf "    %-12s %-10s %s\n" "TOTAL" "$obs_total" "$total_expected_str"
 echo
 
-[ "$obs_total" = "$EXPECT_TOTAL" ] || fail_one "total: observed=$obs_total expected=$EXPECT_TOTAL"
-[ "$obs_mr"    = "$EXPECT_MR_COUNT" ]    || fail_one "MR:    observed=$obs_mr expected=$EXPECT_MR_COUNT"
+# MR / TOTAL: range checks (collapse to exact-match when min == max).
+# Other kinds remain exact-match.
+if [ "$obs_total" != "?" ]; then
+    check_range "$obs_total" "$EXPECT_TOTAL" "$EXPECT_TOTAL_MAX" "total"
+else
+    fail_one "total: observed=? (probe never emitted obs_total)"
+fi
+if [ "$obs_mr" != "?" ]; then
+    check_range "$obs_mr" "$EXPECT_MR_COUNT" "$EXPECT_MR_MAX" "MR"
+    # Multi-page-bug-specific signature: exactly num_aligned_mrs
+    # observed when unaligned MRs were registered, i.e. the unaligned
+    # ones were silently dropped post-EEXIST. Print a targeted hint.
+    if [ "$NUM_UNALIGNED_MRS" -gt 0 ] &&
+       [ "$obs_mr" = "$NUM_MRS" ]; then
+        echo "  HINT: obs_mr == NUM_MRS == $NUM_MRS while $NUM_UNALIGNED_MRS unaligned MRs were registered."
+        echo "        This is the secondary-index multi-page regression signature:"
+        echo "        retag rolled both pages back to KIND_NONE, SAVE emitted zero"
+        echo "        HOST_USER_PAGE records for those MRs. Check the kernel has the"
+        echo "        (instance_key, iova) composite-key fix landed on vfmig_iova.c."
+    fi
+else
+    fail_one "MR: observed=? (no obs_by_kind_MR line in QUERY output)"
+fi
 [ "$obs_cq"    = "$EXPECT_CQ_COUNT" ]    || fail_one "CQ:    observed=$obs_cq expected=$EXPECT_CQ_COUNT"
 [ "$obs_qp"    = "$EXPECT_QP_COUNT" ]    || fail_one "QP:    observed=$obs_qp expected=$EXPECT_QP_COUNT"
 [ "$obs_srq"   = "$EXPECT_SRQ_COUNT" ]   || fail_one "SRQ:   observed=$obs_srq expected=$EXPECT_SRQ_COUNT"
 [ "$obs_dbr"   = "$EXPECT_DBR_COUNT" ]   || fail_one "DBR:   observed=$obs_dbr expected=$EXPECT_DBR_COUNT"
 
 if [ "$overall_rc" = 0 ]; then
-    if [ "$EXPECT_TOTAL" = 0 ]; then
+    if [ "$EXPECT_TOTAL" = 0 ] && [ "$EXPECT_TOTAL_MAX" = 0 ]; then
         echo "  BASELINE PASS (C3-era):"
         echo "      ioctl callable, no HOST_USER_PAGE records on the wire"
         echo "      (stage-2 SAVE emit / LOAD replay / source retag not"
@@ -327,9 +417,17 @@ if [ "$overall_rc" = 0 ]; then
     else
         echo "  FULL PASS:"
         echo "      source emit chain -> wire records -> destination"
-        echo "      placeholders all match across the $((EXPECT_TOTAL)) entries"
+        echo "      placeholders all match across the $total_expected_str entries"
         echo "      enumerated above. Stage-2 identity infrastructure is"
         echo "      empirically validated end-to-end."
+        if [ "$NUM_UNALIGNED_MRS" -gt 0 ]; then
+            echo
+            echo "      Multi-page MR coverage: $NUM_UNALIGNED_MRS unaligned MR(s)"
+            echo "      registered, observed $obs_mr MR entries (band $mr_expected_str)."
+            echo "      The (instance_key, iova) composite-key fix is empirically"
+            echo "      validated -- multi-page user objects survive SAVE/LOAD"
+            echo "      with siblings preserved."
+        fi
     fi
 else
     echo "  PARTIAL FAIL: see line-by-line above. Most likely cause(s):"
@@ -339,6 +437,13 @@ else
     echo "      wire tag handler)."
     echo "    - vfmig_iova_replay_external() returning early (-EEXIST or"
     echo "      -ERANGE on placeholder install -- check dmesg)."
+    if [ "$NUM_UNALIGNED_MRS" -gt 0 ]; then
+        echo "    - Multi-page MR regression: secondary index treating"
+        echo "      instance_key as unique, dropping the second sibling on"
+        echo "      retag with -EEXIST. Look for the HINT line above and"
+        echo "      verify drivers/net/ethernet/mellanox/mlx5/core/vfmig_iova.c"
+        echo "      has the (instance_key, iova) composite-key index."
+    fi
 fi
 echo
 

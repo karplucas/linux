@@ -30,23 +30,54 @@
  * baseline observation: ioctl callable, no replay records on the wire,
  * no placeholders on the destination).
  *
+ * Multi-page MR coverage
+ * ----------------------
+ * --num-unaligned-mrs U adds U additional MRs whose umem straddles
+ * two pages: a 4 KiB MR registered at offset 0x800 inside a 2-page
+ * buffer. ib_umem_get pins both backing pages, and unless the buddy
+ * allocator happened to hand them out physically contiguous,
+ * sg_alloc_append_table_from_pages produces 2 sg entries -- one per
+ * page -- which then become 2 external registry entries via
+ * vfmig_dma_ops.map_sg. Each unaligned MR therefore contributes
+ * either 1 (rare, contiguous case) or 2 (typical) entries, sharing
+ * the same VFMIG_HUOBJ_KEY(KIND_MR, mkey_index).
+ *
+ * This is the regression case for the secondary-index multi-page
+ * bug: before the (instance_key, iova) composite-key fix landed, the
+ * second sibling's user_index_insert_locked() returned -EEXIST
+ * against the first sibling, the rollback wiped both pages back to
+ * KIND_NONE, and SAVE silently emitted ZERO HOST_USER_PAGE records
+ * for the MR. The destination would then trip RESTORE_MR with
+ * -ENOENT. With the fix in place each unaligned MR contributes >= 1
+ * entry; the harness asserts the [min, max] band so a regression
+ * back to obs_mr == num_aligned_mrs (i.e. unaligned MRs silently
+ * dropped) trips a loud failure.
+ *
  * Build:
  *   make -C tools/testing/mlx5_vfmig \
  *        save_load/user_object_replay/user_object_replay_probe
  *
  * Usage:
- *   ./user_object_replay_probe <ibdev> [--num-mrs N]
+ *   ./user_object_replay_probe <ibdev> [--num-mrs N] [--num-unaligned-mrs U]
  *
  *   <ibdev>      name of an ib_device exposed by the tracked VF
  *                (e.g. mlx5_2). The harness picks this up via
  *                find_ib_dev_for_pci() on the bound VF's BDF.
  *
- *   --num-mrs N  number of MRs to register (each 4 KiB).
- *                Default 4. Each MR's umem.sgt is mapped through
- *                vfmig_dma_ops.map_sg into the USER_PAGE slot, so N
- *                MRs yield N external registry entries -- the
- *                stage-2 retag landed in C6 will key each with
+ *   --num-mrs N  number of page-aligned 4 KiB MRs to register.
+ *                Default 4. Each MR's umem.sgt produces exactly 1
+ *                external registry entry -- the stage-2 retag
+ *                landed in C6 keys each with
  *                VFMIG_HUOBJ_KEY(KIND_MR, mkey_index).
+ *
+ *   --num-unaligned-mrs U  number of additional MRs whose umem
+ *                straddles two pages (4 KiB at offset 0x800 inside
+ *                a 2-page buffer). Default 0. Each unaligned MR
+ *                contributes 1 or 2 external entries depending on
+ *                physical-page contiguity; the manifest emits
+ *                expected_mr / expected_mr_max bounding the band.
+ *                Total array slots used = N + U, must be
+ *                <= MAX_NUM_MRS.
  */
 
 #include <errno.h>
@@ -61,6 +92,18 @@
 #define DEFAULT_NUM_MRS	4
 #define MAX_NUM_MRS	64
 #define MR_LEN		4096
+
+/*
+ * Per-page byte offset inside the 2-page umem buffer for unaligned
+ * MRs. 0x800 puts the MR registration at exactly mid-page, so
+ * [base+0x800, base+0x800+MR_LEN) covers the second half of page 0
+ * + the first half of page 1 -- guaranteed multi-page coverage
+ * (umem_offset + umem_length = 0x800 + 0x1000 = 0x1800 > PAGE_SIZE).
+ * Any non-zero offset whose sum-with-MR_LEN exceeds PAGE_SIZE works;
+ * 0x800 is just the cleanest mid-page split.
+ */
+#define UNALIGNED_MR_OFFSET	0x800
+#define UNALIGNED_MR_BUF_SIZE	(2 * 4096)
 
 static struct ibv_device *find_ibdev(const char *name)
 {
@@ -135,6 +178,8 @@ int main(int argc, char **argv)
 {
 	const char *ibdev_name;
 	int num_mrs = DEFAULT_NUM_MRS;
+	int num_unaligned_mrs = 0;
+	int total_mrs;
 	struct ibv_device *dev;
 	struct ibv_context *ctx = NULL;
 	struct ibv_pd *pd = NULL;
@@ -143,13 +188,21 @@ int main(int argc, char **argv)
 	struct ibv_srq *srq = NULL;
 	struct ibv_mr *mrs[MAX_NUM_MRS] = {};
 	void *mr_bufs[MAX_NUM_MRS] = {};
+	/*
+	 * mr_unaligned[i] flags slot i as an unaligned-buffer MR so the
+	 * teardown free()s the raw 2-page allocation rather than the
+	 * mid-page MR address (which is not a malloc base).
+	 */
+	int mr_unaligned[MAX_NUM_MRS] = {};
 	uint32_t pdn = 0, cqn = 0, qpn = 0, srqn = 0;
 	int srq_ok = 0;
 	int rc = 1;
 	int i;
 
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s <ibdev> [--num-mrs N]\n", argv[0]);
+		fprintf(stderr,
+			"usage: %s <ibdev> [--num-mrs N] [--num-unaligned-mrs U]\n",
+			argv[0]);
 		return 2;
 	}
 	ibdev_name = argv[1];
@@ -162,10 +215,28 @@ int main(int argc, char **argv)
 					MAX_NUM_MRS);
 				return 2;
 			}
+		} else if (!strcmp(argv[i], "--num-unaligned-mrs") &&
+			   i + 1 < argc) {
+			num_unaligned_mrs = atoi(argv[++i]);
+			if (num_unaligned_mrs < 0 ||
+			    num_unaligned_mrs > MAX_NUM_MRS) {
+				fprintf(stderr,
+					"uor: num-unaligned-mrs must be in [0, %d]\n",
+					MAX_NUM_MRS);
+				return 2;
+			}
 		} else {
 			fprintf(stderr, "uor: unknown arg '%s'\n", argv[i]);
 			return 2;
 		}
+	}
+
+	total_mrs = num_mrs + num_unaligned_mrs;
+	if (total_mrs > MAX_NUM_MRS) {
+		fprintf(stderr,
+			"uor: num-mrs (%d) + num-unaligned-mrs (%d) = %d exceeds MAX_NUM_MRS=%d\n",
+			num_mrs, num_unaligned_mrs, total_mrs, MAX_NUM_MRS);
+		return 2;
 	}
 
 	dev = find_ibdev(ibdev_name);
@@ -189,10 +260,10 @@ int main(int argc, char **argv)
 		goto out;
 
 	/*
-	 * N MRs. Each backed by a 4 KiB user buffer. The umem.sgt for
-	 * each MR is mapped through vfmig_dma_ops.map_sg into the
-	 * USER_PAGE slot of the per-VF vfmig_iova_domain, creating one
-	 * external registry entry per MR. C6 retags each entry with
+	 * Aligned MRs first. Each backed by a 4 KiB page-aligned user
+	 * buffer; ib_umem_get pins one page, sg_alloc_append_table_from
+	 * _pages produces one sg entry, vfmig_dma_ops.map_sg installs
+	 * one external registry entry. C6 retags each entry with
 	 * VFMIG_HUOBJ_KEY(KIND_MR, mkey_index = lkey >> 8).
 	 */
 	for (i = 0; i < num_mrs; i++) {
@@ -209,6 +280,47 @@ int main(int argc, char **argv)
 		if (!mrs[i]) {
 			fprintf(stderr,
 				"uor: ibv_reg_mr #%d failed: %s\n",
+				i, strerror(errno));
+			goto out;
+		}
+	}
+
+	/*
+	 * Unaligned MRs. Each backed by a 2-page buffer; the MR is
+	 * registered at offset UNALIGNED_MR_OFFSET inside the buffer
+	 * so the umem covers the second half of page 0 + the first
+	 * half of page 1. ib_umem_get pins both pages; the umem.sgt
+	 * yields 2 sg entries (typical: anonymous user pages aren't
+	 * physically contiguous) -> 2 external registry entries that
+	 * vfmig_iova_retag_external_range stamps with the SAME
+	 * (KIND_MR, mkey_index). Pre-fix this is exactly where
+	 * user_index_insert_locked tripped -EEXIST on the second
+	 * sibling and silently dropped the entire MR; post-fix the
+	 * composite-key index keeps both siblings under one key.
+	 */
+	for (i = 0; i < num_unaligned_mrs; i++) {
+		int slot = num_mrs + i;
+		void *raw;
+		void *mr_addr;
+
+		raw = aligned_alloc(4096, UNALIGNED_MR_BUF_SIZE);
+		if (!raw) {
+			fprintf(stderr,
+				"uor: aligned_alloc(unaligned MR %d) failed\n",
+				i);
+			goto out;
+		}
+		memset(raw, 0, UNALIGNED_MR_BUF_SIZE);
+		mr_bufs[slot] = raw;
+		mr_unaligned[slot] = 1;
+		mr_addr = (char *)raw + UNALIGNED_MR_OFFSET;
+		mrs[slot] = ibv_reg_mr(pd, mr_addr, MR_LEN,
+				       IBV_ACCESS_LOCAL_WRITE |
+				       IBV_ACCESS_REMOTE_WRITE |
+				       IBV_ACCESS_REMOTE_READ);
+		if (!mrs[slot]) {
+			fprintf(stderr,
+				"uor: ibv_reg_mr unaligned #%d failed: %s\n",
 				i, strerror(errno));
 			goto out;
 		}
@@ -292,14 +404,21 @@ int main(int argc, char **argv)
 	printf("ibdev=%s\n", ibdev_name);
 	printf("pdn=%u\n", pdn);
 	printf("num_mrs=%d\n", num_mrs);
-	for (i = 0; i < num_mrs; i++) {
+	printf("num_unaligned_mrs=%d\n", num_unaligned_mrs);
+	for (i = 0; i < total_mrs; i++) {
+		void *mr_addr;
+
+		mr_addr = mr_unaligned[i]
+			? (char *)mr_bufs[i] + UNALIGNED_MR_OFFSET
+			: mr_bufs[i];
 		printf("mr_%d_addr=0x%016llx\n", i,
-		       (unsigned long long)(uintptr_t)mr_bufs[i]);
+		       (unsigned long long)(uintptr_t)mr_addr);
 		printf("mr_%d_length=0x%016llx\n", i,
 		       (unsigned long long)MR_LEN);
 		printf("mr_%d_lkey=0x%08x\n", i, mrs[i]->lkey);
 		printf("mr_%d_rkey=0x%08x\n", i, mrs[i]->rkey);
 		printf("mr_%d_mkey_index=%u\n", i, mrs[i]->lkey >> 8);
+		printf("mr_%d_unaligned=%d\n", i, mr_unaligned[i]);
 	}
 	printf("cqn=%u\n", cqn);
 	printf("qpn=%u\n", qpn);
@@ -313,7 +432,16 @@ int main(int argc, char **argv)
 	 * MLX5_VFMIG_IOC_QUERY_AWAITING_BIND should report AFTER all of
 	 * C4 + C5 + C6..C10 of stage 2 have landed.
 	 *
-	 *   - MR: one external entry per ibv_reg_mr.
+	 *   - MR: aligned MRs contribute exactly 1 external entry each
+	 *         (single-page umem). Unaligned MRs contribute 1 OR 2
+	 *         depending on whether ib_umem_get's pinned 2-page run
+	 *         happens to be physically contiguous (rare; typical is
+	 *         non-contiguous => 2 sg entries => 2 registry entries
+	 *         sharing a single (KIND_MR, mkey_index)). The probe
+	 *         emits both bounds; the harness range-checks
+	 *         obs_mr in [expected_mr, expected_mr_max] when U > 0
+	 *         and falls back to the legacy exact-match comparison
+	 *         when U == 0 (expected_mr == expected_mr_max).
 	 *   - CQ: one external entry per ibv_create_cq's CQE-buffer
 	 *         umem (DBR is separate, accounted under KIND_DBR).
 	 *   - QP: one external entry per ibv_create_qp's send+recv
@@ -330,7 +458,8 @@ int main(int argc, char **argv)
 	 *          created) and the harness defaults EXPECT_DBR_COUNT
 	 *          to that floor.
 	 */
-	printf("expected_mr=%d\n", num_mrs);
+	printf("expected_mr=%d\n", num_mrs + num_unaligned_mrs);
+	printf("expected_mr_max=%d\n", num_mrs + 2 * num_unaligned_mrs);
 	printf("expected_cq=1\n");
 	printf("expected_qp=1\n");
 	printf("expected_srq=%d\n", srq_ok);
