@@ -2473,6 +2473,23 @@ static int alloc_cmd_page(struct mlx5_core_dev *dev, struct mlx5_cmd *cmd)
 					    GFP_KERNEL, &iova, &vaddr);
 		if (err)
 			return err;
+		/*
+		 * On a LOAD-replayed VF, vfmig_iova_alloc_slot returns the
+		 * cmd ring page with the source host's last cmd descriptor
+		 * still memcpy'd into it (vfmig_iova_replay_page restores
+		 * page contents verbatim). If we leave that in place, the
+		 * first cmd this driver issues on slot 0 races against
+		 * descriptor bytes the source authored -- empirically that
+		 * shows up as a 60s timeout on dest's first cmd post-LOAD
+		 * (known_issues.md §1.1). Scrub unconditionally; the cmd
+		 * ring is driver-side scaffolding whose initial state is
+		 * "all zeros" both for fresh probes and post-LOAD, and
+		 * mlx5_cmd_enable rewrites the descriptor layout before
+		 * any cmd is issued. The matching EQ-buf slot does the
+		 * equivalent via mlx5_dma_zalloc_coherent_node's
+		 * unconditional memset on the alloc path.
+		 */
+		memset(vaddr, 0, MLX5_ADAPTER_PAGE_SIZE);
 		cmd->vfmig_iova_dom = vfmig_dom;
 		cmd->cmd_alloc_buf = vaddr;
 		cmd->alloc_dma = iova;
