@@ -41,6 +41,7 @@
 #include <linux/anon_inodes.h>
 #include <linux/cdev.h>
 #include <linux/crc32.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/file.h>
@@ -1883,6 +1884,124 @@ static int vfmig_cmd_suspend_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
 	MLX5_SET(suspend_vhca_in, in, op_mod, op_mod);
 
 	return mlx5_cmd_exec_inout(pf_mdev, suspend_vhca, in, out);
+}
+
+/*
+ * Pre-SAVE drain barrier on the source VF's cmd interface.
+ *
+ * Asserts that the source VF mdev's cmd ring has zero in-flight
+ * commands. The mlx5_cmd allocator tracks per-slot busyness in
+ * @cmd->vars.bitmask (bit set = slot free). All-bits-set is the
+ * driver-visible signal that every command issued on this cmd
+ * interface has been FW-completed AND driver-processed (including
+ * comp_handler consuming the EQE), and no further completion
+ * processing is pending.
+ *
+ * Why this matters
+ * ----------------
+ * SAVE_VHCA_STATE captures FW-side state for the VF. If a command
+ * is still in flight when SUSPEND_VHCA fires, the FW snapshot is
+ * taken mid-command-execution and the destination's LOAD inherits
+ * an inconsistent cmd-processor state. Empirically this surfaces
+ * as a 60s timeout on the destination's first cmd-on-slot-0 post-
+ * LOAD; see known_issues.md §1.1 for the symptom.
+ *
+ * Failing SAVE here (rather than producing a poisoned LOAD blob)
+ * is the explicit policy choice: a stalled/failed SAVE is
+ * preferable to a stalled/failed LOAD because the user can react
+ * to the SAVE failure (retry, drain more state, abandon the
+ * checkpoint) before any cross-host state has been emitted.
+ *
+ * Lookup pattern
+ * --------------
+ * Mirrors vfmig_ioc_probe_uid (~line 1000): take device_lock on
+ * the VF pci_dev, verify the driver is mlx5_core and the mdev is
+ * interface-up, then read cmd->vars.bitmask under cmd->alloc_lock.
+ *
+ * Bounded poll
+ * ------------
+ * In practice the SAVE caller has already paused the user-mode
+ * workload (CRIU has frozen the process); the cmd interface
+ * should be idle on first read. Poll with a short timeout
+ * (VFMIG_SAVE_DRAIN_TIMEOUT_MS) so that we don't block the SAVE
+ * ioctl arbitrarily on a flaky workload that's still issuing
+ * cmds.
+ *
+ * Returns 0 if drained, -EBUSY on timeout (with a diagnostic
+ * dmesg line identifying the still-busy slot count), -ENODEV if
+ * the VF isn't bound or interface-up.
+ */
+#define VFMIG_SAVE_DRAIN_TIMEOUT_MS	5000
+#define VFMIG_SAVE_DRAIN_POLL_MS	10
+
+static int vfmig_save_drain_vf_cmd_iface(struct mlx5_core_dev *pf_mdev,
+					 struct pci_dev *vf_pdev,
+					 u32 vf_id)
+{
+	struct mlx5_core_dev *vf_mdev;
+	struct device_driver *drv;
+	unsigned long deadline;
+	unsigned long all_free;
+	unsigned long bitmask;
+	int max_reg_cmds;
+	int err;
+
+	device_lock(&vf_pdev->dev);
+
+	drv = vf_pdev->dev.driver;
+	if (!drv || strcmp(drv->name, KBUILD_MODNAME)) {
+		/*
+		 * VF not bound to mlx5_core. SAVE of an unbound VF is a
+		 * legitimate use case (the VF was already torn down by
+		 * the time SAVE runs); the cmd-interface drain doesn't
+		 * apply because there's no source cmd ring with state
+		 * that could be captured mid-flight. Caller can proceed
+		 * with SUSPEND_VHCA + SAVE_VHCA_STATE.
+		 */
+		err = 0;
+		goto out_unlock;
+	}
+
+	vf_mdev = pci_get_drvdata(vf_pdev);
+	if (!vf_mdev ||
+	    !test_bit(MLX5_INTERFACE_STATE_UP, &vf_mdev->intf_state)) {
+		/* Same rationale as the unbound case. */
+		err = 0;
+		goto out_unlock;
+	}
+
+	max_reg_cmds = vf_mdev->cmd.vars.max_reg_cmds;
+	all_free = (max_reg_cmds >= BITS_PER_LONG) ? ~0UL :
+		   ((1UL << max_reg_cmds) - 1);
+
+	deadline = jiffies + msecs_to_jiffies(VFMIG_SAVE_DRAIN_TIMEOUT_MS);
+	for (;;) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&vf_mdev->cmd.alloc_lock, flags);
+		bitmask = vf_mdev->cmd.vars.bitmask;
+		spin_unlock_irqrestore(&vf_mdev->cmd.alloc_lock, flags);
+
+		if ((bitmask & all_free) == all_free) {
+			err = 0;
+			goto out_unlock;
+		}
+
+		if (time_after_eq(jiffies, deadline))
+			break;
+
+		msleep(VFMIG_SAVE_DRAIN_POLL_MS);
+	}
+
+	mlx5_core_warn(pf_mdev,
+		       "vfmig: SAVE drain timeout on vf %u: cmd bitmask 0x%lx (expected 0x%lx); %u slots still in-flight\n",
+		       vf_id, bitmask, all_free,
+		       (unsigned int)hweight_long(all_free & ~bitmask));
+	err = -EBUSY;
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	return err;
 }
 
 static int vfmig_cmd_resume_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
@@ -3946,6 +4065,30 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	if (err)
 		goto err_pd;
 	ctx->pd_allocated = true;
+
+	/*
+	 * Drain barrier: assert the source VF cmd interface is idle
+	 * before we SUSPEND. Failing here is intentional -- a partially
+	 * in-flight cmd at SAVE time produces a poisoned LOAD blob
+	 * whose symptom is a 60s timeout on dest's first cmd-on-slot-0
+	 * (known_issues.md §1.1). Better to fail SAVE.
+	 */
+	{
+		struct pci_dev *vf_pdev;
+
+		vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+		if (vf_pdev) {
+			err = vfmig_save_drain_vf_cmd_iface(pf_mdev, vf_pdev,
+							    arg.vf_id);
+			pci_dev_put(vf_pdev);
+			if (err) {
+				mlx5_core_warn(pf_mdev,
+					       "vfmig: SAVE vf %u: pre-suspend drain failed: %d\n",
+					       arg.vf_id, err);
+				goto err_suspend;
+			}
+		}
+	}
 
 	/* Quiesce: initiator (egress) first, then responder (ingress). */
 	err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id,
