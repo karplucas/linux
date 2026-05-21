@@ -1089,7 +1089,7 @@ out_unlock:
  *
  * Issues a raw FW QUERY_QP(opcode 0x50b) on the bound VF's mdev for
  * the supplied qpn and reports the subset of the QPC needed by the
- * §6.3 piggyback experiment in tools/testing/mlx5_vfmig/design/uobject_restore.md.
+ * ?6.3 piggyback experiment in tools/testing/mlx5_vfmig/design/uobject_restore.md.
  *
  * VF mdev lookup mirrors vfmig_ioc_probe_uid: resolve the VF pci_dev
  * from the PF + vf_id, take device_lock to keep ->driver and drvdata
@@ -1191,11 +1191,11 @@ out_unlock:
 }
 
 /*
- * MLX5_VFMIG_IOC_PROBE_PD handler -- experimental, §S3b empirical.
+ * MLX5_VFMIG_IOC_PROBE_PD handler -- experimental, ?S3b empirical.
  *
  * Issues a transient CREATE_MKEY(uid, pd, access_mode=PA, length64=1)
  * followed by DESTROY_MKEY on the bound VF mdev's cmdif. The whole
- * point is to answer the §S3b question: "can a uid that has no
+ * point is to answer the ?S3b question: "can a uid that has no
  * destination-side ucontext owner still be used by FW to validate a
  * PD reference in a fresh CREATE_MKEY?" If yes (FW accepts), Model A
  * for mlx5_ib_restore_pd is sound: we can build a kernel-side
@@ -1338,11 +1338,11 @@ out_unlock:
 }
 
 /*
- * MLX5_VFMIG_IOC_PROBE_MKEY handler -- experimental, §S4b empirical.
+ * MLX5_VFMIG_IOC_PROBE_MKEY handler -- experimental, ?S4b empirical.
  *
  * Issues a single QUERY_MKEY(mkey_index) on the bound VF mdev's
  * cmdif and -- on FW accept -- reads back the mkc pd / qpn / len /
- * start_addr fields. The whole point is to answer the §S4b
+ * start_addr fields. The whole point is to answer the ?S4b
  * existence question: "Does the source's user-mode MKEY at index N
  * survive LOAD_VHCA_STATE intact, with the same pd/length/iova the
  * source had at SAVE time?" If yes, Model A for mlx5_ib_restore_mr
@@ -1889,7 +1889,7 @@ static int vfmig_cmd_suspend_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
 /*
  * Pre-SAVE drain barrier on the source VF's cmd interface.
  *
- * Three layers, in order:
+ * Two layers, in order:
  *
  *   1. Bitmask drain. Wait for cmd->vars.bitmask all-bits-set
  *      (every slot free); this is the driver-visible signal that
@@ -1897,35 +1897,24 @@ static int vfmig_cmd_suspend_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
  *      processed (cmd_free_index() flips the bit AFTER
  *      mlx5_cmd_comp_handler() has consumed the EQE).
  *
- *   2. FW-flush barriers. Issue a small number of cheap cmds
- *      (QUERY_ISSI) through the source VF mdev. Each barrier
- *      forces FW to (a) drain any internally-queued completions
- *      it still owes on the slot the barrier lands on, and (b)
- *      emit a fresh completion for the barrier itself. Driver
- *      consumes both EQEs back-to-back; the "extra" stale one
- *      fires the "Command completion arrived after timeout"
- *      warning on this source host -- harmless because the
- *      source process is being checkpointed anyway. The
- *      hypothesis is that FW carries per-VHCA "owed completion"
- *      state across SAVE/LOAD: empirically the destination's
- *      first cmd post-LOAD sees a stale completion arrive ~28ms
- *      after LOAD_VHCA_STATE applies (cmd.c:1817 "Command
- *      completion arrived after timeout (entry idx = 0)"),
- *      followed by the destination's CREATE_MKEY hanging the
- *      full 60s timeout window because FW's view of slot 0 is
- *      now out of sync with the destination driver's. Flushing
- *      owed completions on the source absorbs them there.
+ *   2. FW-flush barrier. Issue a single cheap cmd (QUERY_ISSI)
+ *      through the source VF mdev. The barrier lands on the
+ *      lowest-free slot (slot 0 after a clean drain); if FW has
+ *      an internally-queued completion it still owes on that
+ *      slot, FW emits the stale EQE before processing the
+ *      barrier. The driver consumes both EQEs back-to-back; the
+ *      stale one fires the "Command completion arrived after
+ *      timeout" warning on this source host -- harmless because
+ *      the source process is being checkpointed anyway -- and
+ *      FW's owed-completion queue is empty by the time
+ *      SUSPEND_VHCA snapshots it.
  *
- *   3. Empirical settle delay. After the barriers complete,
- *      optionally msleep() for vfmig_save_post_drain_settle_ms
- *      (module param, default 0). Knob exists for sweeping the
- *      empirical floor of how much FW settle time is needed
- *      beyond what the barrier cmds buy. Per scratch/run_2,
- *      120000 (120s) was needed to additionally clear
- *      SET_ROCE_ADDRESS / GID conflicts on the destination
- *      (known_issues.md §1.2 -- separate root cause, but
- *      empirically time-dependent like the cmd-iface drift, so
- *      the same knob serves both).
+ *      Empirically validated on FW 28.48.1000 with
+ *      swap_after_mr: a single QUERY_ISSI is sufficient to kick
+ *      FW past whatever post-cmd internal work was lagging.
+ *      Multi-cmd barrier rounds and explicit settle delays were
+ *      tried during diagnosis (commit 50e22b8ee071, superseded
+ *      by this commit) but not needed at v0.
  *
  * Why this matters
  * ----------------
@@ -1933,8 +1922,18 @@ static int vfmig_cmd_suspend_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
  * is still in flight when SUSPEND_VHCA fires, or if FW has owed
  * completions internally queued, the FW snapshot is taken mid-
  * command-execution and the destination's LOAD inherits an
- * inconsistent cmd-processor state. Failing SAVE here is
- * preferable to producing a poisoned LOAD blob.
+ * inconsistent cmd-processor state. The destination then sees
+ * "Command completion arrived after timeout (entry idx = 0)" ~28
+ * ms after LOAD_VHCA_STATE applies, followed by CREATE_MKEY
+ * hanging the full 60s timeout window in
+ * mlx5e_create_mdev_resources. See known_issues.md section 1.1
+ * for the full mechanism analysis.
+ *
+ * Failing SAVE here (rather than producing a poisoned LOAD blob)
+ * is the explicit policy choice: a stalled/failed SAVE is
+ * preferable to a stalled/failed LOAD because the user can react
+ * to the SAVE failure (retry, drain more state, abandon the
+ * checkpoint) before any cross-host state has been emitted.
  *
  * Lookup pattern
  * --------------
@@ -1943,86 +1942,27 @@ static int vfmig_cmd_suspend_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
  * interface-up, then read cmd->vars.bitmask under cmd->alloc_lock.
  *
  * Returns 0 on success. -EBUSY if the bitmask drain times out or
- * if a barrier cmd fails (with a diagnostic dmesg line in either
- * case). Returns 0 (with no work done) for unbound / not-up VFs;
- * SAVE on an unbound VF is a legitimate use case (the VF was
- * already torn down by the time SAVE runs) and there's no source
- * cmd ring to drain.
+ * if the barrier cmd fails (with a diagnostic dmesg line in
+ * either case). Returns 0 (with no work done) for unbound /
+ * not-up VFs; SAVE on an unbound VF is a legitimate use case
+ * (the VF was already torn down by the time SAVE runs) and
+ * there's no source cmd ring to drain.
  */
 #define VFMIG_SAVE_DRAIN_TIMEOUT_MS	5000
 #define VFMIG_SAVE_DRAIN_POLL_MS	10
-
-/*
- * Number of FW-flush barrier cmds to issue after the bitmask
- * drain. Each lands on the lowest-free slot (slot 0 for a fully
- * drained interface). The default of 4 is enough to absorb at
- * least 4 owed completions on slot 0 if FW had multiple queued;
- * the cost per barrier is one QUERY_ISSI cmd round-trip (~us).
- */
-static unsigned int vfmig_save_drain_barrier_cmds = 4;
-module_param_named(vfmig_save_drain_barrier_cmds,
-		   vfmig_save_drain_barrier_cmds, uint, 0644);
-MODULE_PARM_DESC(vfmig_save_drain_barrier_cmds,
-		 "Number of QUERY_ISSI barrier cmds to issue on the source VF mdev after the SAVE-time bitmask drain, to flush FW's internally-queued owed completions before SUSPEND_VHCA. Default 4.");
-
-/*
- * Settle delay (ms) after the barrier cmds complete and before
- * SUSPEND_VHCA. Empirical workaround for time-dependent FW state
- * that the barrier cmds don't fully flush -- see known_issues.md
- * §1.1 / §1.2. Default 0 (off). Set via modprobe or
- * /sys/module/mlx5_core/parameters/vfmig_save_post_drain_settle_ms.
- */
-static unsigned int vfmig_save_post_drain_settle_ms;
-module_param_named(vfmig_save_post_drain_settle_ms,
-		   vfmig_save_post_drain_settle_ms, uint, 0644);
-MODULE_PARM_DESC(vfmig_save_post_drain_settle_ms,
-		 "Settle delay in ms after the source-VF cmd-iface drain + barrier cmds, before SUSPEND_VHCA. Workaround for time-dependent FW state. Default 0.");
-
-/*
- * Re-poll the bitmask after a barrier cmd round to assert the
- * interface is idle. The barrier cmds are synchronous so the slot
- * should be free on return, but the cmd EQ might still be
- * draining a trailing stale EQE -- give it a brief window.
- */
-static int vfmig_save_poll_bitmask_idle(struct mlx5_core_dev *vf_mdev,
-					unsigned long all_free,
-					unsigned long timeout_ms,
-					unsigned long *out_bitmask)
-{
-	unsigned long deadline;
-	unsigned long bitmask;
-
-	deadline = jiffies + msecs_to_jiffies(timeout_ms);
-	for (;;) {
-		unsigned long flags;
-
-		spin_lock_irqsave(&vf_mdev->cmd.alloc_lock, flags);
-		bitmask = vf_mdev->cmd.vars.bitmask;
-		spin_unlock_irqrestore(&vf_mdev->cmd.alloc_lock, flags);
-
-		if ((bitmask & all_free) == all_free) {
-			*out_bitmask = bitmask;
-			return 0;
-		}
-		if (time_after_eq(jiffies, deadline))
-			break;
-		msleep(VFMIG_SAVE_DRAIN_POLL_MS);
-	}
-	*out_bitmask = bitmask;
-	return -EBUSY;
-}
 
 static int vfmig_save_drain_vf_cmd_iface(struct mlx5_core_dev *pf_mdev,
 					 struct pci_dev *vf_pdev,
 					 u32 vf_id)
 {
+	u32 issi_in[MLX5_ST_SZ_DW(query_issi_in)] = {};
+	u32 issi_out[MLX5_ST_SZ_DW(query_issi_out)] = {};
 	struct mlx5_core_dev *vf_mdev;
 	struct device_driver *drv;
+	unsigned long deadline;
 	unsigned long all_free;
 	unsigned long bitmask;
-	unsigned int barriers;
 	int max_reg_cmds;
-	unsigned int i;
 	int err;
 
 	device_lock(&vf_pdev->dev);
@@ -2045,60 +1985,44 @@ static int vfmig_save_drain_vf_cmd_iface(struct mlx5_core_dev *pf_mdev,
 		   ((1UL << max_reg_cmds) - 1);
 
 	/* Layer 1: bitmask drain. */
-	err = vfmig_save_poll_bitmask_idle(vf_mdev, all_free,
-					   VFMIG_SAVE_DRAIN_TIMEOUT_MS,
-					   &bitmask);
-	if (err) {
-		mlx5_core_warn(pf_mdev,
-			       "vfmig: SAVE drain timeout on vf %u: cmd bitmask 0x%lx (expected 0x%lx); %u slots still in-flight\n",
-			       vf_id, bitmask, all_free,
-			       (unsigned int)hweight_long(all_free & ~bitmask));
-		err = -EBUSY;
-		goto out_unlock;
+	deadline = jiffies + msecs_to_jiffies(VFMIG_SAVE_DRAIN_TIMEOUT_MS);
+	for (;;) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&vf_mdev->cmd.alloc_lock, flags);
+		bitmask = vf_mdev->cmd.vars.bitmask;
+		spin_unlock_irqrestore(&vf_mdev->cmd.alloc_lock, flags);
+
+		if ((bitmask & all_free) == all_free)
+			break;
+
+		if (time_after_eq(jiffies, deadline)) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SAVE drain timeout on vf %u: cmd bitmask 0x%lx (expected 0x%lx); %u slots still in-flight\n",
+				       vf_id, bitmask, all_free,
+				       (unsigned int)hweight_long(all_free & ~bitmask));
+			err = -EBUSY;
+			goto out_unlock;
+		}
+
+		msleep(VFMIG_SAVE_DRAIN_POLL_MS);
 	}
 
 	/*
-	 * Layer 2: FW-flush barriers. Snapshot the module param into
-	 * a local so a concurrent write to the param doesn't change
-	 * the loop count mid-flight.
+	 * Layer 2: FW-flush barrier. A single QUERY_ISSI is empirically
+	 * sufficient on FW 28.48.1000 to absorb whatever owed completion
+	 * FW had queued; multi-cmd barrier rounds and explicit settle
+	 * delays were tried during diagnosis (commit 50e22b8ee071,
+	 * superseded) but not needed.
 	 */
-	barriers = READ_ONCE(vfmig_save_drain_barrier_cmds);
-	for (i = 0; i < barriers; i++) {
-		u32 in[MLX5_ST_SZ_DW(query_issi_in)] = {};
-		u32 out[MLX5_ST_SZ_DW(query_issi_out)] = {};
-		int cmd_err;
-
-		MLX5_SET(query_issi_in, in, opcode, MLX5_CMD_OP_QUERY_ISSI);
-		cmd_err = mlx5_cmd_exec_inout(vf_mdev, query_issi, in, out);
-		if (cmd_err) {
-			mlx5_core_warn(pf_mdev,
-				       "vfmig: SAVE drain barrier %u/%u on vf %u failed: %d\n",
-				       i + 1, barriers, vf_id, cmd_err);
-			err = -EBUSY;
-			goto out_unlock;
-		}
-	}
-
-	/* Re-assert bitmask idle after the barrier round. */
-	if (barriers) {
-		err = vfmig_save_poll_bitmask_idle(vf_mdev, all_free,
-						   VFMIG_SAVE_DRAIN_TIMEOUT_MS,
-						   &bitmask);
-		if (err) {
-			mlx5_core_warn(pf_mdev,
-				       "vfmig: SAVE post-barrier bitmask still busy on vf %u: 0x%lx (expected 0x%lx)\n",
-				       vf_id, bitmask, all_free);
-			err = -EBUSY;
-			goto out_unlock;
-		}
-	}
-
-	/* Layer 3: empirical settle delay. */
-	if (vfmig_save_post_drain_settle_ms) {
-		mlx5_core_dbg(pf_mdev,
-			      "vfmig: SAVE post-drain settle %u ms on vf %u\n",
-			      vfmig_save_post_drain_settle_ms, vf_id);
-		msleep(vfmig_save_post_drain_settle_ms);
+	MLX5_SET(query_issi_in, issi_in, opcode, MLX5_CMD_OP_QUERY_ISSI);
+	err = mlx5_cmd_exec_inout(vf_mdev, query_issi, issi_in, issi_out);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SAVE drain barrier on vf %u failed: %d\n",
+			       vf_id, err);
+		err = -EBUSY;
+		goto out_unlock;
 	}
 
 	err = 0;
@@ -4175,7 +4099,7 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	 * before we SUSPEND. Failing here is intentional -- a partially
 	 * in-flight cmd at SAVE time produces a poisoned LOAD blob
 	 * whose symptom is a 60s timeout on dest's first cmd-on-slot-0
-	 * (known_issues.md §1.1). Better to fail SAVE.
+	 * (known_issues.md ?1.1). Better to fail SAVE.
 	 */
 	{
 		struct pci_dev *vf_pdev;
@@ -4778,7 +4702,7 @@ EXPORT_SYMBOL(mlx5_vfmig_bind_user_mr);
  *     The destination's Stage-3 bind path needs a stable key that
  *     spans the SAVE -> LOAD boundary; mlx5_ib_db_map_user already
  *     dedups on (mm, user_virt & PAGE_MASK), so we lean on that key.
- *     user_mr_dma.md §6.3 + §A.E.
+ *     user_mr_dma.md ?6.3 + ?A.E.
  *
  *   - The shape is always one PAGE_SIZE entry per doorbell page (the
  *     allocator only ever maps single pages via ib_umem_get(..,
@@ -5490,7 +5414,7 @@ void mlx5_vfmig_pf_detach_unbound_iova_domains(struct mlx5_core_dev *pf_mdev)
  * Drop any per-VF deterministic IOVA domains. Mirror image of
  * vfmig_pf_drop_pending_loads_locked() but for vfs_ctx[].vfmig_iova_dom.
  *
- * Ordering contract (CRITICAL — get this wrong and you get a UAF in
+ * Ordering contract (CRITICAL ��� get this wrong and you get a UAF in
  * vfmig_iova_free_slot on teardown):
  *
  *   The IOVA domain MUST outlive every code path on the VF side that

@@ -49,9 +49,10 @@ timeout (entry idx = 0)` line ~28 ms after `LOAD_VHCA_STATE`
 applies, which corresponds to the duplicate-completion path
 in `cmd.c` (line 1817).
 
-**Refined mechanism (2026-05-21, run_2).** The bitmask drain
-+ dest-side cmd-ring scrub landed by commit `3f354a919947` did
-**not** resolve the symptom. Sequence on dest:
+**Mechanism (validated end-to-end, 2026-05-21).** The bitmask
+drain + dest-side cmd-ring scrub landed by commit `3f354a919947`
+were not sufficient on their own. Sequence observed on the
+destination in run_2 *before* the barrier landed:
 
 1. `LOAD_VHCA_STATE` applies at T.
 2. VF probe starts; first cmd lands on slot 0.
@@ -65,76 +66,65 @@ in `cmd.c` (line 1817).
 5. `CREATE_MKEY` from `mlx5e_create_mdev_resources` lands on
    slot 0 and hangs the full 60 s `wait_func` window.
 
-The mechanism is therefore not cmd-ring buffer staleness (the
-buffer scrub is in effect; the EQ buffer is already zeroed by
-`mlx5_dma_zalloc_coherent_node`). It is **FW carrying per-VHCA
-"owed completion" state across SAVE/LOAD**. `SAVE_VHCA_STATE`
-captures the source VHCA mid-emit, before FW has finished
-delivering every completion EQE it owes the driver. `LOAD`
-restores that state on the destination. The dest's first cmd on
-slot 0 races against FW's queued stale completion.
+Root cause: **FW carries per-VHCA "owed completion" state
+across SAVE/LOAD**. `SAVE_VHCA_STATE` captures the source VHCA
+before FW has finished delivering every completion EQE it owes
+the driver. `LOAD` restores that state on the destination. The
+dest's first cmd on slot 0 races against FW's queued stale
+completion. The cmd-ring buffer staleness was a red herring --
+the dest-side scrub doesn't help (and the EQ buffer is already
+zeroed by `mlx5_dma_zalloc_coherent_node`).
 
-**Workaround (testing only).** `vfmig_save_post_drain_settle_ms`
-module param. Set to 60000+ to absorb the FW settle time.
-Empirically validated:
+**Fix (landed).** `vfmig_save_drain_vf_cmd_iface` now has two
+layers, in order:
 
-| Settle ms | CREATE_MKEY hang | SET_ROCE_ADDRESS error (§1.2) |
-|---|---|---|
-| 0 (none) | hangs 60s | fails |
-| 60000 (60s) | resolved (from earlier session) | still fails (run_2) |
-| 120000 (120s) | resolved | resolved (run_2) |
+1. **Bitmask drain.** Wait for the source VF mdev's
+   `cmd->vars.bitmask` all-bits-set. Driver-visible invariant
+   only. Catches the easier case where the workload has a cmd
+   genuinely in flight at SAVE.
 
-The settle knob is dumb but works. Cost is added wall-clock to
-every SAVE; CRIU plugins should set it via
-`/sys/module/mlx5_core/parameters/vfmig_save_post_drain_settle_ms`
-to whatever floor the deployment has empirically validated.
+2. **FW-flush barrier.** After the bitmask drain, issue a
+   **single** `QUERY_ISSI` cmd through the source VF mdev. The
+   barrier lands on the lowest-free slot (slot 0 after a clean
+   drain); if FW has an internally-queued completion it still
+   owes on that slot, FW emits the stale EQE before processing
+   the barrier. The driver consumes both EQEs back-to-back; the
+   stale one fires the "Command completion arrived after
+   timeout" warning on the **source** host (harmless -- the
+   source process is being checkpointed anyway), and FW's
+   owed-completion queue is empty by the time `SUSPEND_VHCA`
+   snapshots it.
 
-**In-tree partial fix (commits `3f354a919947` + this one).**
+A single barrier is empirically sufficient on FW 28.48.1000.
+Multi-cmd barrier rounds and explicit settle delays were tried
+during diagnosis (commit `50e22b8ee071`, superseded) but not
+needed -- one round-trip kicks FW past whatever post-cmd
+internal work was lagging.
 
-1. **Bitmask drain at SAVE** -- `vfmig_save_drain_vf_cmd_iface`
-   polls source's `cmd->vars.bitmask` for all-bits-set before
-   SUSPEND. Driver-visible invariant only; this didn't catch
-   the FW-side owed-completion state in run_2 (no `SAVE drain
-   timeout` warning fires; bitmask is genuinely all-free). Kept
-   as defense-in-depth -- catches the easier case where the
-   workload genuinely has a cmd in flight at SAVE time.
+The dest-side cmd-ring scrub in `alloc_cmd_page` (commit
+`3f354a919947`) stays as defense-in-depth: it doesn't address
+this symptom but matches the EQ-buf hygiene the rest of the
+codebase already provides, and it covers a hypothetical future
+"source had a cmd descriptor mid-write" scenario the barrier
+doesn't.
 
-2. **Dest-side cmd-ring scrub** in `alloc_cmd_page` -- memsets
-   the replayed cmd-ring page to zero. Didn't resolve this
-   symptom either (the staleness is FW-side, not buffer-side)
-   but is the same shape of hygiene the EQ-buf path already
-   does and is harmless.
+**Validation matrix (kernel commit at runtime).**
 
-3. **FW-flush barrier cmds at SAVE** -- after the bitmask
-   drain, `vfmig_save_drain_vf_cmd_iface` now issues N
-   QUERY_ISSI cmds (N = `vfmig_save_drain_barrier_cmds`,
-   default 4) through the source VF mdev. Each barrier lands
-   on a freshly-free slot (slot 0 by default after the bitmask
-   drain); if FW has an owed completion for that slot, FW
-   flushes it before processing the barrier. The driver
-   consumes both EQEs back-to-back; the stale one fires the
-   "Command completion arrived after timeout" warning on the
-   *source* host where it's harmless (the source process is
-   being checkpointed anyway).
-
-4. **Empirical settle knob** --
-   `vfmig_save_post_drain_settle_ms` module param. After the
-   bitmask drain + barrier cmds succeed, `msleep()` for the
-   param's value before returning to SUSPEND. Default 0.
-   Exists as both a sweep tool and a production escape hatch
-   while we work out whether (3) alone is sufficient and what
-   to do about §1.2 if it isn't.
-
-**Open question.** Whether (3) alone (with settle = 0)
-resolves the CREATE_MKEY hang. The barrier cmds are the
-architectural fix; the settle knob is the empirical fallback.
-Validation pending re-run of `swap_after_mr` with settle = 0
-after this commit.
+| barriers | settle ms | CREATE_MKEY | Outcome |
+|---|---|---|---|
+| 0 | 0 | hangs 60s | swap_after_mr fails |
+| 0 | 60000 | resolved | (earlier session) |
+| 0 | 120000 | resolved | run_2, also resolves §1.2 |
+| **1** | **0** | **resolved** | **swap_after_mr passes (current default)** |
+| 4 | 0 | resolved | overcompleted; same outcome as N=1 |
 
 **Tracking.** Diagnostic dmesg captures in
-`scratch/run_2/dmesg_*.txt`. Working notes from the
-investigation are in this session's transcript (search
-`Command completion arrived after timeout (entry idx = 0)`).
+`scratch/run_2/dmesg_*.txt` (pre-fix). Validation captures
+post-fix in this session's transcript. Final landed shape in
+commits `3f354a919947` (drain skeleton + cmd-ring scrub),
+`50e22b8ee071` (barrier exploration -- superseded), and the
+followup that strips the params back to the single-cmd shape
+under `vfmig_save_drain_vf_cmd_iface`.
 
 ### 1.2 `SET_ROCE_ADDRESS` rejected on the destination post-LOAD  *(new, 2026-05-21)*
 
@@ -182,21 +172,25 @@ own IP. Workloads that re-bind to local IPs after restore are
 broken; workloads that only use already-restored QPs are
 unaffected.
 
-**Workaround.** Set
-`/sys/module/mlx5_core/parameters/vfmig_save_post_drain_settle_ms`
-to 120000 (120 s) before SAVE. Empirically resolves the
-`SET_ROCE_ADDRESS` failure -- the FW state that conflicts with
-the dest's `add_roce_gid` evidently settles in that window.
-Same knob as §1.1 (different root cause but the same shape of
-time-dependence; the knob serves both for now). 30 s and 60 s
-are insufficient (run_2 evidence).
+**Status (2026-05-21).** Resolved as a side-effect of the §1.1
+barrier-cmd fix. Follow-up validation with `barriers=1,
+settle=0` showed `SET_ROCE_ADDRESS` succeeds on the destination
+and the destination's GID table populates correctly. This was
+unexpected: the GID table is conceptually independent of
+cmd-iface owed completions, and the only obvious link is that
+both symptoms required FW to "settle" before the destination
+could safely drive the cmd interface. The single `QUERY_ISSI`
+round-trip on the source apparently flushes whatever
+ROCE-table-related FW state was also lagging.
 
-The CRIU plugin still can't reset the GID table from
-userspace, and the orchestrator can't paper over a missing
-GID, so the SAVE-side delay is the only currently-known
-mitigation.
+Marking this active rather than resolved (kept in §1) because
+the mechanism connecting `QUERY_ISSI` to `SET_ROCE_ADDRESS`
+isn't understood. If a production run re-surfaces the symptom
+with the §1.1 fix in place, the architectural options below
+remain available.
 
-**Fix plan.** Two options at the kernel layer:
+**Architectural options (held in reserve).** Two ways the
+kernel could explicitly handle this if it reappears:
 
 1. **Strip ROCE_ADDRESS state from SAVE.** Treat the GID table
    like a per-host personality (analogous to MAC address): not
