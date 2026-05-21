@@ -1884,6 +1884,95 @@ static int vfmig_cmd_suspend_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
 
 	return mlx5_cmd_exec_inout(pf_mdev, suspend_vhca, in, out);
 }
+/*
+ * Number of FW-flush barrier cmds (NOP, opcode 0x80d) to issue on the
+ * source VF mdev after the SAVE-time bitmask drain, before
+ * SUSPEND_VHCA, to flush FW's internally-queued owed completions.
+ * Each lands on the lowest-free slot (slot 0 for a fully drained
+ * interface). Cost per barrier is one NOP round-trip (~us).
+ *
+ * Default 0 (disabled). Empirical regression sweep on tag
+ * 5-27-26-7628aea-full-pass showed the prior QUERY_ISSI implementation
+ * with barriers >= 1 introducing fresh regressions vs. the no-barrier
+ * baseline. NOP is preferred over QUERY_ISSI because it is the only
+ * cmd opcode FW guarantees has no side effects on VHCA state -- it is
+ * the same opcode the dest-side warm-up uses (vfmig_load_warmup_nop)
+ * and the upstream cmd-EQ recovery path uses for liveness probes.
+ * QUERY_ISSI by contrast may touch ISSI state-machine bookkeeping in
+ * FW; on barriers=4 we observed dest-side cmd-EQ desync that the
+ * baseline (barriers=0) does not. Switching to NOP narrows the variable
+ * to "did SW-side drain hygiene work?" without dragging in any
+ * QUERY_ISSI side-effects.
+ *
+ * The knob is left in tree as a runtime A/B against the narrower
+ * destination-side workarounds (vfmig_load_warmup_nop,
+ * vfmig_polling_alloc_uar) so the SAVE-side and dest-side
+ * contributions can be isolated independently.
+ */
+static unsigned int vfmig_save_drain_barrier_cmds;
+module_param_named(vfmig_save_drain_barrier_cmds,
+		   vfmig_save_drain_barrier_cmds, uint, 0644);
+MODULE_PARM_DESC(vfmig_save_drain_barrier_cmds,
+		 "Number of NOP barrier cmds to issue on the source VF mdev after the SAVE-time bitmask drain, to flush FW's internally-queued owed completions before SUSPEND_VHCA. Default 0 (disabled); >= 1 is opt-in for follow-up debugging only.");
+
+static int vfmig_save_dispatch_nops(struct mlx5_core_dev *pf_mdev,
+				    struct pci_dev *vf_pdev,
+				    u32 vf_id)
+{
+	struct mlx5_core_dev *vf_mdev;
+	struct device_driver *drv;
+	unsigned int barriers;
+	unsigned int i;
+	int err;
+
+	device_lock(&vf_pdev->dev);
+
+	drv = vf_pdev->dev.driver;
+	if (!drv || strcmp(drv->name, KBUILD_MODNAME)) {
+		err = 0;
+		goto out_unlock;
+	}
+
+	vf_mdev = pci_get_drvdata(vf_pdev);
+	if (!vf_mdev ||
+	    !test_bit(MLX5_INTERFACE_STATE_UP, &vf_mdev->intf_state)) {
+		err = 0;
+		goto out_unlock;
+	}
+
+	/*
+	 * Layer 2: FW-flush barriers via NOP cmds. Snapshot the module
+	 * param into a local so a concurrent write to the param doesn't
+	 * change the loop count mid-flight. NOP is chosen over
+	 * QUERY_ISSI to keep the barrier strictly side-effect-free on
+	 * the VHCA's FW state machine; the only contract we need is
+	 * "issue a cmd that lands on the lowest-free cmd ring slot and
+	 * forces FW to consume any queued owed-completion bookkeeping
+	 * for this VF".
+	 */
+	barriers = READ_ONCE(vfmig_save_drain_barrier_cmds);
+	for (i = 0; i < barriers; i++) {
+		u32 in[MLX5_ST_SZ_DW(nop_in)] = {};
+		u32 out[MLX5_ST_SZ_DW(nop_out)] = {};
+		int cmd_err;
+
+		MLX5_SET(nop_in, in, opcode, MLX5_CMD_OP_NOP);
+		cmd_err = mlx5_cmd_exec_inout(vf_mdev, nop, in, out);
+		if (cmd_err) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SAVE drain barrier %u/%u on vf %u failed: %d\n",
+				       i + 1, barriers, vf_id, cmd_err);
+			err = -EBUSY;
+			goto out_unlock;
+		}
+	}
+
+	err = 0;
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	return err;
+}
 
 static int vfmig_cmd_resume_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
 				 u16 op_mod)
@@ -3885,6 +3974,7 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	struct mlx5_vfmig_save_ctx *ctx;
 	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
 	bool migratable = false;
+	struct pci_dev *vf_pdev;
 	u64 query_size = 0;
 	u64 actual_size = 0;
 	struct file *file;
@@ -3946,6 +4036,18 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	if (err)
 		goto err_pd;
 	ctx->pd_allocated = true;
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (vf_pdev) {
+		err = vfmig_save_dispatch_nops(pf_mdev, vf_pdev, arg.vf_id);
+		pci_dev_put(vf_pdev);
+		if (err) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SAVE vf %u: pre-suspend drain failed: %d\n",
+				       arg.vf_id, err);
+			goto err_suspend;
+		}
+	}
 
 	/* Quiesce: initiator (egress) first, then responder (ingress). */
 	err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id,
