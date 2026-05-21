@@ -49,56 +49,90 @@ timeout (entry idx = 0)` line ~28 ms after `LOAD_VHCA_STATE`
 applies, which corresponds to the duplicate-completion path
 in `cmd.c` (line 1817).
 
-**Working hypothesis.** The cmd ring DMA buffer is migrated
-under `VFMIG_SLOT_CMD_RING` (slot 1). Unlike the
-`mlx5_dma_zalloc_coherent_node` path used for EQ buffers, the
-cmd-ring allocator (`alloc_cmd_page`) does **not** memset the
-freshly-mapped IOVA on the destination, so slot 0 of dest's
-cmd ring carries the byte-for-byte content of source's last
-cmd descriptor (typically the source's most recent
-`CREATE_MKEY` from `reg_mr`). FW's view of the cmd processor
-state was also restored from the SAVE blob. Driver-side state
-is fresh (`bitmask` all-free, `ent_arr` all NULL, `token` 0).
-Something about this mismatch on slot 0 specifically is
-time-dependent on the source's pre-SAVE quiescence — sufficient
-idle time on the source lets FW or the cmd ring reach a state
-where dest's first cmd-on-slot-0 doesn't hang.
+**Refined mechanism (2026-05-21, run_2).** The bitmask drain
++ dest-side cmd-ring scrub landed by commit `3f354a919947` did
+**not** resolve the symptom. Sequence on dest:
 
-We have *not* yet confirmed which side (FW state, cmd ring
-content, or both) is the actual driver of the timing dependency.
+1. `LOAD_VHCA_STATE` applies at T.
+2. VF probe starts; first cmd lands on slot 0.
+3. ~28 ms after T, `mlx5_cmd_comp_handler` fires the "Command
+   completion arrived after timeout (entry idx = 0)" warning.
+   The only way for `PENDING_COMP` to be already-cleared in 28
+   ms is for `comp_handler` to have been invoked **twice** for
+   slot 0 -- once for the dest's own cmd (legit) and once for
+   a stale completion FW carried across `LOAD_VHCA_STATE`.
+4. Probe continues for ~65 s doing other cmds (which work).
+5. `CREATE_MKEY` from `mlx5e_create_mdev_resources` lands on
+   slot 0 and hangs the full 60 s `wait_func` window.
 
-**Workaround (testing only, not for production).** Insert a
-`sleep 60` between the last application verb and the CRIU
-`pre-dump`. See `scratch/rdma_test_agent_vfmig_criu_swap_after_mr_sleep.yaml`.
+The mechanism is therefore not cmd-ring buffer staleness (the
+buffer scrub is in effect; the EQ buffer is already zeroed by
+`mlx5_dma_zalloc_coherent_node`). It is **FW carrying per-VHCA
+"owed completion" state across SAVE/LOAD**. `SAVE_VHCA_STATE`
+captures the source VHCA mid-emit, before FW has finished
+delivering every completion EQE it owes the driver. `LOAD`
+restores that state on the destination. The dest's first cmd on
+slot 0 races against FW's queued stale completion.
 
-**Fix plan.** Two pieces, landing together as one work item:
+**Workaround (testing only).** `vfmig_save_post_drain_settle_ms`
+module param. Set to 60000+ to absorb the FW settle time.
+Empirically validated:
 
-1. **Drain barrier at SAVE.** Source-side `vfmig_cmd_suspend_vhca`
-   is preceded by a "quiesce assertion": all `cmd->ent_arr[i]`
-   slots are free, `cmd->vars.bitmask` is fully unmasked, the
-   cmd EQ's `cons_index` has reached the producer pointer.
-   If any of those fail within a bounded poll window, SAVE
-   fails with `-EBUSY` rather than capturing an inconsistent
-   snapshot. ~50 LOC.
+| Settle ms | CREATE_MKEY hang | SET_ROCE_ADDRESS error (§1.2) |
+|---|---|---|
+| 0 (none) | hangs 60s | fails |
+| 60000 (60s) | resolved (from earlier session) | still fails (run_2) |
+| 120000 (120s) | resolved | resolved (run_2) |
 
-2. **Zero the cmd-ring buffer at SAVE.** After `SUSPEND_VHCA`
-   completes (FW frozen) and the quiesce assertion passes,
-   `memset` the cmd ring page to zero before `SAVE_VHCA_STATE`
-   captures it. SAVE still installs an identity-mapped buffer
-   at the same IOVA on the dest; it just contains zeros. The
-   first cmd dest writes has no stale-descriptor neighbour.
-   ~10 LOC.
+The settle knob is dumb but works. Cost is added wall-clock to
+every SAVE; CRIU plugins should set it via
+`/sys/module/mlx5_core/parameters/vfmig_save_post_drain_settle_ms`
+to whatever floor the deployment has empirically validated.
 
-Piece 1 alone is not sufficient: the empirical `sleep 60`
-workaround works without touching the cmd ring content,
-suggesting the cmd ring content is *correlated* with the issue
-but not the only driver. Piece 2 alone is also probably not
-sufficient: the duplicate-completion log line shows up *before*
-any `CREATE_MKEY` is even issued. Together they cover both
-sides of the symmetry.
+**In-tree partial fix (commits `3f354a919947` + this one).**
 
-**Tracking.** Diagnostic dmesg captures in `scratch/dmesg_host_*.txt`
-and `scratch/swap_after_mr_sleep_3.txt`. Working notes from the
+1. **Bitmask drain at SAVE** -- `vfmig_save_drain_vf_cmd_iface`
+   polls source's `cmd->vars.bitmask` for all-bits-set before
+   SUSPEND. Driver-visible invariant only; this didn't catch
+   the FW-side owed-completion state in run_2 (no `SAVE drain
+   timeout` warning fires; bitmask is genuinely all-free). Kept
+   as defense-in-depth -- catches the easier case where the
+   workload genuinely has a cmd in flight at SAVE time.
+
+2. **Dest-side cmd-ring scrub** in `alloc_cmd_page` -- memsets
+   the replayed cmd-ring page to zero. Didn't resolve this
+   symptom either (the staleness is FW-side, not buffer-side)
+   but is the same shape of hygiene the EQ-buf path already
+   does and is harmless.
+
+3. **FW-flush barrier cmds at SAVE** -- after the bitmask
+   drain, `vfmig_save_drain_vf_cmd_iface` now issues N
+   QUERY_ISSI cmds (N = `vfmig_save_drain_barrier_cmds`,
+   default 4) through the source VF mdev. Each barrier lands
+   on a freshly-free slot (slot 0 by default after the bitmask
+   drain); if FW has an owed completion for that slot, FW
+   flushes it before processing the barrier. The driver
+   consumes both EQEs back-to-back; the stale one fires the
+   "Command completion arrived after timeout" warning on the
+   *source* host where it's harmless (the source process is
+   being checkpointed anyway).
+
+4. **Empirical settle knob** --
+   `vfmig_save_post_drain_settle_ms` module param. After the
+   bitmask drain + barrier cmds succeed, `msleep()` for the
+   param's value before returning to SUSPEND. Default 0.
+   Exists as both a sweep tool and a production escape hatch
+   while we work out whether (3) alone is sufficient and what
+   to do about §1.2 if it isn't.
+
+**Open question.** Whether (3) alone (with settle = 0)
+resolves the CREATE_MKEY hang. The barrier cmds are the
+architectural fix; the settle knob is the empirical fallback.
+Validation pending re-run of `swap_after_mr` with settle = 0
+after this commit.
+
+**Tracking.** Diagnostic dmesg captures in
+`scratch/run_2/dmesg_*.txt`. Working notes from the
 investigation are in this session's transcript (search
 `Command completion arrived after timeout (entry idx = 0)`).
 
@@ -148,10 +182,19 @@ own IP. Workloads that re-bind to local IPs after restore are
 broken; workloads that only use already-restored QPs are
 unaffected.
 
-**Workaround.** None currently. The CRIU plugin can't reset
-the GID table from userspace (no public verb to enumerate-and-
-delete by FW index), and the orchestrator can't paper over a
-missing GID.
+**Workaround.** Set
+`/sys/module/mlx5_core/parameters/vfmig_save_post_drain_settle_ms`
+to 120000 (120 s) before SAVE. Empirically resolves the
+`SET_ROCE_ADDRESS` failure -- the FW state that conflicts with
+the dest's `add_roce_gid` evidently settles in that window.
+Same knob as §1.1 (different root cause but the same shape of
+time-dependence; the knob serves both for now). 30 s and 60 s
+are insufficient (run_2 evidence).
+
+The CRIU plugin still can't reset the GID table from
+userspace, and the orchestrator can't paper over a missing
+GID, so the SAVE-side delay is the only currently-known
+mitigation.
 
 **Fix plan.** Two options at the kernel layer:
 
