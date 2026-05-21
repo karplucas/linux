@@ -1884,6 +1884,82 @@ static int vfmig_cmd_suspend_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
 
 	return mlx5_cmd_exec_inout(pf_mdev, suspend_vhca, in, out);
 }
+/*
+ * Number of FW-flush barrier cmds (QUERY_ISSI) to issue on the source
+ * VF mdev after the SAVE-time bitmask drain, before SUSPEND_VHCA, to
+ * flush FW's internally-queued owed completions. Each lands on the
+ * lowest-free slot (slot 0 for a fully drained interface). Cost per
+ * barrier is one QUERY_ISSI round-trip (~us).
+ *
+ * Default 0 (disabled). Empirical regression sweep on tag
+ * 5-27-26-7628aea-full-pass showed barriers >= 1 introducing fresh
+ * regressions vs. the no-barrier baseline -- the same SAVE-side cmd
+ * traffic is exposing a destination-side state the dest probe path
+ * does not yet handle. Disabling by default restores the clean
+ * baseline; the knob is left in tree as a runtime A/B against the
+ * narrower destination-side workarounds (vfmig_load_warmup_nop,
+ * vfmig_polling_alloc_uar) so the SAVE-side and dest-side
+ * contributions can be isolated independently.
+ */
+static unsigned int vfmig_save_drain_barrier_cmds;
+module_param_named(vfmig_save_drain_barrier_cmds,
+		   vfmig_save_drain_barrier_cmds, uint, 0644);
+MODULE_PARM_DESC(vfmig_save_drain_barrier_cmds,
+		 "Number of QUERY_ISSI barrier cmds to issue on the source VF mdev after the SAVE-time bitmask drain, to flush FW's internally-queued owed completions before SUSPEND_VHCA. Default 0 (disabled); >= 1 is opt-in for follow-up debugging only.");
+
+static int vfmig_save_dispatch_nops(struct mlx5_core_dev *pf_mdev,
+				    struct pci_dev *vf_pdev,
+				    u32 vf_id)
+{
+	struct mlx5_core_dev *vf_mdev;
+	struct device_driver *drv;
+	unsigned int barriers;
+	unsigned int i;
+	int err;
+
+	device_lock(&vf_pdev->dev);
+
+	drv = vf_pdev->dev.driver;
+	if (!drv || strcmp(drv->name, KBUILD_MODNAME)) {
+		err = 0;
+		goto out_unlock;
+	}
+
+	vf_mdev = pci_get_drvdata(vf_pdev);
+	if (!vf_mdev ||
+	    !test_bit(MLX5_INTERFACE_STATE_UP, &vf_mdev->intf_state)) {
+		err = 0;
+		goto out_unlock;
+	}
+
+	/*
+	 * Layer 2: FW-flush barriers. Snapshot the module param into
+	 * a local so a concurrent write to the param doesn't change
+	 * the loop count mid-flight.
+	 */
+	barriers = READ_ONCE(vfmig_save_drain_barrier_cmds);
+	for (i = 0; i < barriers; i++) {
+		u32 in[MLX5_ST_SZ_DW(query_issi_in)] = {};
+		u32 out[MLX5_ST_SZ_DW(query_issi_out)] = {};
+		int cmd_err;
+
+		MLX5_SET(query_issi_in, in, opcode, MLX5_CMD_OP_QUERY_ISSI);
+		cmd_err = mlx5_cmd_exec_inout(vf_mdev, query_issi, in, out);
+		if (cmd_err) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SAVE drain barrier %u/%u on vf %u failed: %d\n",
+				       i + 1, barriers, vf_id, cmd_err);
+			err = -EBUSY;
+			goto out_unlock;
+		}
+	}
+
+	err = 0;
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	return err;
+}
 
 static int vfmig_cmd_resume_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
 				 u16 op_mod)
@@ -3885,6 +3961,7 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	struct mlx5_vfmig_save_ctx *ctx;
 	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
 	bool migratable = false;
+	struct pci_dev *vf_pdev;
 	u64 query_size = 0;
 	u64 actual_size = 0;
 	struct file *file;
@@ -3946,6 +4023,18 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	if (err)
 		goto err_pd;
 	ctx->pd_allocated = true;
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (vf_pdev) {
+		err = vfmig_save_dispatch_nops(pf_mdev, vf_pdev, arg.vf_id);
+		pci_dev_put(vf_pdev);
+		if (err) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SAVE vf %u: pre-suspend drain failed: %d\n",
+				       arg.vf_id, err);
+			goto err_suspend;
+		}
+	}
 
 	/* Quiesce: initiator (egress) first, then responder (ingress). */
 	err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id,
