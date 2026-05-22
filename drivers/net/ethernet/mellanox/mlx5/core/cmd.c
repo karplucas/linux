@@ -1821,6 +1821,41 @@ static void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec, bool force
 				continue;
 			}
 
+			/*
+			 * Stale completion EQE filter via cmd-ring ownership.
+			 *
+			 * FW emits a real completion EQE only AFTER it has
+			 * written the response into the cmd ring slot and
+			 * cleared CMD_OWNER_HW (handing ownership back to
+			 * SW). So at this point a slot whose status_own
+			 * still has CMD_OWNER_HW set CANNOT be the EQE for
+			 * the cmd we currently track on this slot -- the
+			 * cmd has not completed yet.
+			 *
+			 * Stale EQEs from FW's owed-completion queue
+			 * (carried across mlx5 SR-IOV VF migration's
+			 * SAVE_VHCA_STATE / LOAD_VHCA_STATE) can land on a
+			 * still-HW-owned slot. Without this gate, the
+			 * PENDING_COMP path would memcpy the slot's request
+			 * data (the in-flight cmd's input, not its response)
+			 * into the caller's response buffer and complete the
+			 * caller with garbage. Skip and let the real EQE
+			 * arrive when status_own actually flips.
+			 *
+			 * !forced only: synthetic comp_handler calls from
+			 * wait_func_handle_exec_timeout() are recovery, not
+			 * real EQEs, and need to flow regardless of slot
+			 * ownership. Polling-mode mlx5_cmd_invoke() does not
+			 * traverse this function and is unaffected.
+			 */
+			if (!forced &&
+			    READ_ONCE(ent->lay->status_own) & CMD_OWNER_HW) {
+				mlx5_core_warn_rl(dev,
+						  "stale completion EQE on HW-owned slot (idx %d, op 0x%x); ignoring\n",
+						  ent->idx, ent->op);
+				continue;
+			}
+
 			if (forced && ent->ret == -ETIMEDOUT)
 				set_bit(MLX5_CMD_ENT_STATE_TIMEDOUT,
 					&ent->state);

@@ -148,31 +148,73 @@ EQE for a normally-completed cmd" (the line-1063 get was
 already balanced by the legit-comp path; this duplicate must
 NOT put again). vfmig is the *trigger*, not the *bug*.
 
-Defense lands in `mlx5_cmd_comp_handler`:
+Defense lands in `mlx5_cmd_comp_handler` in two layers:
 
-- Move the `TIMEDOUT` clear past the `PENDING_COMP` gate so
-  the bit survives long enough to be tested.
-- Use `test_and_clear_bit(TIMEDOUT)` in the `!PENDING_COMP`
-  branch as the discriminator; `cmd_ent_put` only fires when
-  the bit was set (i.e., a synthetic forced-comp earlier
-  leaked the get). Stale duplicates of normal completions
-  fall through to a rate-limited
-  `stale duplicate cmd completion ignored` warning and
-  continue.
-- Add a `unlikely(!ent)` NULL guard at the top of the
-  per-slot loop for the rarer case where the stale EQE
-  arrives after the legit caller's final put has already
-  freed the ent and cleared `ent_arr[i]`. This was a latent
-  null-deref before; under vfmig it is reachable.
+- **Layer 1 (refcount-safe duplicate handling):**
+  - Move the `TIMEDOUT` clear past the `PENDING_COMP` gate so
+    the bit survives long enough to be tested.
+  - Use `test_and_clear_bit(TIMEDOUT)` in the `!PENDING_COMP`
+    branch as the discriminator; `cmd_ent_put` only fires
+    when the bit was set (i.e., a synthetic forced-comp
+    earlier leaked the get). Stale duplicates of normal
+    completions fall through to a rate-limited
+    `stale duplicate cmd completion ignored` warning and
+    continue.
+  - Add a `unlikely(!ent)` NULL guard at the top of the
+    per-slot loop for the rarer case where the stale EQE
+    arrives after the legit caller's final put has already
+    freed the ent and cleared `ent_arr[i]`. This was a latent
+    null-deref before; under vfmig it is reachable.
+
+- **Layer 2 (per-EQE stale-vs-real discriminator via
+  cmd-ring `status_own`):**
+  - FW emits a real completion EQE only AFTER it has written
+    the response into the cmd ring slot and cleared
+    `CMD_OWNER_HW`. So a real EQE for a slot in flight is
+    always paired with `(status_own & CMD_OWNER_HW) == 0`.
+  - Layer 1 alone closes the duplicate-after-completion race
+    (PENDING_COMP cleared) but **not** the duplicate-during-
+    completion race: a stale EQE landing on a still-PENDING
+    slot would pass the `test_and_clear PENDING_COMP` gate,
+    memcpy the slot's request data (still HW-owned, FW
+    hasn't written response yet) into the caller's response
+    buffer, and `complete(&ent->done)` with garbage. This
+    looked like the real cmd succeeded with corrupt data, or
+    -- if FW eventually emitted the actual real EQE later
+    on the now-stale-marked slot -- a 60s
+    `wait_func_handle_exec_timeout` "No done completion".
+  - Add `READ_ONCE(ent->lay->status_own) & CMD_OWNER_HW`
+    check at the top of the per-slot loop (after the NULL
+    guard, before the PENDING_COMP gate). If still HW-owned,
+    skip the EQE with a rate-limited warning. The real EQE
+    arrives later when FW actually writes the response and
+    flips ownership; the slot stays correctly PENDING_COMP=1
+    in the meantime.
+  - `!forced` only -- synthetic comp_handler calls from
+    `wait_func_handle_exec_timeout()` are recovery, not real
+    EQEs, and must flow regardless of slot ownership.
+    Polling-mode `mlx5_cmd_invoke()` does not traverse
+    `mlx5_cmd_comp_handler` and is unaffected.
 
 Together, the two layers give: source-side `QUERY_ISSI`
-barrier flushes the common case; kernel-side
-`mlx5_cmd_comp_handler` stays correct under any residual
-duplicate / stale EQE that survives the barrier. Source dmesg
-keeps showing the warning (harmless on the source process
-being checkpointed); destination dmesg keeps showing the
-warning if FW emits a residual stale (rate-limited, no
-refcount corruption).
+barrier flushes the common case; layer 1 keeps the refcount
+sane on duplicates that arrive after legit completion; layer
+2 keeps the response data correct on duplicates that arrive
+while a real cmd is still in flight on the same slot. Source
+dmesg keeps showing layer-1 warnings (harmless on the source
+process being checkpointed); destination dmesg shows either
+layer-1 or layer-2 warnings if FW emits residual stales, but
+no refcount corruption and no garbage response data.
+
+The status_own check is also a more durable answer to "what
+prevents another EQE from arriving after we drain on source
+but before SUSPEND" than additional source-side barrier
+rounds: SUSPEND_VHCA does not freeze the cmd interface (it
+only stops data-path WQEs), so any source-side drain leaves
+a fundamental TOCTOU window. Trusting an explicit per-EQE
+discriminator on the destination -- driven by the same
+ownership bit `mlx5_cmd_invoke()`'s polling path already
+trusts -- is the architectural fix.
 
 ### 1.2 `SET_ROCE_ADDRESS` rejected on the destination post-LOAD  *(new, 2026-05-21)*
 
