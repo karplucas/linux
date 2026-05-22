@@ -1802,24 +1802,92 @@ static void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec, bool force
 		if (test_bit(i, &vector)) {
 			ent = cmd->ent_arr[i];
 
+			/*
+			 * Stale completion EQE on a slot that has already
+			 * been freed (ent_arr cleared by cmd_free_index in a
+			 * prior cmd_ent_put). Can be observed under mlx5
+			 * SR-IOV VF migration, where FW carries owed-
+			 * completion state across SAVE_VHCA_STATE /
+			 * LOAD_VHCA_STATE and re-emits one or more EQEs on
+			 * the destination cmd EQ that don't correspond to
+			 * any cmd the dest driver has issued. Defensive only;
+			 * the legitimate path always finds ent != NULL.
+			 */
+			if (unlikely(!ent)) {
+				if (!forced)
+					mlx5_core_warn_rl(dev,
+							  "stale completion EQE on freed slot (idx %d, vector 0x%lx); ignoring\n",
+							  i, vector);
+				continue;
+			}
+
 			if (forced && ent->ret == -ETIMEDOUT)
 				set_bit(MLX5_CMD_ENT_STATE_TIMEDOUT,
 					&ent->state);
-			else if (!forced) /* real FW completion */
-				clear_bit(MLX5_CMD_ENT_STATE_TIMEDOUT,
-					  &ent->state);
+
+			/*
+			 * Note: a real FW completion (!forced) used to clear
+			 * MLX5_CMD_ENT_STATE_TIMEDOUT here unconditionally,
+			 * but doing so before the PENDING_COMP gate destroys
+			 * the only signal that distinguishes "late real EQE
+			 * for a previously-timed-out cmd" (the cmd_work_handler
+			 * cmd_ent_get() taken for the FW completion was leaked
+			 * by a synthetic forced comp_handler call from
+			 * wait_func_handle_exec_timeout(); this real EQE owes
+			 * the unwind) from "stale duplicate EQE for a normally-
+			 * completed cmd" (the cmd_ent_get() was already balanced
+			 * by the legit completion path; this duplicate must NOT
+			 * cmd_ent_put again, or the caller's still-live final
+			 * cmd_ent_put @ mlx5_cmd_invoke()'s out_free underflows
+			 * the refcount and uses-after-free the ent). The clear
+			 * has been moved past the PENDING_COMP gate.
+			 */
 
 			/* if we already completed the command, ignore it */
 			if (!test_and_clear_bit(MLX5_CMD_ENT_STATE_PENDING_COMP,
 						&ent->state)) {
 				/* only real completion can free the cmd slot */
 				if (!forced) {
-					mlx5_core_err(dev, "Command completion arrived after timeout (entry idx = %d).\n",
-						      ent->idx);
-					cmd_ent_put(ent);
+					/*
+					 * test_and_clear_bit(TIMEDOUT) is the
+					 * discriminator:
+					 *   set:   synthetic forced-comp fired
+					 *          earlier and leaked the
+					 *          cmd_ent_get() for the FW
+					 *          completion; this real EQE
+					 *          owes the matching put.
+					 *   clear: stale duplicate of a real
+					 *          completion; the cmd_ent_get()
+					 *          was already balanced by the
+					 *          legit comp path. Skipping
+					 *          cmd_ent_put here keeps the
+					 *          refcount sane.
+					 */
+					if (test_and_clear_bit(MLX5_CMD_ENT_STATE_TIMEDOUT,
+							       &ent->state)) {
+						mlx5_core_err(dev,
+							      "Command completion arrived after timeout (entry idx = %d).\n",
+							      ent->idx);
+						cmd_ent_put(ent);
+					} else {
+						mlx5_core_warn_rl(dev,
+								  "stale duplicate cmd completion ignored (entry idx = %d, op 0x%x)\n",
+								  ent->idx, ent->op);
+					}
 				}
 				continue;
 			}
+
+			/*
+			 * Real EQE on a still-PENDING cmd. Any TIMEDOUT bit
+			 * left behind by a synthetic forced-comp that a
+			 * recovery flow beat to the punch is moot now: the
+			 * cmd has recovered in time, so the timeout signal
+			 * no longer applies.
+			 */
+			if (!forced)
+				clear_bit(MLX5_CMD_ENT_STATE_TIMEDOUT,
+					  &ent->state);
 
 			if (ent->callback && cancel_delayed_work(&ent->cb_timeout_work))
 				cmd_ent_put(ent); /* timeout work was canceled */
