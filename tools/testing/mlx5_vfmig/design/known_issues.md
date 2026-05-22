@@ -126,6 +126,54 @@ commits `3f354a919947` (drain skeleton + cmd-ring scrub),
 followup that strips the params back to the single-cmd shape
 under `vfmig_save_drain_vf_cmd_iface`.
 
+**Followup (2026-05-22): MR-restore-cleanup wedge.** The
+`barriers=1` source-side drain was empirically sufficient on
+the lighter `swap_after_mr` workload but **not** on the
+MR-restore-cleanup path (`num_vfs -> 0` after a successful
+LOAD on an MR-heavy workload). On dest, a stale completion
+EQE arrives while a legitimately-issued cmd is mid-teardown,
+and the kernel's existing "Command completion arrived after
+timeout" path in `mlx5_cmd_comp_handler` mishandles it,
+producing `refcount_t: underflow; use-after-free.` and a
+kernel wedge.
+
+The mechanism inside `cmd.c` is independent of vfmig: an
+unconditional `clear_bit(MLX5_CMD_ENT_STATE_TIMEDOUT)` before
+the `PENDING_COMP` gate destroys the only signal that
+distinguishes "late real EQE for a previously-timed-out cmd"
+(the `cmd_ent_get()` taken at line 1063 was leaked by a
+synthetic forced-comp from `wait_func_handle_exec_timeout()`;
+this real EQE owes the matching put) from "stale duplicate
+EQE for a normally-completed cmd" (the line-1063 get was
+already balanced by the legit-comp path; this duplicate must
+NOT put again). vfmig is the *trigger*, not the *bug*.
+
+Defense lands in `mlx5_cmd_comp_handler`:
+
+- Move the `TIMEDOUT` clear past the `PENDING_COMP` gate so
+  the bit survives long enough to be tested.
+- Use `test_and_clear_bit(TIMEDOUT)` in the `!PENDING_COMP`
+  branch as the discriminator; `cmd_ent_put` only fires when
+  the bit was set (i.e., a synthetic forced-comp earlier
+  leaked the get). Stale duplicates of normal completions
+  fall through to a rate-limited
+  `stale duplicate cmd completion ignored` warning and
+  continue.
+- Add a `unlikely(!ent)` NULL guard at the top of the
+  per-slot loop for the rarer case where the stale EQE
+  arrives after the legit caller's final put has already
+  freed the ent and cleared `ent_arr[i]`. This was a latent
+  null-deref before; under vfmig it is reachable.
+
+Together, the two layers give: source-side `QUERY_ISSI`
+barrier flushes the common case; kernel-side
+`mlx5_cmd_comp_handler` stays correct under any residual
+duplicate / stale EQE that survives the barrier. Source dmesg
+keeps showing the warning (harmless on the source process
+being checkpointed); destination dmesg keeps showing the
+warning if FW emits a residual stale (rate-limited, no
+refcount corruption).
+
 ### 1.2 `SET_ROCE_ADDRESS` rejected on the destination post-LOAD  *(new, 2026-05-21)*
 
 **Symptom.** Every `SET_ROCE_ADDRESS(0x761)` issued by the
