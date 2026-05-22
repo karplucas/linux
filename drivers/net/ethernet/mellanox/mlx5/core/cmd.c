@@ -72,6 +72,46 @@ enum {
 	CMD_IF_REV = 5,
 };
 
+/*
+ * vfmig debug knobs (see known_issues.md §1.x "post-LOAD cmd EQ wedge").
+ *
+ * vfmig_force_polling_cmd:
+ *   When true, every FW cmd issued through cmd_exec() is forced through the
+ *   polling completion path -- equivalent to mlx5_cmd_exec_polling() for the
+ *   whole driver. The cmd EQ is bypassed for cmd completions; async events
+ *   continue to use the async EQ unmodified. Diagnostic / interim
+ *   workaround for the post-LOAD cmd EQ wedge under SR-IOV VF migration
+ *   where FW completes the cmd (status_own flips to SW) but the matching
+ *   completion EQE is never observed by SW.
+ *
+ * vfmig_eq_debug:
+ *   When true, prints the cmd EQ state (cons_index, ring slot, owner byte
+ *   of EQE at cons_index, "fresh" predicate matching next_eqe_sw()) plus
+ *   the in-flight cmd's lay->status_own at wait_func_handle_exec_timeout()
+ *   entry/exit. This disambiguates the two competing hypotheses for a
+ *   timed-out cmd:
+ *     - lay->status_own & CMD_OWNER_HW set at timeout: FW never processed
+ *       the cmd. Doorbell or FW-side state issue.
+ *     - lay->status_own & CMD_OWNER_HW clear at timeout: FW processed and
+ *       wrote the response; the completion EQE was either never emitted by
+ *       FW or never picked up by SW (cmd EQ producer/consumer index
+ *       disagreement across LOAD). The eqe[ci].owner value combined with
+ *       fresh=0/1 tells us whether SW is staring at a stale ring slot
+ *       waiting for FW to re-flip ownership.
+ *
+ * Both knobs default off and have no effect on the legitimate datapath
+ * when unset.
+ */
+static bool vfmig_force_polling_cmd;
+module_param(vfmig_force_polling_cmd, bool, 0644);
+MODULE_PARM_DESC(vfmig_force_polling_cmd,
+		 "vfmig debug: force polling completion for ALL FW cmds (bypass cmd EQ for cmd completions). Diagnostic for the post-LOAD cmd EQ wedge.");
+
+static bool vfmig_eq_debug;
+module_param(vfmig_eq_debug, bool, 0644);
+MODULE_PARM_DESC(vfmig_eq_debug,
+		 "vfmig debug: log cmd EQ state and per-slot status_own at cmd timeout. Diagnostic for stuck-cmd investigations under SR-IOV VF migration.");
+
 enum {
 	CMD_MODE_POLLING,
 	CMD_MODE_EVENTS
@@ -1140,10 +1180,65 @@ enum {
 	MLX5_CMD_TIMEOUT_RECOVER_MSEC   = 5 * 1000,
 };
 
+/*
+ * Snapshot cmd-ring slot ownership and cmd-EQ ring state for the ent in
+ * question. Used by wait_func_handle_exec_timeout() to disambiguate the two
+ * post-LOAD wedge modes (FW didn't process vs FW processed but EQE lost).
+ * No-op unless vfmig_eq_debug is set.
+ */
+static void vfmig_log_cmd_eq_state(struct mlx5_core_dev *dev,
+				   const char *where,
+				   struct mlx5_cmd_work_ent *ent)
+{
+	struct mlx5_eq *eq;
+	struct mlx5_eqe *eqe;
+	u32 ci, sz, slot;
+	bool fresh;
+	u8 own;
+
+	if (!READ_ONCE(vfmig_eq_debug))
+		return;
+
+	eq = mlx5_get_cmd_eq(dev);
+	if (!eq) {
+		mlx5_core_warn(dev,
+			       "vfmig_eq_debug:%s cmd_eq not available\n",
+			       where);
+		return;
+	}
+
+	ci = READ_ONCE(eq->cons_index);
+	sz = eq_get_size(eq);
+	slot = ci & eq->fbc.sz_m1;
+	eqe = get_eqe(eq, slot);
+	/*
+	 * Mirror next_eqe_sw(): an EQE is "fresh" (FW-written, ready for SW
+	 * consumption) iff its owner bit does NOT match the expected owner
+	 * derived from ci and log_sz. If we ever see fresh=1 here while still
+	 * waiting on a cmd, SW is missing an EQE that's already been written.
+	 */
+	fresh = !((eqe->owner ^ (ci >> eq->fbc.log_sz)) & 1);
+
+	if (ent && ent->lay) {
+		own = READ_ONCE(ent->lay->status_own);
+		mlx5_core_warn(dev,
+			       "vfmig_eq_debug:%s slot=%d op=0x%x lay->status_own=0x%02x (CMD_OWNER_HW=%d, status=0x%x); cmd_eq ci=%u eq_slot=%u sz=%u eqe[ci].owner=0x%02x fresh=%d\n",
+			       where, ent->idx, ent->op, own,
+			       !!(own & CMD_OWNER_HW), own >> 1,
+			       ci, slot, sz, eqe->owner, fresh);
+	} else {
+		mlx5_core_warn(dev,
+			       "vfmig_eq_debug:%s cmd_eq ci=%u eq_slot=%u sz=%u eqe[ci].owner=0x%02x fresh=%d\n",
+			       where, ci, slot, sz, eqe->owner, fresh);
+	}
+}
+
 static void wait_func_handle_exec_timeout(struct mlx5_core_dev *dev,
 					  struct mlx5_cmd_work_ent *ent)
 {
 	unsigned long timeout = msecs_to_jiffies(MLX5_CMD_TIMEOUT_RECOVER_MSEC);
+
+	vfmig_log_cmd_eq_state(dev, " TIMEOUT_PRE_RECOVER", ent);
 
 	mlx5_cmd_eq_recover(dev);
 
@@ -1157,6 +1252,8 @@ static void wait_func_handle_exec_timeout(struct mlx5_core_dev *dev,
 			       mlx5_command_str(ent->op), ent->op);
 		return;
 	}
+
+	vfmig_log_cmd_eq_state(dev, " TIMEOUT_FINAL", ent);
 
 	mlx5_core_warn(dev, "cmd[%d]: %s(0x%x) No done completion\n", ent->idx,
 		       mlx5_command_str(ent->op), ent->op);
@@ -2122,6 +2219,17 @@ static int cmd_exec(struct mlx5_core_dev *dev, void *in, int in_size, void *out,
 
 	if (mlx5_cmd_is_down(dev) || !opcode_allowed(&dev->cmd, opcode))
 		return -ENXIO;
+
+	/*
+	 * vfmig debug: opt all cmds into polling completion when the diag
+	 * knob is set. cmd_work_handler routes both the global CMD_MODE_POLLING
+	 * mode and the per-ent ent->polling flag through poll_timeout() +
+	 * forced mlx5_cmd_comp_handler(); raising force_polling here is safe
+	 * for callback and page-queue cmds and matches mlx5_cmd_exec_polling()'s
+	 * existing semantics. No effect when the knob is unset.
+	 */
+	if (READ_ONCE(vfmig_force_polling_cmd))
+		force_polling = true;
 
 	if (!callback) {
 		/* The semaphore is already held for callback commands. It was

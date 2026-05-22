@@ -741,6 +741,11 @@ struct mlx5_eq *mlx5_get_async_eq(struct mlx5_core_dev *dev)
 	return &dev->priv.eq_table->async_eq.core;
 }
 
+struct mlx5_eq *mlx5_get_cmd_eq(struct mlx5_core_dev *dev)
+{
+	return &dev->priv.eq_table->cmd_eq.core;
+}
+
 void mlx5_eq_synchronize_async_irq(struct mlx5_core_dev *dev)
 {
 	synchronize_irq(dev->priv.eq_table->async_eq.core.irqn);
