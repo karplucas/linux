@@ -190,6 +190,25 @@ Defense lands in `mlx5_cmd_comp_handler` in two layers:
     arrives later when FW actually writes the response and
     flips ownership; the slot stays correctly PENDING_COMP=1
     in the meantime.
+  - **Populate-window NULL-lay subcase.** `cmd_work_handler`
+    publishes `cmd->ent_arr[idx] = ent` (under
+    `cmd->alloc_lock`, in `cmd_alloc_index()` or the
+    page-queue path) BEFORE assigning `ent->lay =
+    get_inst(cmd, ent->idx)` a few lines later. A stale EQE
+    landing in that micro-window finds `ent != NULL`
+    (so layer-1 NULL-ent guard passes) but `ent->lay ==
+    NULL` (still zero from `kzalloc`). A bare layer-2 read
+    of `ent->lay->status_own` then NULL-derefs at offset
+    `0x3f` (the `status_own` byte). Fix: read `ent->lay`
+    via `READ_ONCE` first; if NULL, treat as a stale EQE
+    and `continue`. The doorbell has not yet been rung in
+    this window, so no real FW completion can possibly
+    belong to this slot. Empirically observable (host 087)
+    during VF teardown post-LOAD with
+    `vfmig_force_polling_cmd=1`, when FW dumps its
+    full owed-completion backlog into the cmd EQ and
+    concurrent fresh `cmd_work_handler` invocations on the
+    teardown path are mid-populate.
   - `!forced` only -- synthetic comp_handler calls from
     `wait_func_handle_exec_timeout()` are recovery, not real
     EQEs, and must flow regardless of slot ownership.
@@ -215,6 +234,91 @@ a fundamental TOCTOU window. Trusting an explicit per-EQE
 discriminator on the destination -- driven by the same
 ownership bit `mlx5_cmd_invoke()`'s polling path already
 trusts -- is the architectural fix.
+
+#### 1.1.1 cmd-EQ producer/consumer index misalignment  *(active, validated 2026-05-22)*
+
+**Symptom (after layers 1+2 landed).** A different post-LOAD
+wedge surfaces: even when a stale-EQE flood is correctly
+filtered, fresh cmds (`ALLOC_UAR(0x802)`, `ALLOC_PD(0x800)`)
+still time out after 60s with `wait_func` reporting `No done
+completion`, despite FW having actually completed the cmd
+(`status_own` flipped to SW-owned, response written into the
+slot).
+
+**Diagnostic.** The new module knob
+`vfmig_eq_debug=1` (commit `9ca99865f938`) hooks
+`wait_func_handle_exec_timeout()` and dumps
+`(cmd_eq cons_index, eq_slot, eqe[ci].owner, fresh)`
+plus `lay->status_own` at `TIMEOUT_PRE_RECOVER` and
+`TIMEOUT_FINAL`. Empirically across hosts 086 / 087:
+
+```
+TIMEOUT_FINAL slot=0 op=0x802 lay->status_own=0x00
+  (CMD_OWNER_HW=0, status=0x0); cmd_eq ci=N eq_slot=N
+  sz=256 eqe[ci].owner=0x01 fresh=0
+```
+
+`lay->status_own == 0x00` proves FW completed the cmd. But
+the cmd-EQ slot SW is waiting on still has its initial
+owner bit (`0x01`), `fresh=0` -- FW never wrote a fresh EQE
+into that slot. Either FW wrote the EQE *somewhere else*
+(producer index ≠ what SW thinks consumer should be) or
+silently skipped the EQE entirely.
+
+`SAVE_VHCA_STATE` / `LOAD_VHCA_STATE` synchronizes the FW
+side of EQ state across the migration boundary, but the SW
+side (`eq->cons_index`) is reinitialized from scratch on
+the destination during VF probe. If FW's
+post-`LOAD_VHCA_STATE` producer index for the cmd EQ is
+non-zero, SW's `cons_index = 0` is misaligned and SW
+walks an EQ slot that's actually behind FW's write
+position -- it polls a slot FW won't touch until producer
+wraps the entire ring.
+
+**Workaround (validated 2026-05-22).**
+`vfmig_force_polling_cmd=1` (also commit `9ca99865f938`)
+flips all FW cmds onto the polling completion path
+(`mlx5_cmd_invoke()` reads `lay->status_own` directly off
+the cmd ring and never blocks on the cmd EQ for cmd
+completions). Empirically this fully eliminates the 60s
+timeouts: with `force_polling=1`, neither
+`TIMEOUT_PRE_RECOVER` nor `TIMEOUT_FINAL` fires, the test
+breezes past the wedge, and progresses through SAVE +
+LOAD into VF teardown. Layers 1+2 still see the
+expected stale-EQE flood and filter it cleanly.
+
+**Permanent fix (deferred).** Two viable shapes, neither
+landed:
+
+1. **Reset cmd EQ on dest post-`LOAD_VHCA_STATE`.** Before
+   the dest mlx5_core arms its cmd EQ, destroy + recreate
+   it (or QUERY_EQ + adjust `eq->cons_index` to match FW's
+   reported producer). Architecturally cleanest -- gives
+   us a known-aligned starting point.
+
+2. **Keep `force_polling=1` in the migration window.**
+   Set it on at LOAD time and clear it after a barrier
+   cmd round-trip confirms FW has caught up. Pragmatic and
+   already proven; depends on polling-mode being stable
+   under stress.
+
+Both leave layers 1+2 in place because the stale-EQE flood
+is not affected by either fix -- those EQEs are FW's
+*owed completions* from the source's pre-SAVE state, and
+arrive regardless of whether SW's `cons_index` is aligned
+or whether SW polls vs waits on the EQ.
+
+**Self-inflicted regression caught + fixed
+(2026-05-22).** With `force_polling=1` enabled the test
+progressed far enough to expose a NULL deref I had
+introduced in commit `69ae4b8adb66` (the layer-2 status_own
+filter): `cmd_work_handler` publishes `cmd->ent_arr[idx]
+= ent` BEFORE assigning `ent->lay`, so a stale EQE racing
+into that populate window NULL-derefs at offset `0x3f`.
+Fix folded into the same layer-2 path -- read `ent->lay`
+via `READ_ONCE` first, treat NULL as a stale EQE and
+`continue`. See "Populate-window NULL-lay subcase" under
+Layer 2 above.
 
 ### 1.2 `SET_ROCE_ADDRESS` rejected on the destination post-LOAD  *(new, 2026-05-21)*
 

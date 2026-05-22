@@ -1939,18 +1939,44 @@ static void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec, bool force
 			 * caller with garbage. Skip and let the real EQE
 			 * arrive when status_own actually flips.
 			 *
+			 * cmd_work_handler publishes cmd->ent_arr[idx] = ent
+			 * (under cmd->alloc_lock, in cmd_alloc_index() or
+			 * the page-queue path) BEFORE assigning ent->lay
+			 * = get_inst(cmd, ent->idx). A stale EQE racing into
+			 * that populate window finds ent != NULL but
+			 * ent->lay == NULL (from kzalloc). The doorbell has
+			 * not yet been rung, so no real FW completion can
+			 * belong to this slot -- treat the NULL lay as a
+			 * stale exactly like the still-HW-owned case and
+			 * skip. Without this guard, READ_ONCE(ent->lay->
+			 * status_own) NULL-derefs at offsetof(status_own)
+			 * == 0x3f. Race is empirically observable with
+			 * vfmig_force_polling_cmd=1 during VF teardown
+			 * post-LOAD, when FW dumps its owed-completion
+			 * backlog into the cmd EQ.
+			 *
 			 * !forced only: synthetic comp_handler calls from
 			 * wait_func_handle_exec_timeout() are recovery, not
 			 * real EQEs, and need to flow regardless of slot
 			 * ownership. Polling-mode mlx5_cmd_invoke() does not
 			 * traverse this function and is unaffected.
 			 */
-			if (!forced &&
-			    READ_ONCE(ent->lay->status_own) & CMD_OWNER_HW) {
-				mlx5_core_warn_rl(dev,
-						  "stale completion EQE on HW-owned slot (idx %d, op 0x%x); ignoring\n",
-						  ent->idx, ent->op);
-				continue;
+			if (!forced) {
+				struct mlx5_cmd_layout *lay;
+
+				lay = READ_ONCE(ent->lay);
+				if (!lay) {
+					mlx5_core_warn_rl(dev,
+							  "stale completion EQE on still-populating slot (idx %d, op 0x%x); ignoring\n",
+							  ent->idx, ent->op);
+					continue;
+				}
+				if (READ_ONCE(lay->status_own) & CMD_OWNER_HW) {
+					mlx5_core_warn_rl(dev,
+							  "stale completion EQE on HW-owned slot (idx %d, op 0x%x); ignoring\n",
+							  ent->idx, ent->op);
+					continue;
+				}
 			}
 
 			if (forced && ent->ret == -ETIMEDOUT)
