@@ -1897,9 +1897,12 @@ static int vfmig_cmd_suspend_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
  *      processed (cmd_free_index() flips the bit AFTER
  *      mlx5_cmd_comp_handler() has consumed the EQE).
  *
- *   2. FW-flush barrier. Issue a single cheap cmd (QUERY_ISSI)
- *      through the source VF mdev. The barrier lands on the
- *      lowest-free slot (slot 0 after a clean drain); if FW has
+ *   2. FW-flush barrier cmds. Issue
+ *      vfmig_save_drain_barrier_cmds (module param) QUERY_ISSI
+ *      cmds through the source VF mdev. Each barrier cmd is
+ *      synchronous (mlx5_cmd_exec_inout waits for completion
+ *      before returning), so all N land sequentially on the
+ *      lowest-free slot (slot 0 after a clean drain). If FW has
  *      an internally-queued completion it still owes on that
  *      slot, FW emits the stale EQE before processing the
  *      barrier. The driver consumes both EQEs back-to-back; the
@@ -1909,12 +1912,21 @@ static int vfmig_cmd_suspend_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
  *      FW's owed-completion queue is empty by the time
  *      SUSPEND_VHCA snapshots it.
  *
- *      Empirically validated on FW 28.48.1000 with
- *      swap_after_mr: a single QUERY_ISSI is sufficient to kick
- *      FW past whatever post-cmd internal work was lagging.
- *      Multi-cmd barrier rounds and explicit settle delays were
- *      tried during diagnosis (commit 50e22b8ee071, superseded
- *      by this commit) but not needed at v0.
+ *      Re-asserts bitmask idle after the round to give the cmd
+ *      EQ a brief window to drain any trailing stale EQE.
+ *
+ *      Module param history (this is a diagnostic knob, not a
+ *      production-tuning surface): the param was originally added
+ *      at default 4 in commit 50e22b8ee071, then stripped to a
+ *      hardcoded single barrier in commit dafdd032b663 after
+ *      swap_after_mr passed at N=1. Subsequent end-to-end runs
+ *      with the simplified form surfaced cleanup-time wedges
+ *      (refcount underflow, cmd-EQ producer/consumer
+ *      misalignment); the param is revived here so the workload
+ *      that actually exercised cleanup can be sweept across
+ *      barrier counts to disambiguate whether N is load-bearing
+ *      for the cleanup path. See known_issues.md section 1.1 +
+ *      1.1.1 for the full mechanism analysis.
  *
  * Why this matters
  * ----------------
@@ -1941,9 +1953,9 @@ static int vfmig_cmd_suspend_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
  * the VF pci_dev, verify the driver is mlx5_core and the mdev is
  * interface-up, then read cmd->vars.bitmask under cmd->alloc_lock.
  *
- * Returns 0 on success. -EBUSY if the bitmask drain times out or
- * if the barrier cmd fails (with a diagnostic dmesg line in
- * either case). Returns 0 (with no work done) for unbound /
+ * Returns 0 on success. -EBUSY if either bitmask drain times out
+ * or if a barrier cmd fails (with a diagnostic dmesg line in
+ * each case). Returns 0 (with no work done) for unbound /
  * not-up VFs; SAVE on an unbound VF is a legitimate use case
  * (the VF was already torn down by the time SAVE runs) and
  * there's no source cmd ring to drain.
@@ -1951,18 +1963,71 @@ static int vfmig_cmd_suspend_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
 #define VFMIG_SAVE_DRAIN_TIMEOUT_MS	5000
 #define VFMIG_SAVE_DRAIN_POLL_MS	10
 
+/*
+ * Number of QUERY_ISSI barrier cmds to issue after the layer-1
+ * bitmask drain. Default 4 -- matches the original empirical
+ * choice in commit 50e22b8ee071. Set to 0 to skip the barrier
+ * round entirely (diagnostic only; do not run production
+ * workloads with N=0). Each barrier costs one cmd round-trip
+ * (~us on FW 28.48.1000), so values up to a few dozen are cheap.
+ *
+ * Sweep this knob to disambiguate whether the SAVE-side barrier
+ * count is load-bearing for cleanup-time wedges that the
+ * dest-side cmd.c hardening (commits 4a89a284add7,
+ * 69ae4b8adb66, 305a35c12849) does not fully close. See
+ * known_issues.md section 1.1.1 for the experimental matrix.
+ */
+static unsigned int vfmig_save_drain_barrier_cmds = 4;
+module_param_named(vfmig_save_drain_barrier_cmds,
+		   vfmig_save_drain_barrier_cmds, uint, 0644);
+MODULE_PARM_DESC(vfmig_save_drain_barrier_cmds,
+		 "vfmig: number of QUERY_ISSI barrier cmds to issue on the source VF mdev after the SAVE-time bitmask drain, to flush FW's internally-queued owed completions before SUSPEND_VHCA. Default 4. Set to 0 to skip the barrier round entirely.");
+
+/*
+ * Re-poll the bitmask after a barrier cmd round to assert the
+ * interface is idle. The barrier cmds are synchronous so the slot
+ * should be free on return, but the cmd EQ might still be
+ * draining a trailing stale EQE -- give it a brief window.
+ */
+static int vfmig_save_poll_bitmask_idle(struct mlx5_core_dev *vf_mdev,
+					unsigned long all_free,
+					unsigned long timeout_ms,
+					unsigned long *out_bitmask)
+{
+	unsigned long deadline;
+	unsigned long bitmask;
+
+	deadline = jiffies + msecs_to_jiffies(timeout_ms);
+	for (;;) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&vf_mdev->cmd.alloc_lock, flags);
+		bitmask = vf_mdev->cmd.vars.bitmask;
+		spin_unlock_irqrestore(&vf_mdev->cmd.alloc_lock, flags);
+
+		if ((bitmask & all_free) == all_free) {
+			*out_bitmask = bitmask;
+			return 0;
+		}
+		if (time_after_eq(jiffies, deadline))
+			break;
+		msleep(VFMIG_SAVE_DRAIN_POLL_MS);
+	}
+	*out_bitmask = bitmask;
+	return -EBUSY;
+}
+
 static int vfmig_save_drain_vf_cmd_iface(struct mlx5_core_dev *pf_mdev,
 					 struct pci_dev *vf_pdev,
 					 u32 vf_id)
 {
-	u32 issi_in[MLX5_ST_SZ_DW(query_issi_in)] = {};
-	u32 issi_out[MLX5_ST_SZ_DW(query_issi_out)] = {};
 	struct mlx5_core_dev *vf_mdev;
 	struct device_driver *drv;
-	unsigned long deadline;
 	unsigned long all_free;
 	unsigned long bitmask;
+	unsigned int barriers;
 	int max_reg_cmds;
+	unsigned int i;
 	int err;
 
 	device_lock(&vf_pdev->dev);
@@ -1985,44 +2050,53 @@ static int vfmig_save_drain_vf_cmd_iface(struct mlx5_core_dev *pf_mdev,
 		   ((1UL << max_reg_cmds) - 1);
 
 	/* Layer 1: bitmask drain. */
-	deadline = jiffies + msecs_to_jiffies(VFMIG_SAVE_DRAIN_TIMEOUT_MS);
-	for (;;) {
-		unsigned long flags;
-
-		spin_lock_irqsave(&vf_mdev->cmd.alloc_lock, flags);
-		bitmask = vf_mdev->cmd.vars.bitmask;
-		spin_unlock_irqrestore(&vf_mdev->cmd.alloc_lock, flags);
-
-		if ((bitmask & all_free) == all_free)
-			break;
-
-		if (time_after_eq(jiffies, deadline)) {
-			mlx5_core_warn(pf_mdev,
-				       "vfmig: SAVE drain timeout on vf %u: cmd bitmask 0x%lx (expected 0x%lx); %u slots still in-flight\n",
-				       vf_id, bitmask, all_free,
-				       (unsigned int)hweight_long(all_free & ~bitmask));
-			err = -EBUSY;
-			goto out_unlock;
-		}
-
-		msleep(VFMIG_SAVE_DRAIN_POLL_MS);
+	err = vfmig_save_poll_bitmask_idle(vf_mdev, all_free,
+					   VFMIG_SAVE_DRAIN_TIMEOUT_MS,
+					   &bitmask);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SAVE drain timeout on vf %u: cmd bitmask 0x%lx (expected 0x%lx); %u slots still in-flight\n",
+			       vf_id, bitmask, all_free,
+			       (unsigned int)hweight_long(all_free & ~bitmask));
+		err = -EBUSY;
+		goto out_unlock;
 	}
 
 	/*
-	 * Layer 2: FW-flush barrier. A single QUERY_ISSI is empirically
-	 * sufficient on FW 28.48.1000 to absorb whatever owed completion
-	 * FW had queued; multi-cmd barrier rounds and explicit settle
-	 * delays were tried during diagnosis (commit 50e22b8ee071,
-	 * superseded) but not needed.
+	 * Layer 2: FW-flush barriers. Snapshot the module param so a
+	 * concurrent write doesn't change the loop count mid-flight.
 	 */
-	MLX5_SET(query_issi_in, issi_in, opcode, MLX5_CMD_OP_QUERY_ISSI);
-	err = mlx5_cmd_exec_inout(vf_mdev, query_issi, issi_in, issi_out);
-	if (err) {
-		mlx5_core_warn(pf_mdev,
-			       "vfmig: SAVE drain barrier on vf %u failed: %d\n",
-			       vf_id, err);
-		err = -EBUSY;
-		goto out_unlock;
+	barriers = READ_ONCE(vfmig_save_drain_barrier_cmds);
+	for (i = 0; i < barriers; i++) {
+		u32 issi_in[MLX5_ST_SZ_DW(query_issi_in)] = {};
+		u32 issi_out[MLX5_ST_SZ_DW(query_issi_out)] = {};
+		int cmd_err;
+
+		MLX5_SET(query_issi_in, issi_in, opcode,
+			 MLX5_CMD_OP_QUERY_ISSI);
+		cmd_err = mlx5_cmd_exec_inout(vf_mdev, query_issi,
+					      issi_in, issi_out);
+		if (cmd_err) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SAVE drain barrier %u/%u on vf %u failed: %d\n",
+				       i + 1, barriers, vf_id, cmd_err);
+			err = -EBUSY;
+			goto out_unlock;
+		}
+	}
+
+	/* Re-assert bitmask idle after the barrier round. */
+	if (barriers) {
+		err = vfmig_save_poll_bitmask_idle(vf_mdev, all_free,
+						   VFMIG_SAVE_DRAIN_TIMEOUT_MS,
+						   &bitmask);
+		if (err) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SAVE post-barrier bitmask still busy on vf %u: 0x%lx (expected 0x%lx)\n",
+				       vf_id, bitmask, all_free);
+			err = -EBUSY;
+			goto out_unlock;
+		}
 	}
 
 	err = 0;

@@ -320,6 +320,54 @@ via `READ_ONCE` first, treat NULL as a stale EQE and
 `continue`. See "Populate-window NULL-lay subcase" under
 Layer 2 above.
 
+#### 1.1.2 `vfmig_save_drain_barrier_cmds` revived for cleanup-path sweep  *(active, 2026-05-25)*
+
+**Why.** The original validation matrix in §1.1 tested
+`barriers={0,1,4}` only against the `swap_after_mr`
+workload, which exercises the failure mode "VF never
+appears on the dest" (CREATE_MKEY hangs in
+`mlx5e_create_mdev_resources`). The matrix entry "N=4 →
+overcompleted; same outcome as N=1" was true *for that
+workload*. The MR-restore + cleanup workload was *not*
+sweept against barrier counts; the
+single-cmd shape landed in `dafdd032b663` was carried
+forward unchanged into the cleanup-path testing, which
+subsequently exposed the cleanup-time wedges (refcount
+underflow `4a89a284add7`, cmd-EQ misalignment §1.1.1).
+
+So the question "was the cleanup wedge an artifact of the
+N=4 → N=1 reduction, or an independent failure mode of
+the same workload that N=4 happened to mask
+coincidentally?" is genuinely open. None of the
+subsequent dest-side hardening (`4a89a284add7`,
+`69ae4b8adb66`, `305a35c12849`) targeted the SAVE-side
+barrier count -- they targeted the *consequences* of
+stale EQEs reaching the dest cmd_comp_handler at all.
+
+**Revival.** `vfmig_save_drain_barrier_cmds` (uint, 0644,
+default **4**) is reintroduced with the original
+`50e22b8ee071` shape: layer-1 bitmask drain, then N
+sequential `QUERY_ISSI` cmds via
+`mlx5_cmd_exec_inout()` (each synchronous; lands on slot
+0 after the previous returns), then layer-1 bitmask
+re-poll. Settle-delay knob from `50e22b8ee071` is *not*
+revived -- only the barrier count.
+
+**Experiment plan.**
+
+| run | barriers | force_polling | eq_debug | expected reading |
+|---|---|---|---|---|
+| baseline | 4 | 0 | 1 | does the cleanup wedge appear or not at the historically-tested default? |
+| sweep_lo | 1 | 0 | 1 | reproduces the regression we already debugged from? |
+| sweep_zero | 0 | 0 | 1 | confirms barriers are doing *something* (or not) -- if cleanup wedges identically at 0 and 1, axis A is moot for cleanup; if 0 is worse than 1, axis A matters but isn't the load-bearing piece |
+
+If `barriers=4 + force_polling=0` runs cleanup cleanly,
+the v0 path collapses to "revert
+`69ae4b8adb66` + `9ca99865f938` + `305a35c12849` (none
+needed) and ship `barriers=4`." If not, the dest-side
+hardening was load-bearing and `force_polling=1` is the
+v0 carry-on as currently planned.
+
 ### 1.2 `SET_ROCE_ADDRESS` rejected on the destination post-LOAD  *(new, 2026-05-21)*
 
 **Symptom.** Every `SET_ROCE_ADDRESS(0x761)` issued by the
