@@ -88,6 +88,39 @@ static unsigned int prof_sel = MLX5_DEFAULT_PROF;
 module_param_named(prof_sel, prof_sel, uint, 0444);
 MODULE_PARM_DESC(prof_sel, "profile selector. Valid range 0 - 2");
 
+/*
+ * Debug knob (vfmig). Gates whether mlx5_function_enable() opts a
+ * freshly-restored VF mdev into polling cmd completions
+ * (dev->cmd.force_polling) for the rest of its lifetime.
+ *
+ * Default false: restored VFs stay on the event-driven cmd completion
+ * path. Empirically, opting them in (=true) reliably wedges the host
+ * with no recoverable kernel log -- the broad scope (every cmd on the
+ * mdev routes through cmd_work_handler's polling path, including
+ * callback and page-handling cmds) appears to introduce a
+ * deadlock-prone interaction we have not yet root-caused. Leaving the
+ * knob off restores the prior dest-side behavior: the very first cmd
+ * post-LOAD (typically ALLOC_UAR during VF probe) takes a 60s
+ * MLX5_CMD_TIMEOUT_MSEC hit absorbing the stale cmd-EQ slot, after
+ * which the EQ resyncs and subsequent cmds flow normally. Test
+ * frameworks that only check PD/CQ-restore semantics survive this with
+ * a partial-doorbell warning rather than a hard wedge.
+ *
+ * The knob remains in tree as an A/B toggle for follow-up work on
+ * narrower polling scopes (per-cmd-site polling via
+ * mlx5_cmd_exec_polling, post-LOAD warm-up NOP) so the failure mode is
+ * reproducible alongside any candidate fix.
+ *
+ * Read at VF-probe time only; runtime toggles take effect on the next
+ * fresh VF mdev (i.e. next sriov_numvfs cycle), not on already-probed
+ * VFs.
+ */
+static bool vfmig_polling_restored_vf;
+module_param_named(vfmig_polling_restored_vf, vfmig_polling_restored_vf,
+		   bool, 0644);
+MODULE_PARM_DESC(vfmig_polling_restored_vf,
+		 "vfmig debug: opt restored-VF mdevs into polling cmd completions for the lifetime of the mdev. Default N. Set to Y to reproduce the cmd_work_handler-polling wedge for follow-up debugging.");
+
 static u32 sw_owner_id[4];
 #define MAX_SW_VHCA_ID (BIT(__mlx5_bit_sz(cmd_hca_cap_2, sw_vhca_id)) - 1)
 static DEFINE_IDA(sw_vhca_ida);
@@ -1247,29 +1280,26 @@ static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeou
 		dev->priv.vfmig_self_restored = true;
 
 		/*
-		 * Opt this restored-VF mdev into polling cmd completions
-		 * for the rest of its lifetime.
+		 * Optionally opt this restored-VF mdev into polling cmd
+		 * completions for the rest of its lifetime, gated on the
+		 * vfmig_polling_restored_vf debug knob (default off, see
+		 * top-of-file comment).
 		 *
-		 * Across LOAD_VHCA_STATE, the dest VF's cmd EQ producer/
+		 * Across LOAD_VHCA_STATE the dest VF's cmd EQ producer/
 		 * consumer indices can disagree with FW's view: cmds
 		 * complete in FW (lay->status_own flips to SW) but the
-		 * matching completion EQE lands on a slot SW isn't watching,
-		 * and the cmd times out at MLX5_CMD_TIMEOUT_MSEC. The first
-		 * cmd to bite this is opcode-agnostic -- whatever lands on
-		 * the misaligned slot first (ALLOC_UAR, CREATE_RQT,
-		 * CREATE_MKEY, etc.) wedges. Polling reads status_own
-		 * directly off the cmd ring and so sidesteps the cmd EQ
-		 * delivery for cmd completions. Async events still flow
-		 * through the async EQ unmodified.
-		 *
-		 * Scope is intentionally tight: only mdevs that just
-		 * consumed a "restored" mark get the flag flipped.
-		 * Untouched on every other code path (PF, non-vfmig VFs,
-		 * migratable VFs that never migrated). Cleared implicitly
-		 * when the mdev is freed and reallocated, same lifetime as
-		 * vfmig_self_restored above.
+		 * matching completion EQE lands on a slot SW isn't
+		 * watching, and the cmd times out at
+		 * MLX5_CMD_TIMEOUT_MSEC. Forcing every cmd on this mdev
+		 * through the polling completion path sidesteps the EQ
+		 * for cmd completions and so dodges the wedge -- but in
+		 * the broad form gated here, that path itself wedges the
+		 * host (root cause not yet localised); narrower fixes
+		 * (per-cmd-site polling, post-LOAD warm-up NOP) are
+		 * preferred. The knob stays as a debug-only reproducer.
 		 */
-		dev->cmd.force_polling = true;
+		if (READ_ONCE(vfmig_polling_restored_vf))
+			dev->cmd.force_polling = true;
 
 		err = mlx5_vfmig_vf_apply_pending_load(dev);
 		if (err) {
