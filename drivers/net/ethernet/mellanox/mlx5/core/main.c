@@ -121,6 +121,34 @@ module_param_named(vfmig_polling_restored_vf, vfmig_polling_restored_vf,
 MODULE_PARM_DESC(vfmig_polling_restored_vf,
 		 "vfmig debug: opt restored-VF mdevs into polling cmd completions for the lifetime of the mdev. Default N. Set to Y to reproduce the cmd_work_handler-polling wedge for follow-up debugging.");
 
+/*
+ * Debug knob (vfmig). When set, mlx5_function_enable() issues a single
+ * polling-mode NOP on the restored VF's cmd interface immediately
+ * after LOAD_VHCA_STATE applies, before any other cmd touches the
+ * mdev. Hypothesis: the cmd EQ producer/consumer skew introduced by
+ * LOAD_VHCA_STATE is one slot deep -- the first post-LOAD cmd
+ * absorbs it (FW writes the matching EQE on the misaligned slot, SW
+ * never sees it, cmd times out after MLX5_CMD_TIMEOUT_MSEC). Polling
+ * the warm-up cmd reads status_own off the cmd ring directly and so
+ * pulls the first cmd out of the EQ delivery path entirely; FW's EQ
+ * producer advances by one as a side effect of the cmd completing,
+ * and subsequent event-driven cmds see fresh EQEs at the slot SW is
+ * watching.
+ *
+ * If the model is right, this single line of code retires the 60s
+ * ALLOC_UAR timeout that ships as the default-N behavior of
+ * vfmig_polling_restored_vf, with none of the broad-scope wedge risk
+ * of routing every cmd through cmd_work_handler's polling path.
+ *
+ * Default false until empirically validated. Read once per restored
+ * VF probe.
+ */
+static bool vfmig_load_warmup_nop;
+module_param_named(vfmig_load_warmup_nop, vfmig_load_warmup_nop,
+		   bool, 0644);
+MODULE_PARM_DESC(vfmig_load_warmup_nop,
+		 "vfmig debug: after LOAD_VHCA_STATE applies on a restored VF, issue one polling-mode NOP on the restored mdev's cmd interface to consume the post-LOAD cmd-EQ producer/consumer skew before any event-driven cmd runs. Default N.");
+
 static u32 sw_owner_id[4];
 #define MAX_SW_VHCA_ID (BIT(__mlx5_bit_sz(cmd_hca_cap_2, sw_vhca_id)) - 1)
 static DEFINE_IDA(sw_vhca_ida);
@@ -1307,6 +1335,48 @@ static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeou
 				      "vfmig: apply LOAD_VHCA_STATE failed for vhca_id 0x%04x: %d\n",
 				      restored_vhca_id, err);
 			goto err_cmd_cleanup;
+		}
+
+		/*
+		 * Optional post-LOAD warm-up NOP, gated on the
+		 * vfmig_load_warmup_nop debug knob (see top-of-file). Issue
+		 * one polling-mode NOP on the restored mdev's cmd interface
+		 * so the very first cmd post-LOAD reads completion off the
+		 * cmd ring's status_own bit instead of going through the
+		 * (skewed) cmd EQ. If the skew is exactly one slot deep, the
+		 * NOP absorbs it and subsequent event-driven cmds find their
+		 * EQEs at the slot SW expects.
+		 *
+		 * Placed after apply_pending_load (which issues
+		 * LOAD_VHCA_STATE on the *PF* mdev, not on this VF mdev) and
+		 * before any cmd actually runs against this VF mdev's cmd
+		 * interface, so the NOP is provably the first cmd this VF's
+		 * post-LOAD cmd path executes. import_replayed_fw_pages
+		 * below is purely software (no cmd issued); subsequent cmds
+		 * happen later in mlx5_function_open and downstream.
+		 *
+		 * NOP failure is logged but not fatal: a failed NOP just
+		 * means the warm-up didn't get to act, and probe falls back
+		 * to the same axis-B failure mode it had without the knob.
+		 */
+		if (READ_ONCE(vfmig_load_warmup_nop)) {
+			u32 nop_in[MLX5_ST_SZ_DW(nop_in)] = {};
+			u32 nop_out[MLX5_ST_SZ_DW(nop_out)] = {};
+			int nop_err;
+
+			MLX5_SET(nop_in, nop_in, opcode, MLX5_CMD_OP_NOP);
+			nop_err = mlx5_cmd_exec_polling(dev, nop_in,
+							sizeof(nop_in),
+							nop_out,
+							sizeof(nop_out));
+			if (nop_err)
+				mlx5_core_warn(dev,
+					       "vfmig: post-LOAD warm-up NOP failed on vhca_id 0x%04x: %d\n",
+					       restored_vhca_id, nop_err);
+			else
+				mlx5_core_info(dev,
+					       "vfmig: post-LOAD warm-up NOP completed (polling) on vhca_id 0x%04x\n",
+					       restored_vhca_id);
 		}
 
 		/*
