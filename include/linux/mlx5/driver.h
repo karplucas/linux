@@ -331,6 +331,25 @@ struct mlx5_cmd {
 	 */
 	void	       *vfmig_iova_dom;
 
+	/*
+	 * Per-device opt-in to polling cmd completions for ALL FW cmds
+	 * issued against this mdev. When true, cmd_exec() routes every cmd
+	 * through the polling completion path (lay->status_own off the cmd
+	 * ring) and bypasses the cmd EQ for cmd completions; async events
+	 * still flow through the async EQ unmodified.
+	 *
+	 * Targeted workaround for the post-LOAD cmd EQ wedge under SR-IOV
+	 * VF migration: a freshly-restored VF's cmd EQ producer/consumer
+	 * indices can disagree with FW's view across LOAD_VHCA_STATE, so
+	 * cmds complete in FW (status_own flips to SW) but the matching
+	 * completion EQE is never observed by SW. Polling sidesteps the
+	 * EQ delivery and so dodges the wedge. Set by mlx5_vfmig at VF
+	 * probe time on a restored VHCA; stays set for the lifetime of the
+	 * mdev. Default false on every other code path -- PF, non-vfmig
+	 * VFs, and migratable VFs that never migrated are unaffected.
+	 */
+	bool		force_polling;
+
 	/* protect command queue allocations
 	 */
 	spinlock_t	alloc_lock;
