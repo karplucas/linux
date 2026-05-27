@@ -31,8 +31,40 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/mlx5/driver.h>
 #include "mlx5_core.h"
+
+/*
+ * Debug knob (vfmig). When set, mlx5_cmd_alloc_uar() routes
+ * ALLOC_UAR(0x802) through mlx5_cmd_exec_polling() instead of the
+ * default event-driven path -- but only on mdevs that came up via
+ * the vfmig restore path (mlx5_vf_is_restored() == true). PFs and
+ * non-restored VFs are unaffected.
+ *
+ * Targets the same axis-B post-LOAD cmd-EQ producer/consumer skew
+ * the warm-up NOP knob (vfmig_load_warmup_nop) targets, but at a
+ * different code site: the very first cmds a freshly-restored VF
+ * issues on its own cmd interface during probe are the eight
+ * ALLOC_UAR calls in alloc_uars_page() (one per doorbell page).
+ * Empirically those are the cmds that have been absorbing the
+ * 60s MLX5_CMD_TIMEOUT_MSEC hit in every wedged dest-side run.
+ *
+ * Polling each one consumes the (presumed one-slot-deep) skew at
+ * the call site instead of relying on a separate warm-up cmd to
+ * have already done it. Either knob alone should be sufficient if
+ * the axis-B model is correct; both can be enabled for belt-and-
+ * suspenders. Scope is much narrower than vfmig_polling_restored_vf
+ * -- only ALLOC_UAR, only on restored VFs -- so the broad-scope
+ * cmd_work_handler wedge does not apply.
+ *
+ * Default false until empirically validated.
+ */
+static bool vfmig_polling_alloc_uar;
+module_param_named(vfmig_polling_alloc_uar, vfmig_polling_alloc_uar,
+		   bool, 0644);
+MODULE_PARM_DESC(vfmig_polling_alloc_uar,
+		 "vfmig debug: route ALLOC_UAR cmds through mlx5_cmd_exec_polling() on restored VF mdevs to dodge the post-LOAD cmd-EQ skew at the alloc_uars_page() call site. Default N.");
 
 static int mlx5_cmd_alloc_uar(struct mlx5_core_dev *dev, u32 *uarn)
 {
@@ -41,7 +73,11 @@ static int mlx5_cmd_alloc_uar(struct mlx5_core_dev *dev, u32 *uarn)
 	int err;
 
 	MLX5_SET(alloc_uar_in, in, opcode, MLX5_CMD_OP_ALLOC_UAR);
-	err = mlx5_cmd_exec_inout(dev, alloc_uar, in, out);
+	if (mlx5_vf_is_restored(dev) && READ_ONCE(vfmig_polling_alloc_uar))
+		err = mlx5_cmd_exec_polling(dev, in, sizeof(in),
+					    out, sizeof(out));
+	else
+		err = mlx5_cmd_exec_inout(dev, alloc_uar, in, out);
 	if (err)
 		return err;
 
