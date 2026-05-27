@@ -32,6 +32,7 @@
 
 #include <linux/highmem.h>
 #include <linux/errno.h>
+#include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/dma-mapping.h>
 #include <linux/slab.h>
@@ -48,6 +49,43 @@
 #include "vfmig_iova.h"
 #define CREATE_TRACE_POINTS
 #include "diag/cmd_tracepoint.h"
+
+/*
+ * Debug knob (vfmig). Layer-1 dup-EQE hardening for
+ * mlx5_cmd_comp_handler: refcount-balance the !PENDING_COMP path so a
+ * stale duplicate completion EQE does not underflow the cmd_work_ent
+ * refcount, plus an unlikely(!ent) guard for stale EQEs that land on a
+ * slot whose ent_arr[] entry has already been cleared by a prior legit
+ * completion.
+ *
+ * When N (default), mlx5_cmd_comp_handler keeps strict upstream
+ * behavior: TIMEDOUT is cleared eagerly before the PENDING_COMP gate,
+ * the !PENDING_COMP branch unconditionally cmd_ent_put()s, and a NULL
+ * ent_arr[i] silently NULL-derefs. This is the pre-vfmig kernel
+ * behavior: race exists but is not triggered by mainline FW, which
+ * does not emit duplicate completion EQEs.
+ *
+ * When Y, the per-slot loop in mlx5_cmd_comp_handler:
+ *   - skips a NULL ent (rate-limited warn) instead of NULL-derefing,
+ *   - defers clear_bit(MLX5_CMD_ENT_STATE_TIMEDOUT) past the
+ *     PENDING_COMP gate so the bit stays around as a discriminator,
+ *   - in the !PENDING_COMP / !forced branch, fires cmd_ent_put only
+ *     when test_and_clear_bit(TIMEDOUT) confirms a synthetic forced
+ *     completion previously leaked the line-1063 cmd_ent_get(); a
+ *     stale duplicate (TIMEDOUT clear) is rate-limited-warned and
+ *     skipped, leaving the caller's still-live final put intact.
+ *
+ * Cost: one branch per cmd-EQ EQE on the !forced path. Default off so
+ * stock mlx5 behavior is unchanged unless explicitly opted in for VF
+ * migration regression sweeps. Pair with
+ * vfmig_cmd_filter_dup_eqe_status_own to additionally cover stale
+ * EQEs that arrive while a real cmd is still in flight on the slot.
+ */
+static bool vfmig_cmd_filter_dup_eqe_refcount;
+module_param_named(vfmig_cmd_filter_dup_eqe_refcount,
+		   vfmig_cmd_filter_dup_eqe_refcount, bool, 0644);
+MODULE_PARM_DESC(vfmig_cmd_filter_dup_eqe_refcount,
+		 "vfmig debug: refcount-balance mlx5_cmd_comp_handler against duplicate completion EQEs (NULL-ent guard + TIMEDOUT-bit discriminator on the !PENDING_COMP path). Default N. Set to Y to enable layer-1 dup-EQE hardening for VF migration debugging.");
 
 struct mlx5_ifc_mbox_out_bits {
 	u8         status[0x8];
@@ -1800,12 +1838,40 @@ static void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec, bool force
 	vector = vec & 0xffffffff;
 	for (i = 0; i < (1 << cmd->vars.log_sz); i++) {
 		if (test_bit(i, &vector)) {
+			bool filter_refcount =
+				READ_ONCE(vfmig_cmd_filter_dup_eqe_refcount);
+
 			ent = cmd->ent_arr[i];
+
+			/*
+			 * Layer-1 dup-EQE filter (vfmig knob):
+			 * stale completion EQE on a slot whose ent_arr[]
+			 * entry has already been cleared by cmd_free_index
+			 * in a prior cmd_ent_put. Without this guard the
+			 * subsequent ent->ret / ent->state derefs NULL.
+			 * Defensive only; legitimate path always has
+			 * ent != NULL.
+			 */
+			if (filter_refcount && unlikely(!ent)) {
+				if (!forced)
+					mlx5_core_warn_rl(dev,
+							  "stale completion EQE on freed slot (idx %d, vector 0x%lx); ignoring\n",
+							  i, vector);
+				continue;
+			}
 
 			if (forced && ent->ret == -ETIMEDOUT)
 				set_bit(MLX5_CMD_ENT_STATE_TIMEDOUT,
 					&ent->state);
-			else if (!forced) /* real FW completion */
+			else if (!forced && !filter_refcount)
+				/*
+				 * Upstream behavior: clear TIMEDOUT eagerly.
+				 * When the layer-1 filter is enabled (knob=Y)
+				 * the clear is deferred past the PENDING_COMP
+				 * gate so TIMEDOUT can serve as the
+				 * !PENDING_COMP-branch discriminator; see the
+				 * deferred clear_bit() below.
+				 */
 				clear_bit(MLX5_CMD_ENT_STATE_TIMEDOUT,
 					  &ent->state);
 
@@ -1814,12 +1880,60 @@ static void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec, bool force
 						&ent->state)) {
 				/* only real completion can free the cmd slot */
 				if (!forced) {
-					mlx5_core_err(dev, "Command completion arrived after timeout (entry idx = %d).\n",
-						      ent->idx);
-					cmd_ent_put(ent);
+					if (filter_refcount) {
+						/*
+						 * test_and_clear_bit(TIMEDOUT)
+						 * is the discriminator:
+						 *   set:   synthetic forced-
+						 *          comp earlier leaked
+						 *          the cmd_ent_get()
+						 *          @ line 1063; this
+						 *          real EQE owes the
+						 *          matching put.
+						 *   clear: stale duplicate of
+						 *          a real completion;
+						 *          the line-1063 get
+						 *          was already balanced
+						 *          by the legit comp
+						 *          path. Skipping
+						 *          cmd_ent_put here
+						 *          keeps the refcount
+						 *          sane against the
+						 *          caller's still-live
+						 *          final put.
+						 */
+						if (test_and_clear_bit(MLX5_CMD_ENT_STATE_TIMEDOUT,
+								       &ent->state)) {
+							mlx5_core_err(dev,
+								      "Command completion arrived after timeout (entry idx = %d).\n",
+								      ent->idx);
+							cmd_ent_put(ent);
+						} else {
+							mlx5_core_warn_rl(dev,
+									  "stale duplicate cmd completion ignored (entry idx = %d, op 0x%x)\n",
+									  ent->idx, ent->op);
+						}
+					} else {
+						mlx5_core_err(dev, "Command completion arrived after timeout (entry idx = %d).\n",
+							      ent->idx);
+						cmd_ent_put(ent);
+					}
 				}
 				continue;
 			}
+
+			/*
+			 * Real EQE on a still-PENDING cmd. Any TIMEDOUT bit
+			 * left behind by a synthetic forced-comp that a
+			 * recovery flow beat to the punch is moot now: the
+			 * cmd has recovered in time, so the timeout signal
+			 * no longer applies. Only meaningful when the
+			 * layer-1 filter is enabled; without it, the eager
+			 * clear above already handled this.
+			 */
+			if (filter_refcount && !forced)
+				clear_bit(MLX5_CMD_ENT_STATE_TIMEDOUT,
+					  &ent->state);
 
 			if (ent->callback && cancel_delayed_work(&ent->cb_timeout_work))
 				cmd_ent_put(ent); /* timeout work was canceled */
