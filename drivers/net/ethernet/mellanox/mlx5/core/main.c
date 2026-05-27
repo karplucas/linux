@@ -1246,6 +1246,31 @@ static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeou
 		 */
 		dev->priv.vfmig_self_restored = true;
 
+		/*
+		 * Opt this restored-VF mdev into polling cmd completions
+		 * for the rest of its lifetime.
+		 *
+		 * Across LOAD_VHCA_STATE, the dest VF's cmd EQ producer/
+		 * consumer indices can disagree with FW's view: cmds
+		 * complete in FW (lay->status_own flips to SW) but the
+		 * matching completion EQE lands on a slot SW isn't watching,
+		 * and the cmd times out at MLX5_CMD_TIMEOUT_MSEC. The first
+		 * cmd to bite this is opcode-agnostic -- whatever lands on
+		 * the misaligned slot first (ALLOC_UAR, CREATE_RQT,
+		 * CREATE_MKEY, etc.) wedges. Polling reads status_own
+		 * directly off the cmd ring and so sidesteps the cmd EQ
+		 * delivery for cmd completions. Async events still flow
+		 * through the async EQ unmodified.
+		 *
+		 * Scope is intentionally tight: only mdevs that just
+		 * consumed a "restored" mark get the flag flipped.
+		 * Untouched on every other code path (PF, non-vfmig VFs,
+		 * migratable VFs that never migrated). Cleared implicitly
+		 * when the mdev is freed and reallocated, same lifetime as
+		 * vfmig_self_restored above.
+		 */
+		dev->cmd.force_polling = true;
+
 		err = mlx5_vfmig_vf_apply_pending_load(dev);
 		if (err) {
 			mlx5_core_err(dev,
