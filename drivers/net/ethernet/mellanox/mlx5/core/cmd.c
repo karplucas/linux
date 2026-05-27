@@ -87,6 +87,56 @@ module_param_named(vfmig_cmd_filter_dup_eqe_refcount,
 MODULE_PARM_DESC(vfmig_cmd_filter_dup_eqe_refcount,
 		 "vfmig debug: refcount-balance mlx5_cmd_comp_handler against duplicate completion EQEs (NULL-ent guard + TIMEDOUT-bit discriminator on the !PENDING_COMP path). Default N. Set to Y to enable layer-1 dup-EQE hardening for VF migration debugging.");
 
+/*
+ * Debug knob (vfmig). Layer-2 dup-EQE hardening for
+ * mlx5_cmd_comp_handler: filter stale completion EQEs that arrive
+ * while a real cmd is still in flight on the slot, by trusting the
+ * cmd-ring slot's status_own byte as a "FW done" discriminator.
+ *
+ * FW emits a real completion EQE only AFTER it has written the
+ * response into the cmd ring slot and cleared CMD_OWNER_HW (handing
+ * ownership back to SW). A slot whose status_own still has
+ * CMD_OWNER_HW set therefore CANNOT have produced the EQE we are
+ * currently servicing -- the cmd has not completed yet. Polling-mode
+ * mlx5_cmd_invoke() (poll_timeout()) already trusts this exact bit on
+ * this exact byte as a sufficient "FW done" signal.
+ *
+ * Without this filter, a stale duplicate EQE arriving while a real
+ * cmd is in flight passes test_and_clear_bit(PENDING_COMP), memcpys
+ * the slot's request data (the in-flight cmd's input -- FW has not
+ * yet written the response) into the caller's response buffer, and
+ * completes the caller with garbage. The real EQE, when FW does emit
+ * it, then finds PENDING_COMP=0 and falls into the layer-1 path,
+ * leaving the in-flight caller to time out via
+ * wait_func_handle_exec_timeout().
+ *
+ * Includes an ent->lay NULL guard for the cmd_work_handler populate
+ * window:
+ *   cmd->ent_arr[idx] = ent;          [1] publish (alloc_lock held)
+ *   ent->lay = get_inst(cmd, idx);    [2] populate
+ * A stale EQE racing into [1]..[2] finds ent != NULL but
+ * ent->lay == NULL (kzalloc); reading status_own off NULL crashes at
+ * offsetof(status_own) == 0x3f. The doorbell has not yet been rung
+ * for this slot, so any EQE in this window must be stale -- treat
+ * NULL lay as a stale exactly like still-HW-owned and skip.
+ *
+ * !forced only: synthetic comp_handler calls from
+ * wait_func_handle_exec_timeout() / mlx5_cmd_trigger_completions()
+ * are recovery flows for genuinely stuck commands and must drive
+ * completion regardless of slot ownership.
+ *
+ * Cost: one READ_ONCE(ent->lay) + one READ_ONCE(lay->status_own) per
+ * cmd-EQ EQE on the !forced path. Default off so stock mlx5 behavior
+ * is unchanged. Pair with vfmig_cmd_filter_dup_eqe_refcount for
+ * layer-1 coverage of stale EQEs that arrive after the legitimate
+ * completion path has already cleared PENDING_COMP.
+ */
+static bool vfmig_cmd_filter_dup_eqe_status_own;
+module_param_named(vfmig_cmd_filter_dup_eqe_status_own,
+		   vfmig_cmd_filter_dup_eqe_status_own, bool, 0644);
+MODULE_PARM_DESC(vfmig_cmd_filter_dup_eqe_status_own,
+		 "vfmig debug: filter stale completion EQEs in mlx5_cmd_comp_handler via cmd-ring status_own (skip EQEs whose slot is still HW-owned, with ent->lay populate-window NULL guard). Default N. Set to Y to enable layer-2 dup-EQE hardening for VF migration debugging.");
+
 struct mlx5_ifc_mbox_out_bits {
 	u8         status[0x8];
 	u8         reserved_at_8[0x18];
@@ -1874,6 +1924,46 @@ static void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec, bool force
 				 */
 				clear_bit(MLX5_CMD_ENT_STATE_TIMEDOUT,
 					  &ent->state);
+
+			/*
+			 * Layer-2 dup-EQE filter (vfmig knob). FW emits a
+			 * real completion EQE only AFTER it has written the
+			 * response and cleared CMD_OWNER_HW; a slot whose
+			 * status_own still has CMD_OWNER_HW set therefore
+			 * cannot be the EQE we are servicing here -- the
+			 * cmd has not completed yet. Skip and let the real
+			 * EQE arrive when status_own actually flips.
+			 *
+			 * cmd_work_handler publishes ent_arr[idx]=ent under
+			 * alloc_lock BEFORE assigning ent->lay; a stale EQE
+			 * racing into that window finds ent != NULL but
+			 * ent->lay == NULL. Treat NULL lay as a stale on a
+			 * still-populating slot (the doorbell has not yet
+			 * been rung, so no real FW completion can belong to
+			 * this slot).
+			 *
+			 * !forced only: synthetic forced-comp calls are
+			 * recovery for stuck cmds and must flow regardless
+			 * of slot ownership.
+			 */
+			if (!forced &&
+			    READ_ONCE(vfmig_cmd_filter_dup_eqe_status_own)) {
+				struct mlx5_cmd_layout *lay;
+
+				lay = READ_ONCE(ent->lay);
+				if (!lay) {
+					mlx5_core_warn_rl(dev,
+							  "stale completion EQE on still-populating slot (idx %d, op 0x%x); ignoring\n",
+							  ent->idx, ent->op);
+					continue;
+				}
+				if (READ_ONCE(lay->status_own) & CMD_OWNER_HW) {
+					mlx5_core_warn_rl(dev,
+							  "stale completion EQE on HW-owned slot (idx %d, op 0x%x); ignoring\n",
+							  ent->idx, ent->op);
+					continue;
+				}
+			}
 
 			/* if we already completed the command, ignore it */
 			if (!test_and_clear_bit(MLX5_CMD_ENT_STATE_PENDING_COMP,
