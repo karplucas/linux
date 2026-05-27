@@ -2020,6 +2020,20 @@ static int cmd_exec(struct mlx5_core_dev *dev, void *in, int in_size, void *out,
 	if (mlx5_cmd_is_down(dev) || !opcode_allowed(&dev->cmd, opcode))
 		return -ENXIO;
 
+	/*
+	 * Per-device polling opt-in (vfmig). When set, route every cmd on
+	 * this mdev through the polling completion path -- equivalent to
+	 * mlx5_cmd_exec_polling() for the whole device. cmd_work_handler
+	 * routes both the global CMD_MODE_POLLING mode and the per-ent
+	 * ent->polling flag through poll_timeout() + forced
+	 * mlx5_cmd_comp_handler(); raising force_polling here is safe for
+	 * callback and page-queue cmds and matches mlx5_cmd_exec_polling()'s
+	 * existing semantics. Targeted workaround for the post-LOAD cmd EQ
+	 * wedge under SR-IOV VF migration; see struct mlx5_cmd::force_polling.
+	 */
+	if (READ_ONCE(dev->cmd.force_polling))
+		force_polling = true;
+
 	if (!callback) {
 		/* The semaphore is already held for callback commands. It was
 		 * acquired in mlx5_cmd_exec_cb()
