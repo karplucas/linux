@@ -251,6 +251,44 @@ module_param_named(vfmig_load_drain_barrier_nops,
 MODULE_PARM_DESC(vfmig_load_drain_barrier_nops,
 		 "vfmig debug: after the cmd EQ is created and (optionally) drained on a restored VF, issue this many event-driven NOPs in sequence on the cmd interface before mlx5_clock_load() runs, to drive FW to flush any lazily-held pre-migration owed completions on slot 0 while layer-1/layer-2 dup-EQE filters absorb whatever comes out. Default 0 (disabled).");
 
+/*
+ * Debug knob (vfmig). After the LOAD-time cmd-EQ drain and the (optional)
+ * event-driven NOP barrier above, idle the cmd interface for this many
+ * milliseconds before mlx5_clock_load() runs. Default 0 (disabled).
+ *
+ * Empirical motivation. Run B (vfmig_load_drain_barrier_nops=1) shows the
+ * stale dup-EQE arrives at a fixed ~6.5ms wall-clock after the LOAD-time
+ * drain, regardless of whether we issue NOPs in the interval. The NOP
+ * itself completes in ~80us via real EQE delivery, far short of the 6.5ms
+ * window, so by the time FW emits the stale we are already past the NOP
+ * barrier and into the next cmd in flight (alloc_pd / alloc_td /
+ * create_mkey -- whichever happens to occupy slot 0 at +6.5ms). Layer-1
+ * absorbs the stale cleanly, but the cmd that was the unlucky occupant
+ * times out 60s later: FW evidently considers its slot-0 EQE budget
+ * spent on the stale and never delivers a real completion for the
+ * doorbell that followed.
+ *
+ * The only deterministic shape of "ensure no real cmd is at slot 0 at
+ * +6.5ms" is: hold the cmd interface idle for >= 7ms after the drain.
+ * During the sleep slot 0 is free (cmd->ent_arr[0] == NULL); when FW
+ * lazily emits the stale, layer-1 takes the !ent / "freed slot" branch
+ * and the EQE is absorbed without victimizing any real cmd. Subsequent
+ * cmds (mlx5_clock_load and the mlx5e probe path) then issue against a
+ * cmd-EQ FW now considers fully reconciled.
+ *
+ * Tradeoff: the sleep is wall-clock cost that lengthens every restored
+ * VF's mlx5_load() by N ms. Sweep small values (5/10/20 ms) and pick
+ * the smallest that yields a clean restore. Default 0 keeps the knob
+ * dormant for non-vfmig PFs and unmigrated VFs alike.
+ *
+ * Restricted to restored VFs and read once per probe via READ_ONCE so a
+ * concurrent param write doesn't change the loop count mid-flight.
+ */
+static unsigned int vfmig_load_settle_ms;
+module_param_named(vfmig_load_settle_ms, vfmig_load_settle_ms, uint, 0644);
+MODULE_PARM_DESC(vfmig_load_settle_ms,
+		 "vfmig debug: after the LOAD-time cmd-EQ drain and (optional) NOP barrier on a restored VF, hold the cmd interface idle for this many milliseconds before mlx5_clock_load() runs, so any FW-emitted stale completion EQE on slot 0 lands while ent_arr[0] is NULL and gets absorbed by layer-1's !ent branch instead of victimizing a real cmd. Default 0 (disabled).");
+
 static u32 sw_owner_id[4];
 #define MAX_SW_VHCA_ID (BIT(__mlx5_bit_sz(cmd_hca_cap_2, sw_vhca_id)) - 1)
 static DEFINE_IDA(sw_vhca_ida);
@@ -1803,6 +1841,25 @@ static int mlx5_load(struct mlx5_core_dev *dev)
 			mlx5_core_info(dev,
 				       "vfmig: post-LOAD event NOP barrier ran (%u NOPs)\n",
 				       barriers);
+	}
+
+	/*
+	 * vfmig: optionally idle the cmd interface for vfmig_load_settle_ms
+	 * milliseconds on a restored VF, so the FW-emitted stale slot-0 EQE
+	 * that arrives ~6.5ms after the LOAD-time drain lands while
+	 * ent_arr[0] is NULL and is absorbed by layer-1's !ent branch
+	 * rather than victimizing whatever real cmd happens to be at slot
+	 * 0 at +6.5ms. See the top-of-file comment block for rationale.
+	 */
+	if (mlx5_vf_is_restored(dev)) {
+		unsigned int settle_ms = READ_ONCE(vfmig_load_settle_ms);
+
+		if (settle_ms) {
+			mlx5_core_info(dev,
+				       "vfmig: post-LOAD cmd-iface settle %u ms\n",
+				       settle_ms);
+			msleep(settle_ms);
+		}
 	}
 
 	mlx5_clock_load(dev);
