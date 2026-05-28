@@ -199,6 +199,58 @@ module_param_named(vfmig_load_drain_cmd_eq, vfmig_load_drain_cmd_eq,
 MODULE_PARM_DESC(vfmig_load_drain_cmd_eq,
 		 "vfmig debug: after the cmd EQ is created and switched to event mode on a restored VF, drain it once via mlx5_cmd_eq_recover() to consume FW-internally-queued stale completion EQEs from the source VHCA before any event-driven cmd runs. Default N.");
 
+/*
+ * Debug knob (vfmig). After the LOAD-time cmd-EQ drain (above) has
+ * run and yielded zero EQEs, issue this many event-driven NOPs in
+ * sequence on the restored VF's cmd interface, before mlx5_clock_load()
+ * (the next site that issues cmds against this mdev). Default 0.
+ *
+ * Empirical motivation. Layer-1 + layer-2 + LOAD-time drain still
+ * reproduces exactly one stale dup-EQE on cmd slot 0 followed 60s
+ * later by an MLX5_CMD_TIMEOUT_MSEC on the actual cmd that landed at
+ * slot 0 (CREATE_MKEY in the mlx5e probe path). The drain logs no
+ * "Recovered N EQEs on cmd_eq" message at LOAD time, which means the
+ * stale was NOT pre-buffered in the cmd EQ at the moment cmd_use_events()
+ * returned -- FW emits it lazily, ~10-15ms later, in temporal coincidence
+ * with cmd_alloc_index() reserving slot 0 for CREATE_MKEY in the mlx5e
+ * probe path. The owed completion is held in some FW-internal buffer
+ * and flushed in response to a trigger we don't yet have a direct
+ * handle on (slot reuse, lay->status_own=HW transition, doorbell, or
+ * an FW timer).
+ *
+ * The fix shape: stop trying to passively absorb the lazy emission and
+ * instead drive it deterministically. Each event-driven NOP runs through
+ * cmd_work_handler's full path -- cmd_alloc_index reservation,
+ * lay->status_own write, doorbell, real EQE delivery, comp_handler --
+ * which exercises every plausible FW-flush trigger end-to-end. The NOPs
+ * iterate slot 0 (single in-flight cmd at a time) so they cover the
+ * specific reuse pattern the mlx5e probe will hit moments later. With
+ * layer-1 + layer-2 enabled, any stale EQE FW emits during these NOPs
+ * is filtered cleanly; the NOPs themselves complete via the real EQE
+ * path. After N successful NOPs, FW's owed-completion backlog for slot
+ * 0 has had N opportunities to flush, which empirically should be
+ * enough since pre-LOAD evidence suggests exactly one owed completion
+ * per restored VHCA.
+ *
+ * Suggested sweep values: 1, 2, 4, 8. NOP is chosen for the same reason
+ * as vfmig_save_drain_barrier_cmds: it is the only opcode FW guarantees
+ * has no side effects on VHCA state, matching what mlx5_cmd_eq_recover
+ * itself uses for liveness probes upstream and what
+ * vfmig_load_warmup_nop already issues (in polling mode -- this knob is
+ * the event-mode counterpart since polling NOPs bypass the cmd EQ
+ * entirely and so cannot provoke FW's lazy flush).
+ *
+ * Restricted to restored VFs and read once per probe. NOP failure is
+ * logged but not fatal: a failed NOP just means the barrier didn't get
+ * to act, and probe falls back to the same axis-B failure mode it had
+ * without the knob.
+ */
+static unsigned int vfmig_load_drain_barrier_nops;
+module_param_named(vfmig_load_drain_barrier_nops,
+		   vfmig_load_drain_barrier_nops, uint, 0644);
+MODULE_PARM_DESC(vfmig_load_drain_barrier_nops,
+		 "vfmig debug: after the cmd EQ is created and (optionally) drained on a restored VF, issue this many event-driven NOPs in sequence on the cmd interface before mlx5_clock_load() runs, to drive FW to flush any lazily-held pre-migration owed completions on slot 0 while layer-1/layer-2 dup-EQE filters absorb whatever comes out. Default 0 (disabled).");
+
 static u32 sw_owner_id[4];
 #define MAX_SW_VHCA_ID (BIT(__mlx5_bit_sz(cmd_hca_cap_2, sw_vhca_id)) - 1)
 static DEFINE_IDA(sw_vhca_ida);
@@ -1718,6 +1770,39 @@ static int mlx5_load(struct mlx5_core_dev *dev)
 		mlx5_core_info(dev,
 			       "vfmig: post-LOAD cmd_eq drain invoked\n");
 		mlx5_cmd_eq_recover(dev);
+	}
+
+	/*
+	 * vfmig: optionally issue N event-driven NOPs on the restored VF's
+	 * cmd interface to drive FW's lazy slot-0 owed-completion flush
+	 * before mlx5_clock_load() (the next cmd-issuing site) runs. See
+	 * the top-of-file comment block for rationale. Each NOP runs
+	 * through cmd_work_handler's full event path so any stale EQE FW
+	 * emits is delivered while layer-1/layer-2 are armed to filter it.
+	 */
+	if (mlx5_vf_is_restored(dev)) {
+		unsigned int barriers =
+			READ_ONCE(vfmig_load_drain_barrier_nops);
+		unsigned int i;
+
+		for (i = 0; i < barriers; i++) {
+			u32 in[MLX5_ST_SZ_DW(nop_in)] = {};
+			u32 out[MLX5_ST_SZ_DW(nop_out)] = {};
+			int nop_err;
+
+			MLX5_SET(nop_in, in, opcode, MLX5_CMD_OP_NOP);
+			nop_err = mlx5_cmd_exec_inout(dev, nop, in, out);
+			if (nop_err) {
+				mlx5_core_warn(dev,
+					       "vfmig: post-LOAD event NOP barrier %u/%u failed: %d\n",
+					       i + 1, barriers, nop_err);
+				break;
+			}
+		}
+		if (barriers)
+			mlx5_core_info(dev,
+				       "vfmig: post-LOAD event NOP barrier ran (%u NOPs)\n",
+				       barriers);
 	}
 
 	mlx5_clock_load(dev);
