@@ -149,6 +149,56 @@ module_param_named(vfmig_load_warmup_nop, vfmig_load_warmup_nop,
 MODULE_PARM_DESC(vfmig_load_warmup_nop,
 		 "vfmig debug: after LOAD_VHCA_STATE applies on a restored VF, issue one polling-mode NOP on the restored mdev's cmd interface to consume the post-LOAD cmd-EQ producer/consumer skew before any event-driven cmd runs. Default N.");
 
+/*
+ * Debug knob (vfmig). When set, mlx5_load() drains the restored VF's
+ * cmd EQ once -- immediately after mlx5_eq_table_create() has set the
+ * cmd interface up in event mode (mlx5_cmd_use_events()) and before
+ * any event-driven cmd issues against the cmd EQ -- to consume any
+ * stale, FW-internally-queued completion EQEs the source VHCA was
+ * carrying at SAVE time and re-emits at LOAD time.
+ *
+ * Empirical motivation. Across the full layer-1 + layer-2 dup-EQE
+ * filter matrix (vfmig_cmd_filter_dup_eqe_refcount,
+ * vfmig_cmd_filter_dup_eqe_status_own), every restore reproducibly
+ * shows exactly one dup completion EQE caught on cmd slot 0 within
+ * ~14ms of the first event-driven cmd post-LOAD, followed 60s later
+ * by an MLX5_CMD_TIMEOUT_MSEC on the actual cmd that landed at
+ * slot 0 (CREATE_MKEY in the mlx5e probe path). The dup is FW
+ * delivering a pre-migration owed completion onto the freshly-created
+ * cmd EQ; the layer-1/layer-2 filters refcount-balance against it
+ * cleanly, but the real EQE for the actually-issued cmd never lands.
+ * This is FW's cmd-EQ producer/consumer index running ahead of SW's
+ * by exactly the count of owed completions the source had.
+ *
+ * The drain calls mlx5_cmd_eq_recover() (the same primitive
+ * mlx5_cmd.c uses to clear the cmd EQ on per-cmd timeout recovery)
+ * exactly once at LOAD time, while the cmd EQ is provably empty of
+ * SW-issued in-flight cmds -- create_async_eqs() has just transitioned
+ * cmd mode to events and no async-mode cmd has run yet on this mdev.
+ * Anything the recover walk consumes is therefore a stale FW-queued
+ * EQE by construction. SW's cons_index advances past those stale
+ * entries; subsequent event-driven cmds find their real EQEs at the
+ * slot SW is watching.
+ *
+ * Conceptually this is the "drain at LOAD time" mirror of the SAVE-
+ * side vfmig_save_drain_barrier_cmds knob: the SAVE-side drain tries
+ * to flush FW's owed completions on the source before the migration
+ * snapshot is taken; this knob accepts that the source drain is
+ * unreliable (NOP barriers introduced their own regressions, see
+ * comment block in vfmig.c) and instead absorbs whatever the source
+ * left behind once the destination's cmd EQ is up. Unlike the warm-up
+ * NOP knob, no new cmd is issued -- nothing to time out, nothing to
+ * collide with mlx5e probe.
+ *
+ * Default false until empirically validated. Read once per restored
+ * VF probe.
+ */
+static bool vfmig_load_drain_cmd_eq;
+module_param_named(vfmig_load_drain_cmd_eq, vfmig_load_drain_cmd_eq,
+		   bool, 0644);
+MODULE_PARM_DESC(vfmig_load_drain_cmd_eq,
+		 "vfmig debug: after the cmd EQ is created and switched to event mode on a restored VF, drain it once via mlx5_cmd_eq_recover() to consume FW-internally-queued stale completion EQEs from the source VHCA before any event-driven cmd runs. Default N.");
+
 static u32 sw_owner_id[4];
 #define MAX_SW_VHCA_ID (BIT(__mlx5_bit_sz(cmd_hca_cap_2, sw_vhca_id)) - 1)
 static DEFINE_IDA(sw_vhca_ida);
@@ -1636,6 +1686,38 @@ static int mlx5_load(struct mlx5_core_dev *dev)
 	if (err) {
 		mlx5_core_err(dev, "Failed to create EQs\n");
 		goto err_eq_table;
+	}
+
+	/*
+	 * vfmig: optionally drain the cmd EQ once on a restored VF after
+	 * create_async_eqs() has switched the cmd interface into event
+	 * mode (mlx5_cmd_use_events()) but before any event-driven cmd
+	 * runs against this mdev (the next site is mlx5_clock_load()
+	 * below, which can issue cmds). Gated by vfmig_load_drain_cmd_eq;
+	 * see the top-of-file comment for the rationale and the SAVE-side
+	 * mirror knob (vfmig_save_drain_barrier_cmds).
+	 *
+	 * Restricted to restored VFs: PFs and non-migrated VFs have no
+	 * pre-migration owed-completion backlog to consume here, and a
+	 * spurious recover walk on those would just be a no-op IRQ-
+	 * disable cycle (cons_index unchanged). Keep the call site cheap
+	 * for the default-N path with READ_ONCE before the predicate.
+	 *
+	 * The mlx5_cmd_eq_recover() helper itself only logs when its walk
+	 * actually consumed at least one EQE ("Recovered N EQEs on
+	 * cmd_eq"). Emit an unconditional info line here so dmesg captures
+	 * the "drain ran but found nothing" case too -- empirically the
+	 * stale dup-EQE that drives the post-LOAD CREATE_MKEY wedge
+	 * appears 10-15ms *after* this site, in response to slot-0 reuse
+	 * by mlx5e probe rather than as a pre-existing buffer flushed at
+	 * LOAD time. Knowing whether the LOAD-time walk found 0 vs. >0
+	 * EQEs disambiguates "drain came too early" from "drain didn't
+	 * fire" without further instrumentation.
+	 */
+	if (READ_ONCE(vfmig_load_drain_cmd_eq) && mlx5_vf_is_restored(dev)) {
+		mlx5_core_info(dev,
+			       "vfmig: post-LOAD cmd_eq drain invoked\n");
+		mlx5_cmd_eq_recover(dev);
 	}
 
 	mlx5_clock_load(dev);
