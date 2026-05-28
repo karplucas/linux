@@ -1916,6 +1916,41 @@ MODULE_PARM_DESC(vfmig_save_drain_barrier_cmds,
 		 "Number of NOP barrier cmds to issue on the source VF mdev after the SAVE-time bitmask drain, to flush FW's internally-queued owed completions before SUSPEND_VHCA. Default 0 (disabled); >= 1 is opt-in for follow-up debugging only.");
 
 /*
+ * Opcode used by the SAVE-side barrier loop (above). Default "nop".
+ * Accepted values (case-insensitive):
+ *
+ *   "nop"        - MLX5_CMD_OP_NOP (0x80d). Side-effect-free; matches
+ *                  what mlx5_cmd_eq_recover() and the LOAD-side
+ *                  vfmig_load_warmup_nop / vfmig_load_drain_barrier_nops
+ *                  knobs use. Safe default.
+ *
+ *   "query_issi" - MLX5_CMD_OP_QUERY_ISSI (0x10a). Read-only on FW
+ *                  state but touches the ISSI state-machine
+ *                  bookkeeping path. Historically observed (on the
+ *                  pre-NOP barrier implementation) to leave restored
+ *                  VFs in a state where the data path "came up" on
+ *                  the destination even when the LOAD-time slot-0
+ *                  ghost EQE pattern was present. We never recorded
+ *                  why -- the suspicion is that QUERY_ISSI's FW-side
+ *                  bookkeeping incidentally drained or re-aligned
+ *                  cmd-EQ producer/consumer state in a way NOP
+ *                  doesn't, but we never had a clean reproducer to
+ *                  confirm. Provided here strictly to enable a side-
+ *                  by-side dmesg comparison vs the NOP path so we
+ *                  can interrogate that hypothesis with current
+ *                  layer-1 / slot-0-reservation hardening in place.
+ *
+ * Unrecognised strings fall back to "nop" with a warn() at first
+ * dispatch. Read once per SAVE session via sysfs_streq() against
+ * a snapshot.
+ */
+static char *vfmig_save_drain_barrier_op = "nop";
+module_param_named(vfmig_save_drain_barrier_op,
+		   vfmig_save_drain_barrier_op, charp, 0644);
+MODULE_PARM_DESC(vfmig_save_drain_barrier_op,
+		 "Opcode used by the SAVE-side barrier loop driven by vfmig_save_drain_barrier_cmds. Accepted: \"nop\" (default, MLX5_CMD_OP_NOP, side-effect-free) or \"query_issi\" (MLX5_CMD_OP_QUERY_ISSI, exercises ISSI bookkeeping path; historically appeared to allow data-path liveness post-restore). Unrecognised values fall back to \"nop\" with a one-shot warn().");
+
+/*
  * Settle-time knob, mirror of vfmig_save_drain_barrier_cmds. After the
  * SAVE-time bitmask drain on the source VF cmd interface (and after the
  * optional NOP barrier above), idle the cmd interface for this many
@@ -1981,29 +2016,74 @@ static int vfmig_save_dispatch_nops(struct mlx5_core_dev *pf_mdev,
 	}
 
 	/*
-	 * Layer 2: FW-flush barriers via NOP cmds. Snapshot the module
-	 * param into a local so a concurrent write to the param doesn't
-	 * change the loop count mid-flight. NOP is chosen over
-	 * QUERY_ISSI to keep the barrier strictly side-effect-free on
-	 * the VHCA's FW state machine; the only contract we need is
-	 * "issue a cmd that lands on the lowest-free cmd ring slot and
-	 * forces FW to consume any queued owed-completion bookkeeping
-	 * for this VF".
+	 * Layer 2: FW-flush barriers. Snapshot the module params into
+	 * locals so a concurrent param write doesn't change the loop
+	 * count or opcode mid-flight. Opcode is "nop" by default
+	 * (side-effect-free, matches LOAD-side warm-up); "query_issi"
+	 * is supported as an A/B knob so we can interrogate the prior
+	 * QUERY_ISSI-based barrier behavior side-by-side with the NOP
+	 * path. See vfmig_save_drain_barrier_op for rationale.
 	 */
 	barriers = READ_ONCE(vfmig_save_drain_barrier_cmds);
-	for (i = 0; i < barriers; i++) {
-		u32 in[MLX5_ST_SZ_DW(nop_in)] = {};
-		u32 out[MLX5_ST_SZ_DW(nop_out)] = {};
-		int cmd_err;
+	if (barriers) {
+		const char *op_name = READ_ONCE(vfmig_save_drain_barrier_op);
+		bool use_query_issi;
 
-		MLX5_SET(nop_in, in, opcode, MLX5_CMD_OP_NOP);
-		cmd_err = mlx5_cmd_exec_inout(vf_mdev, nop, in, out);
-		if (cmd_err) {
-			mlx5_core_warn(pf_mdev,
-				       "vfmig: SAVE drain barrier %u/%u on vf %u failed: %d\n",
-				       i + 1, barriers, vf_id, cmd_err);
-			err = -EBUSY;
-			goto out_unlock;
+		/*
+		 * Defensive: charp params can be set to NULL via sysfs
+		 * (write empty string) on some kernels. Treat NULL or
+		 * empty as the default "nop". sysfs_streq tolerates a
+		 * trailing newline from `echo ... > sysfs_node`.
+		 */
+		if (!op_name || !*op_name)
+			op_name = "nop";
+
+		if (sysfs_streq(op_name, "query_issi")) {
+			use_query_issi = true;
+		} else {
+			if (!sysfs_streq(op_name, "nop"))
+				mlx5_core_warn_once(pf_mdev,
+						    "vfmig: SAVE drain barrier op \"%s\" unrecognised, using NOP\n",
+						    op_name);
+			use_query_issi = false;
+		}
+
+		mlx5_core_info(pf_mdev,
+			       "vfmig: SAVE vf %u: dispatching %u %s barrier cmd(s)\n",
+			       vf_id, barriers,
+			       use_query_issi ? "QUERY_ISSI" : "NOP");
+
+		for (i = 0; i < barriers; i++) {
+			int cmd_err;
+
+			if (use_query_issi) {
+				u32 in[MLX5_ST_SZ_DW(query_issi_in)] = {};
+				u32 out[MLX5_ST_SZ_DW(query_issi_out)] = {};
+
+				MLX5_SET(query_issi_in, in, opcode,
+					 MLX5_CMD_OP_QUERY_ISSI);
+				cmd_err = mlx5_cmd_exec_inout(vf_mdev,
+							      query_issi,
+							      in, out);
+			} else {
+				u32 in[MLX5_ST_SZ_DW(nop_in)] = {};
+				u32 out[MLX5_ST_SZ_DW(nop_out)] = {};
+
+				MLX5_SET(nop_in, in, opcode,
+					 MLX5_CMD_OP_NOP);
+				cmd_err = mlx5_cmd_exec_inout(vf_mdev, nop,
+							      in, out);
+			}
+
+			if (cmd_err) {
+				mlx5_core_warn(pf_mdev,
+					       "vfmig: SAVE %s barrier %u/%u on vf %u failed: %d\n",
+					       use_query_issi ? "QUERY_ISSI" : "NOP",
+					       i + 1, barriers, vf_id,
+					       cmd_err);
+				err = -EBUSY;
+				goto out_unlock;
+			}
 		}
 	}
 
