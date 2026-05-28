@@ -257,7 +257,21 @@ static int cmd_alloc_index(struct mlx5_cmd *cmd, struct mlx5_cmd_work_ent *ent)
 	int ret;
 
 	spin_lock_irqsave(&cmd->alloc_lock, flags);
-	ret = find_first_bit(&cmd->vars.bitmask, cmd->vars.max_reg_cmds);
+	/*
+	 * vfmig: when slot 0 is reserved on a restored VF (see
+	 * mlx5_cmd::vfmig_slot0_reserved in driver.h), skip it here so
+	 * every real cmd lands in [1, max_reg_cmds-1] and the FW-emitted
+	 * post-LOAD ghost EQE on slot 0 has nothing to victimize. Bit 0
+	 * stays SET (free) in vars.bitmask, so the rest of the cmd
+	 * machinery -- mlx5_cmd_trigger_completions, cmd_free_index,
+	 * bitmap_weight checks -- remains correct without further changes.
+	 */
+	if (cmd->vfmig_slot0_reserved)
+		ret = find_next_bit(&cmd->vars.bitmask,
+				    cmd->vars.max_reg_cmds, 1);
+	else
+		ret = find_first_bit(&cmd->vars.bitmask,
+				     cmd->vars.max_reg_cmds);
 	if (ret < cmd->vars.max_reg_cmds) {
 		clear_bit(ret, &cmd->vars.bitmask);
 		ent->idx = ret;

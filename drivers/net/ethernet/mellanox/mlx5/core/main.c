@@ -289,6 +289,45 @@ module_param_named(vfmig_load_settle_ms, vfmig_load_settle_ms, uint, 0644);
 MODULE_PARM_DESC(vfmig_load_settle_ms,
 		 "vfmig debug: after the LOAD-time cmd-EQ drain and (optional) NOP barrier on a restored VF, hold the cmd interface idle for this many milliseconds before mlx5_clock_load() runs, so any FW-emitted stale completion EQE on slot 0 lands while ent_arr[0] is NULL and gets absorbed by layer-1's !ent branch instead of victimizing a real cmd. Default 0 (disabled).");
 
+/*
+ * Debug knob (vfmig). Permanently reserve cmd-ring slot 0 on a restored
+ * VF so every real cmd is allocated at slot >= 1; FW's post-LOAD ghost
+ * EQE on slot 0 lands on cmd->ent_arr[0] == NULL and is absorbed by the
+ * vfmig_cmd_filter_dup_eqe_refcount layer-1 filter (!ent / freed-slot
+ * branch). Default false.
+ *
+ * Empirical motivation. Across Row A (no settle), Run B (1 NOP barrier),
+ * L5 (5ms LOAD settle) and S10 (10ms SAVE settle), the failure mode is
+ * identical: the ghost EQE always lands on slot 0, and whatever real
+ * cmd cmd_alloc_index() just installed there (CREATE_MKEY in the mlx5e
+ * probe path, or ALLOC_TRANSPORT_DOMAIN if a NOP shifted timing) gets
+ * victimized and times out 60s later. Settle/drain/NOP variants only
+ * shift timing, not the slot the ghost targets. The architectural
+ * comparison vs vfio-pci-mlx5 (which never calls mlx5_cmd_use_events()
+ * on the migrated VF and so never triggers this ghost) confirms the
+ * stale is generated destination-side as a property of the host driver
+ * driving the VF cmd-EQ in event mode after restore -- nothing the
+ * source can hand off cleanly avoids it.
+ *
+ * The reservation is the only intervention so far that makes the
+ * outcome independent of when FW chooses to emit the stale: with bit 0
+ * never assigned to any cmd, ent_arr[0] is permanently NULL and the
+ * !ent branch in mlx5_cmd_comp_handler swallows the ghost regardless
+ * of arrival time (+6.5ms / +13ms / +21ms / never).
+ *
+ * Cost: one cmd slot of concurrency (max_reg_cmds 31 -> 30 effective).
+ * cmd_alloc_index() returns -ENOMEM on the (max_reg_cmds)-th concurrent
+ * cmd after taking a sem permit, which is the existing graceful path.
+ *
+ * Restricted to restored VFs and read once per probe via READ_ONCE so
+ * a concurrent param write doesn't toggle reservation mid-flight.
+ */
+static bool vfmig_load_reserve_slot0;
+module_param_named(vfmig_load_reserve_slot0, vfmig_load_reserve_slot0,
+		   bool, 0644);
+MODULE_PARM_DESC(vfmig_load_reserve_slot0,
+		 "vfmig debug: on a restored VF, permanently reserve cmd-ring slot 0 in cmd_alloc_index() so every real cmd is allocated at slot >= 1; the FW-emitted post-LOAD ghost EQE on slot 0 then lands on a NULL ent_arr[0] and is absorbed by the layer-1 dup-EQE filter without victimizing a real cmd. Costs one cmd slot of concurrency (max_reg_cmds 31 -> 30 effective). Default N.");
+
 static u32 sw_owner_id[4];
 #define MAX_SW_VHCA_ID (BIT(__mlx5_bit_sz(cmd_hca_cap_2, sw_vhca_id)) - 1)
 static DEFINE_IDA(sw_vhca_ida);
@@ -1860,6 +1899,33 @@ static int mlx5_load(struct mlx5_core_dev *dev)
 				       settle_ms);
 			msleep(settle_ms);
 		}
+	}
+
+	/*
+	 * vfmig: optionally reserve cmd-ring slot 0 on a restored VF so
+	 * every subsequent cmd lands at slot >= 1 and FW's lazily-emitted
+	 * post-LOAD ghost EQE on slot 0 finds cmd->ent_arr[0] == NULL,
+	 * letting the vfmig_cmd_filter_dup_eqe_refcount layer-1 filter
+	 * absorb it via the !ent branch. See the top-of-file comment block
+	 * for vfmig_load_reserve_slot0 for rationale and trade-offs.
+	 *
+	 * Set the flag here, after the settle/drain/NOP-barrier knobs have
+	 * had their chance to run, but before any LOAD-time cmd-issuing
+	 * site (mlx5_clock_load and below). At this point the cmd EQ is in
+	 * event mode and the only cmds that ran since cmd_use_events() are
+	 * the async_eq / pages_eq CREATE_EQs inside mlx5_eq_table_create,
+	 * both of which have completed and freed slot 0. Setting the flag
+	 * now guarantees no real cmd ever lands on slot 0 again on this
+	 * mdev, so the +13ms FW ghost has no cmd to victimize. Read once
+	 * via READ_ONCE so a concurrent param write doesn't toggle the
+	 * decision mid-probe.
+	 */
+	if (mlx5_vf_is_restored(dev) &&
+	    READ_ONCE(vfmig_load_reserve_slot0)) {
+		dev->cmd.vfmig_slot0_reserved = true;
+		mlx5_core_info(dev,
+			       "vfmig: post-LOAD cmd-ring slot 0 reserved (effective max_reg_cmds = %d)\n",
+			       dev->cmd.vars.max_reg_cmds - 1);
 	}
 
 	mlx5_clock_load(dev);

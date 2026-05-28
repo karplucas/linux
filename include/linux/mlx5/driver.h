@@ -350,6 +350,40 @@ struct mlx5_cmd {
 	 */
 	bool		force_polling;
 
+	/*
+	 * Per-device opt-in to skip cmd-ring slot 0 in cmd_alloc_index.
+	 * When true, find_next_bit() on cmd->vars.bitmask starts at index
+	 * 1, so every regular cmd gets a slot in [1, max_reg_cmds-1]; slot
+	 * 0 stays free in the bitmask but is never handed out to a real
+	 * cmd, and cmd->ent_arr[0] stays NULL.
+	 *
+	 * Targeted workaround for the post-LOAD slot-0 stale-EQE wedge
+	 * under SR-IOV VF migration. Empirically, FW emits exactly one
+	 * "ghost" cmd-EQ completion targeting slot 0 some milliseconds
+	 * after the host calls mlx5_cmd_use_events() on a freshly-restored
+	 * VF. That EQE collides with whichever real cmd cmd_alloc_index()
+	 * just installed at slot 0 (typically CREATE_MKEY in mlx5e probe),
+	 * causing a 60s timeout. Reserving slot 0 routes every real cmd
+	 * past slot 0; when the ghost arrives, ent_arr[0] is NULL and the
+	 * vfmig_cmd_filter_dup_eqe_refcount layer-1 filter absorbs it via
+	 * the !ent / "freed slot" branch with no real cmd victimized.
+	 *
+	 * Cost: one cmd slot of concurrency capacity (max_reg_cmds is
+	 * normally 31, so 30 effective). mlx5_cmd_trigger_completions()
+	 * remains correct because it iterates on ~bitmask&MASK, and bit 0
+	 * stays SET (free) so it is never visited; mlx5_cmd_flush() is
+	 * unaffected because cmd->vars.sem permits are not touched. Under
+	 * pathological (>= 31) concurrent cmd load the (max_reg_cmds)-th
+	 * cmd_alloc_index() returns -ENOMEM after taking a semaphore
+	 * permit; the existing up()/-ENOMEM path is graceful.
+	 *
+	 * Set once by mlx5_load() on a restored VHCA when the
+	 * vfmig_load_reserve_slot0 module param is Y; cleared only in
+	 * mlx5_init_cmd_data() (i.e., next mdev probe). Default false on
+	 * every other code path.
+	 */
+	bool		vfmig_slot0_reserved;
+
 	/* protect command queue allocations
 	 */
 	spinlock_t	alloc_lock;
