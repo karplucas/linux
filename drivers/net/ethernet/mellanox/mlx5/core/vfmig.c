@@ -1915,6 +1915,46 @@ module_param_named(vfmig_save_drain_barrier_cmds,
 MODULE_PARM_DESC(vfmig_save_drain_barrier_cmds,
 		 "Number of NOP barrier cmds to issue on the source VF mdev after the SAVE-time bitmask drain, to flush FW's internally-queued owed completions before SUSPEND_VHCA. Default 0 (disabled); >= 1 is opt-in for follow-up debugging only.");
 
+/*
+ * Settle-time knob, mirror of vfmig_save_drain_barrier_cmds. After the
+ * SAVE-time bitmask drain on the source VF cmd interface (and after the
+ * optional NOP barrier above), idle the cmd interface for this many
+ * milliseconds before SUSPEND_VHCA(INITIATOR). Default 0 (disabled).
+ *
+ * Empirical motivation. On the destination, ~6.5ms after the LOAD-time
+ * cmd-EQ drain runs, FW emits an unsolicited completion EQE on cmd slot
+ * 0 that does not correspond to any host-issued doorbell. Whatever real
+ * cmd happens to occupy slot 0 at that wall-clock moment becomes the
+ * victim: layer-1 absorbs the stale, but FW evidently considers its
+ * slot-0 EQE budget for this LOAD spent and the genuine post-stale
+ * doorbell never gets a real completion.
+ *
+ * One plausible source of the FW-side phantom EQE is timing-sensitive
+ * cmd-EQ producer/consumer index bookkeeping at SUSPEND_VHCA. The cmd
+ * EQ has a consumer-index (CI) doorbell SW writes to FW each time it
+ * consumes EQEs. If SAVE captures FW state after the source kernel has
+ * processed an EQE but before the source kernel has written the CI
+ * back to FW, FW's view at SUSPEND_VHCA shows "EQE not yet consumed by
+ * SW" and on RESUME_VHCA / LOAD_VHCA_STATE the destination FW could
+ * legitimately re-emit (or refuse to advance prod_index past) that
+ * EQE. A short SAVE-side settle gives the source SW time to push CI
+ * doorbell writes (and any other cmd-EQ-related FW handshakes) to FW
+ * before the suspend freezes everything.
+ *
+ * Tradeoff: the sleep is wall-clock cost added to every SAVE session.
+ * Sweep small values (5/10/20/50 ms) on the source and check whether
+ * the destination's stale-EQE / 60s-cmd-timeout pattern goes away.
+ * Default 0 leaves SAVE behavior unchanged.
+ *
+ * Read once via READ_ONCE so a concurrent param write doesn't change
+ * the sleep duration mid-flight.
+ */
+static unsigned int vfmig_save_post_drain_settle_ms;
+module_param_named(vfmig_save_post_drain_settle_ms,
+		   vfmig_save_post_drain_settle_ms, uint, 0644);
+MODULE_PARM_DESC(vfmig_save_post_drain_settle_ms,
+		 "Milliseconds to idle the source VF cmd interface after the SAVE-time bitmask drain (and after vfmig_save_drain_barrier_cmds barrier NOPs, if any) and before SUSPEND_VHCA(INITIATOR), to give the source kernel time to push cmd-EQ CI doorbell writes / FW-side handshakes to FW before the migration snapshot is taken. Default 0 (disabled).");
+
 static int vfmig_save_dispatch_nops(struct mlx5_core_dev *pf_mdev,
 				    struct pci_dev *vf_pdev,
 				    u32 vf_id)
@@ -4039,6 +4079,8 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 
 	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
 	if (vf_pdev) {
+		unsigned int settle_ms;
+
 		err = vfmig_save_dispatch_nops(pf_mdev, vf_pdev, arg.vf_id);
 		pci_dev_put(vf_pdev);
 		if (err) {
@@ -4046,6 +4088,22 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 				       "vfmig: SAVE vf %u: pre-suspend drain failed: %d\n",
 				       arg.vf_id, err);
 			goto err_suspend;
+		}
+
+		/*
+		 * vfmig: optionally idle the source VF cmd interface for
+		 * vfmig_save_post_drain_settle_ms before SUSPEND_VHCA, so
+		 * the source kernel has time to push cmd-EQ CI doorbell
+		 * writes / FW-side handshakes to FW before the snapshot is
+		 * taken. See the param's MODULE_PARM_DESC for rationale.
+		 * Gated on vf_pdev presence (matching the drain's gate).
+		 */
+		settle_ms = READ_ONCE(vfmig_save_post_drain_settle_ms);
+		if (settle_ms) {
+			mlx5_core_info(pf_mdev,
+				       "vfmig: SAVE vf %u: post-drain settle %u ms\n",
+				       arg.vf_id, settle_ms);
+			msleep(settle_ms);
 		}
 	}
 
