@@ -350,6 +350,49 @@ static inline void mlx5r_umr_init_context(struct mlx5r_umr_context *context)
 	init_completion(&context->done);
 }
 
+/* Poll cadence / first-warn / repeat for the stuck-UMR diagnostic; _WARN_MS
+ * is far beyond any legitimate UMR op so a healthy path never trips it.
+ */
+#define MLX5R_UMR_STUCK_POLL_MS		5000
+#define MLX5R_UMR_STUCK_WARN_MS		10000
+#define MLX5R_UMR_STUCK_REPEAT_MS	30000
+
+/*
+ * Wait for a UMR completion; if it blocks pathologically long, narrate why
+ * instead of sitting in an opaque D-state. A restored (post-LOAD_VHCA_STATE)
+ * VF whose initiator datapath was re-toggled can leave the UMR QP's SQ
+ * non-executing even though RESUME_VHCA reported success -- the WQE is posted
+ * but no CQE ever lands. Dump umrc state, UMR QP/CQ identity, CQ consumer
+ * index (frozen iff no completion) and the restored-VF bit (the
+ * differentiator). Observability only: umr_context is on the caller's stack
+ * and a late CQE must still find it, so we never return early.
+ */
+static void mlx5r_umr_wait_completion(struct mlx5_ib_dev *dev, u32 mkey,
+				      bool with_data,
+				      struct mlx5r_umr_context *umr_context)
+{
+	struct umr_common *umrc = &dev->umrc;
+	unsigned long start = jiffies;
+	unsigned int next_warn_ms = MLX5R_UMR_STUCK_WARN_MS;
+
+	while (!wait_for_completion_timeout(&umr_context->done,
+			msecs_to_jiffies(MLX5R_UMR_STUCK_POLL_MS))) {
+		struct mlx5_ib_cq *cq = umrc->cq ? to_mcq(umrc->cq) : NULL;
+		unsigned int elapsed_ms = jiffies_to_msecs(jiffies - start);
+
+		if (elapsed_ms < next_warn_ms)
+			continue;
+		mlx5_ib_warn(dev,
+			     "UMR post_send stuck %ums: mkey=0x%x with_data=%d umrc_state=%u qpn=0x%x cqn=0x%x cq_cons=0x%x restored_vf=%d\n",
+			     elapsed_ms, mkey, with_data, umrc->state,
+			     umrc->qp ? umrc->qp->qp_num : 0,
+			     cq ? cq->mcq.cqn : 0,
+			     cq ? (u32)cq->mcq.cons_index : 0,
+			     mlx5_vf_is_restored(dev->mdev));
+		next_warn_ms = elapsed_ms + MLX5R_UMR_STUCK_REPEAT_MS;
+	}
+}
+
 static int mlx5r_umr_post_send_wait(struct mlx5_ib_dev *dev, u32 mkey,
 				   struct mlx5r_umr_wqe *wqe, bool with_data)
 {
@@ -387,7 +430,7 @@ static int mlx5r_umr_post_send_wait(struct mlx5_ib_dev *dev, u32 mkey,
 			break;
 		}
 
-		wait_for_completion(&umr_context.done);
+		mlx5r_umr_wait_completion(dev, mkey, with_data, &umr_context);
 
 		if (umr_context.status == IB_WC_SUCCESS)
 			break;
