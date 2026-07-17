@@ -128,6 +128,8 @@ TESTS=(
   "cq_query|uobject_restore/cq_query/test_cq_query_mlx5_vfmig.sh|IBDEV=$IBDEV|run"
   "cq_destroy_matrix|uobject_restore/cq_destroy_matrix/test_cq_destroy_matrix.sh||run"
   "mr_restore|uobject_restore/mr_restore/test_mr_restore_mlx5_vfmig.sh||run"
+  "reg_mr_restored|uobject_restore/reg_mr_live/test_reg_mr_restored_mlx5_vfmig.sh||run"
+  "reg_mr_fresh_toggle|uobject_restore/reg_mr_live/test_reg_mr_fresh_toggle_mlx5_vfmig.sh||run"
   "mr_adopt|uobject_restore/mr_adopt/test_mr_adopt.sh||run"
   "mr_destroy_matrix|uobject_restore/mr_destroy_matrix/test_mr_destroy_matrix.sh||run"
   "qp_restore|uobject_restore/qp_restore/test_qp_restore_mlx5_vfmig.sh||run"

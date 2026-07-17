@@ -19,6 +19,7 @@ PROBE_BINARIES :=						\
 	uobject_restore/pd_restore/pd_restore_probe_mlx5_vfmig	\
 	uobject_restore/mr_restore/mr_restore_probe_rxe	\
 	uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig		\
+	uobject_restore/reg_mr_live/restored_reg_mr_probe	\
 	uobject_restore/cq_restore/cq_restore_probe_rxe		\
 	uobject_restore/cq_restore/cq_restore_probe_mlx5_vfmig	\
 	uobject_restore/cq_query/cq_query_probe_mlx5_vfmig	\
@@ -117,6 +118,16 @@ uobject_restore/mr_restore/mr_restore_probe_rxe: \
 # Both are inlined in the probe; libmlx5 has no plumbing for either.
 uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig: \
 		uobject_restore/mr_restore/mr_restore_probe_mlx5_vfmig.c
+	$(CC) $(CFLAGS) -o $@ $< -libverbs
+
+# Ordinary ibv_reg_mr exerciser against a restored VF
+# (scratch/restored_vf_new_verbs.md). libibverbs only -- it uses the
+# real libmlx5 provider path (ibv_reg_mr -> create_real_mr), which is
+# exactly what regresses post-restore. DANGER: only run against a kernel
+# carrying the restored-VF inline-CREATE_MKEY gate; an ungated kernel
+# D-state hangs in the UMR wait.
+uobject_restore/reg_mr_live/restored_reg_mr_probe: \
+		uobject_restore/reg_mr_live/restored_reg_mr_probe.c
 	$(CC) $(CFLAGS) -o $@ $< -libverbs
 
 # RESTORE_CQ + rxe_restore_cq S5a probe (design/uobject_restore.md §9.7).
