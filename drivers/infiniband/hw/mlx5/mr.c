@@ -1476,6 +1476,20 @@ static struct ib_mr *create_real_mr(struct ib_pd *pd, struct ib_umem *umem,
 	}
 
 	xlt_with_umr = mlx5r_umr_can_load_pas(dev, umem->length);
+	/*
+	 * A restored (post-LOAD_VHCA_STATE) VF never reconstitutes the kernel
+	 * UMR QP/resources (mlx5r_umr_resource_init() is skipped for restored
+	 * VFs), so the UMR/WQE registration path would post to a dead QP and
+	 * block forever in the untimed mlx5r_umr_post_send_wait(). Force the
+	 * inline CREATE_MKEY (command-ring) path, which is functional on
+	 * restored VFs. See design/datapath_pause_resume.md.
+	 */
+	if (xlt_with_umr && mlx5_vf_is_restored(dev->mdev)) {
+		mlx5_ib_dbg(dev,
+			    "restored VF: reg_mr len=%zu forced onto inline CREATE_MKEY (UMR QP unavailable)\n",
+			    (size_t)umem->length);
+		xlt_with_umr = false;
+	}
 	if (xlt_with_umr) {
 		mr = alloc_cacheable_mr(pd, umem, iova, access_flags,
 					MLX5_MKC_ACCESS_MODE_MTT,
