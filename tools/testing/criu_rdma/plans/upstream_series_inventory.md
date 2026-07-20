@@ -4,9 +4,12 @@ Oracle branch: **`criu-dev-poc` @ `0da0f097`** — **266 commits** over the true
 base `8fb0d17` ("Add -raphael-criu version", a local version stamp on the
 `archive/f-save-restore-fixup-allocator` mainline tag). Note: `f7e71a81b2ad` is
 *not* the fork point; the first 5 commits (`8fb0d17..f7e71a81`) are
-CRIU-enabling prerequisites (see the `P` group in section 6). The `umr.c`
-diagnostic + `mr.c` gate cleanup are parked on a separate branch and are **out
-of scope** for this inventory.
+CRIU-enabling prerequisites (see the `P` group in section 6). These are **not**
+baked into the curation base — they are curated as **Group P (T1.0)** (section 2).
+The real mainline fork point is `05f7e89` (`Linux 6.19`); `8fb0d17` only adds a
+`-raphael-criu` `Makefile` version stamp. **Curation base = `05f7e89`.** The
+`umr.c` diagnostic + `mr.c` gate cleanup are parked on a separate branch and are
+**out of scope** for this inventory.
 
 ## 0. Approach (agreed)
 
@@ -56,7 +59,22 @@ ABI introduced:
   `QUERY_QP`, `QUERY_CQ`.
 
 Patch order = **read-only → quiesce → save → restore**, interleaving the core
-framework patch with its RXE reference impl:
+framework patch with its RXE reference impl, on top of the CRIU-enabling
+prerequisites (Group P):
+
+**Group P — CRIU-enabling prerequisites (T1.0, `base..f7e71a81`)**
+These are the 5 commits below `f7e71a81` that must be *curated as real patches*,
+not baked into the base. Curated on `upstream-t1` (base `05f7e89` = `Linux 6.19`):
+- **T1.0a `P-rxe-netns`** (`eb6bb8b`, carried) — per-netns rxe sockets.
+  Third-party ("original patch from Enfabrica"); carried as a dependency to keep
+  rxe testable, to be dropped once the upstream netns series lands. `rxe_net.c`.
+- **T1.0b `P-fdinfo`** (`52721d0`+`551a135`+`a753315`, **squashed**) — expose
+  `ib_ucontext` restrack id via `show_fdinfo` on uverbs char/mmap/async/comp fds
+  for CRIU fd↔context discovery. `uverbs_main.c`.
+- **T1.0c `P-safe-file-access`** (`f7e71a8`) — delete the `ib_safe_file_access`
+  check in `ib_uverbs_write` (blocks CRIU restore recreating fds). SECURITY-
+  sensitive; message self-documents the tradeoff; may need a narrower
+  restore-only mechanism before upstream. `uverbs_main.c`.
 
 **Group A — discovery / query (read-only, lowest risk, mergeable first)**
 - **T1.1 RDMA/core: extend QUERY_MR (user_addr, access_flags)**
@@ -488,4 +506,44 @@ comm -3 \
 
 (Use `comm -13` for only-missing-from-table, or `comm -23` for
 only-stale-in-table, if you want the two halves separately.)
+
+## 7. Curation workspace + progress log
+
+Two git worktrees under `/opt/builds` (shared object store, one clone):
+
+| Path | Branch | Base | Role |
+|------|--------|------|------|
+| `/opt/builds/linux-stable-poc` | `criu-dev-poc-rebase` | oracle tip + this doc | **Buildable POC** — this is the tree we build/boot to run the `criu_rdma` harnesses; holds the full kernel build that produced the running `6.19.0-raphael-criu-dev+`. Also the diff/behaviour oracle. |
+| `/opt/builds/linux` | `upstream-t1` | `05f7e89` (`Linux 6.19`) | **Curation** — clean per-track upstream series is built here (P → A → B → C → D). Compile-checked; harness runs happen on the POC kernel until an `upstream-t1` kernel is booted. |
+
+Notes:
+- We build/run from the **rebase (POC)**, not from `upstream-t1`: modules built
+  from `upstream-t1` (`6.19.0`, no `-raphael-criu-dev+`) won't `insmod` into the
+  running POC kernel (vermagic mismatch). Runtime harness validation uses the POC
+  kernel; `upstream-t1` is compile-checked per patch and boot-tested separately
+  later.
+- No `master`/rc worktree — staying on 6.19 for stability; rebase onto a recent
+  `-rc` is a later step for the RFC posting only.
+- `upstream-t1` not yet pushed to `origin` (no creds on the box); push +
+  `origin/upstream-t1` tracking is a pending step.
+
+### Curation approach (chosen)
+
+Clean per-track upstream branches directly (section 4 mechanics): per FUNCTIONAL
+patch, `git checkout criu-dev-poc -- <paths>` + `git add -p` to split hunks,
+write real message + `Signed-off-by`, compile, run the matching harness (on the
+POC kernel), `checkpatch.pl --strict`. Path-disjoint SCAFFOLD (`tools/`) is
+simply not carried onto `upstream-t1`.
+
+### Progress
+
+- [x] **Group P (T1.0)** curated on `upstream-t1` — 3 commits, all
+  `checkpatch --strict` clean, path-disjoint (drivers only):
+  - `P-rxe-netns` (`eb6bb8b` carried)
+  - `P-fdinfo` (squash of `52721d0`+`551a135`+`a753315`)
+  - `P-safe-file-access` (`f7e71a8`)
+- [ ] **Group A (T1.1–T1.x)** — `A-querymr` (`35fb924`,`ff4544a`), `A-nldev-ufile`
+  (`0601c49`, split tools), `A-nldev-cqn` (`5fe60bc`), `A-core-acc` (`5b6f13a`
+  umem_pin split + `2727d8a` qp_user_handle). NEXT.
+- [ ] Group B / C / D — see section 2.
 
