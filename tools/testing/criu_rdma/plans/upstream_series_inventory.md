@@ -4,12 +4,14 @@ Oracle branch: **`criu-dev-poc` @ `0da0f097`** — **266 commits** over the true
 base `8fb0d17` ("Add -raphael-criu version", a local version stamp on the
 `archive/f-save-restore-fixup-allocator` mainline tag). Note: `f7e71a81b2ad` is
 *not* the fork point; the first 5 commits (`8fb0d17..f7e71a81`) are
-CRIU-enabling prerequisites (see the `P` group in section 6). These are **not**
-baked into the curation base — they are curated as **Group P (T1.0)** (section 2).
-The real mainline fork point is `05f7e89` (`Linux 6.19`); `8fb0d17` only adds a
-`-raphael-criu` `Makefile` version stamp. **Curation base = `05f7e89`.** The
-`umr.c` diagnostic + `mr.c` gate cleanup are parked on a separate branch and are
-**out of scope** for this inventory.
+CRIU-enabling prerequisites (see the `P` group in section 6 / Group P in
+section 2). **Curation starts from the real dev branch at `f7e71a81`** (branch
+`rebase-P-0` = `origin/criu-dev-build-up-rebase` = `origin/6.19-dev-criu`),
+keeping the 5 P commits as-is; new functional patches (Group A onward) are built
+on top. Underneath: `f7e71a81` sits on `8fb0d17` (a `-raphael-criu` `Makefile`
+version stamp) which sits on the real mainline fork point `05f7e89` (`Linux
+6.19`). The `umr.c` diagnostic + `mr.c` gate cleanup are parked on a separate
+branch and are **out of scope** for this inventory.
 
 ## 0. Approach (agreed)
 
@@ -63,18 +65,20 @@ framework patch with its RXE reference impl, on top of the CRIU-enabling
 prerequisites (Group P):
 
 **Group P — CRIU-enabling prerequisites (T1.0, `base..f7e71a81`)**
-These are the 5 commits below `f7e71a81` that must be *curated as real patches*,
-not baked into the base. Curated on `upstream-t1` (base `05f7e89` = `Linux 6.19`):
-- **T1.0a `P-rxe-netns`** (`eb6bb8b`, carried) — per-netns rxe sockets.
-  Third-party ("original patch from Enfabrica"); carried as a dependency to keep
-  rxe testable, to be dropped once the upstream netns series lands. `rxe_net.c`.
-- **T1.0b `P-fdinfo`** (`52721d0`+`551a135`+`a753315`, **squashed**) — expose
-  `ib_ucontext` restrack id via `show_fdinfo` on uverbs char/mmap/async/comp fds
-  for CRIU fd↔context discovery. `uverbs_main.c`.
-- **T1.0c `P-safe-file-access`** (`f7e71a8`) — delete the `ib_safe_file_access`
-  check in `ib_uverbs_write` (blocks CRIU restore recreating fds). SECURITY-
-  sensitive; message self-documents the tradeoff; may need a narrower
-  restore-only mechanism before upstream. `uverbs_main.c`.
+The 5 commits below `f7e71a81`. **We start curation from the real dev branch at
+`f7e71a81` and keep these commits as-is** — this is the `rebase-P-0` branch
+(`origin/criu-dev-build-up-rebase`), NOT a re-curation onto pristine mainline.
+Group A onward is built on top of `rebase-P-0`. The 5 commits, in branch order:
+- **`eb6bb8b` `P-rxe-netns`** — per-netns rxe sockets. Third-party ("original
+  patch from Enfabrica"); a carried dependency to keep rxe testable, to be
+  dropped once the upstream netns series lands. `rxe_net.c`.
+- **`52721d0` / `551a135` / `a753315` `P-fdinfo`** — expose `ib_ucontext`
+  restrack id via `show_fdinfo` on uverbs char/mmap/async/comp fds for CRIU
+  fd↔context discovery. `uverbs_main.c`. (Squash into one patch at final export.)
+- **`f7e71a8` `P-safe-file-access`** — delete the `ib_safe_file_access` check in
+  `ib_uverbs_write` (blocks CRIU restore recreating fds). SECURITY-sensitive;
+  message self-documents the tradeoff; may need a narrower restore-only
+  mechanism before upstream. `uverbs_main.c`.
 
 **Group A — discovery / query (read-only, lowest risk, mergeable first)**
 - **T1.1 RDMA/core: extend QUERY_MR (user_addr, access_flags)**
@@ -511,39 +515,52 @@ only-stale-in-table, if you want the two halves separately.)
 
 Two git worktrees under `/opt/builds` (shared object store, one clone):
 
-| Path | Branch | Base | Role |
-|------|--------|------|------|
-| `/opt/builds/linux-stable-poc` | `criu-dev-poc-rebase` | oracle tip + this doc | **Buildable POC** — this is the tree we build/boot to run the `criu_rdma` harnesses; holds the full kernel build that produced the running `6.19.0-raphael-criu-dev+`. Also the diff/behaviour oracle. |
-| `/opt/builds/linux` | `upstream-t1` | `05f7e89` (`Linux 6.19`) | **Curation** — clean per-track upstream series is built here (P → A → B → C → D). Compile-checked; harness runs happen on the POC kernel until an `upstream-t1` kernel is booted. |
+| Path | Branch | Tip / tracking | Role |
+|------|--------|----------------|------|
+| `/opt/builds/linux-stable-poc` | `criu-dev-poc-rebase` | `c729d16` (oracle tip `0da0f097` + inventory/plan commits); tracks `origin/criu-dev-poc-rebase` | **Buildable POC** — the tree we build/boot to run the `criu_rdma` harnesses; holds the full kernel build behind the running `6.19.0-raphael-criu-dev+`. Also the diff/behaviour oracle and where these plan docs live. |
+| `/opt/builds/linux` | `rebase-P-0` | `f7e71a81` (dev branch through the 5 P commits); tracks `origin/criu-dev-build-up-rebase` (== `origin/6.19-dev-criu`) | **Curation** — the working tree for building the clean series. Starts at `f7e71a81` (Group P kept as-is); Group A onward is built on top. |
+
+Branch/naming convention:
+- `rebase-P-0` = curation starting point = real dev branch through the P
+  prerequisites (`f7e71a81`). Successive curation stages follow the same
+  `rebase-<group>-<n>` shape (e.g. Group A work on top of `rebase-P-0`).
+- The plan docs (`tools/testing/criu_rdma/plans/`) live only on
+  `criu-dev-poc-rebase`; they do not exist at `f7e71a81`, so edit/commit them in
+  `linux-stable-poc`.
 
 Notes:
-- We build/run from the **rebase (POC)**, not from `upstream-t1`: modules built
-  from `upstream-t1` (`6.19.0`, no `-raphael-criu-dev+`) won't `insmod` into the
-  running POC kernel (vermagic mismatch). Runtime harness validation uses the POC
-  kernel; `upstream-t1` is compile-checked per patch and boot-tested separately
-  later.
+- We build/run from the **rebase / POC** (`linux-stable-poc`), not from the
+  curation tree: a kernel/modules built off the curation branch won't match the
+  running POC kernel's vermagic. Runtime harness validation happens on the POC
+  kernel; the curated series is compile-checked per patch and boot-tested
+  separately later.
 - No `master`/rc worktree — staying on 6.19 for stability; rebase onto a recent
   `-rc` is a later step for the RFC posting only.
-- `upstream-t1` not yet pushed to `origin` (no creds on the box); push +
-  `origin/upstream-t1` tracking is a pending step.
+- Stale branches from an earlier approach exist and can be deleted:
+  `upstream-t1`, `upstream-t1-1` (both `74c9435`, a superseded squash-onto-6.19
+  experiment).
 
 ### Curation approach (chosen)
 
-Clean per-track upstream branches directly (section 4 mechanics): per FUNCTIONAL
-patch, `git checkout criu-dev-poc -- <paths>` + `git add -p` to split hunks,
-write real message + `Signed-off-by`, compile, run the matching harness (on the
-POC kernel), `checkpatch.pl --strict`. Path-disjoint SCAFFOLD (`tools/`) is
-simply not carried onto `upstream-t1`.
+Start from the real branch at `f7e71a81` (`rebase-P-0`), keeping the P commits
+intact, and build the clean functional series forward on top per section 2/3.
+Per FUNCTIONAL patch: assemble the tip (working) hunks from the oracle, write a
+real message + `Signed-off-by`, compile, run the matching harness on the POC
+kernel, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD (`tools/design/
+scratch`) is dropped from the upstream export.
 
 ### Progress
 
-- [x] **Group P (T1.0)** curated on `upstream-t1` — 3 commits, all
-  `checkpatch --strict` clean, path-disjoint (drivers only):
-  - `P-rxe-netns` (`eb6bb8b` carried)
-  - `P-fdinfo` (squash of `52721d0`+`551a135`+`a753315`)
-  - `P-safe-file-access` (`f7e71a8`)
-- [ ] **Group A (T1.1–T1.x)** — `A-querymr` (`35fb924`,`ff4544a`), `A-nldev-ufile`
-  (`0601c49`, split tools), `A-nldev-cqn` (`5fe60bc`), `A-core-acc` (`5b6f13a`
-  umem_pin split + `2727d8a` qp_user_handle). NEXT.
+- [x] **Workspace** set up: `linux-stable-poc` (POC/build) + `linux`
+  (`rebase-P-0` @ `f7e71a81`, curation), pushed to
+  `origin/criu-dev-build-up-rebase`.
+- [x] **Group P (T1.0)** adopted as-is via `rebase-P-0` @ `f7e71a81`
+  (`eb6bb8b` rxe-netns, `52721d0`/`551a135`/`a753315` fdinfo, `f7e71a8`
+  safe-file-access). Squash of the fdinfo trio + message polish deferred to
+  final export.
+- [ ] **Group A (T1.1–T1.x)** on top of `rebase-P-0` — `A-querymr`
+  (`35fb924`,`ff4544a`), `A-nldev-ufile` (`0601c49`, split tools), `A-nldev-cqn`
+  (`5fe60bc`), `A-core-acc` (`5b6f13a` umem_pin split + `2727d8a`
+  qp_user_handle). NEXT.
 - [ ] Group B / C / D — see section 2.
 
