@@ -28,6 +28,10 @@ branch and are **out of scope** for this inventory.
   T2 = the whole mlx5 side (mlx5_core vfmig + mlx5_ib verbs, interleaved).
   T2 spans two trees but is one functional unit — proposed together, split
   only as a submission logistic.
+- **Development order ≠ submission order.** Sections 2-3 describe the *submission*
+  layering; the build-up branches are actually built and tested in a *vertical,
+  per-object* order that matches the two-agent (kernel↔criu) workflow. See §8 and
+  the criu-side companion (`criu.git:test/rdma/plans/criu_build_up_plan.md`).
 
 ## 1. What ships vs. what's dropped
 
@@ -563,4 +567,102 @@ scratch`) is dropped from the upstream export.
   (`5fe60bc`), `A-core-acc` (`5b6f13a` umem_pin split + `2727d8a`
   qp_user_handle). NEXT.
 - [ ] Group B / C / D — see section 2.
+
+## 8. Development ordering (incremental-test) vs submission ordering — the two-agent workflow
+
+Sections 2-3 order patches for **submission** (horizontal layers: T1 `A→B→C→D`
+read-only→quiesce→save→restore; T2 `2a→2b`). That is correct for maintainers but
+**test-hostile**: no object round-trips end-to-end until the whole restore layer
+(`D` / `F`) lands, so the kernel→criu→on-rig loop has nothing to validate for most
+of the series.
+
+**Development follows a different, vertical order** — the POC's own cumulative
+per-object spine — because the unit of the kernel→criu handoff and of the on-rig
+E2E gate is *one object type's full round-trip*, not one horizontal mechanism. The
+POC was in fact built this way (design stages `S3=PD`, `S4=MR`, `S5=CQ`, `S6=QP`;
+criu pass matrix `pd → pd_mr/pd_cq → pd_cq_qp → pd_cq_qp_sq`). The build-up
+branches keep that spine.
+
+Reconciliation (no rework):
+- The **build-up branches are ordered for testing** (vertical, cumulative). This is
+  also a fine organization for the **first architectural RFC** (per-feature slices
+  read well).
+- The **horizontal per-tree re-slice** (§2/§3) is deferred to the *final
+  per-maintainer submission* (net-next vs rdma-next). The §6 `feeds` label on every
+  commit is the pre-computed dev-order→submission-order mapping; the re-slice is
+  mechanical (drop scaffold; coalesce hunks by label).
+
+### Two phases, each built vertically (per-object) for testing
+
+**RXE (T1) is completed end-to-end first; mlx5 (T2) is layered on top.** RXE +
+core is independently postable and merges long before vfmig, so finishing it first
+delivers a shippable series early, fully exercises the criu restore framework on a
+proven base, and — because RXE is soft-RoCE over any netdev — spares the scarce
+CX-7 rigs for the T2 phase. This is safe precisely because we curate from a
+**proven oracle**: the POC already shows the final core ABI serves both RXE and
+mlx5, so there is no "mlx5 forces a late core-ABI change" surprise that would
+otherwise argue for per-object interleaving of the two tracks.
+
+Within each phase, dev order is **vertical per-object** (PD→MR→CQ→QP→in-flight);
+the horizontal `A→D` / `2a→2b` submission re-slice (§2-3) is derived later via the
+§6 `feeds` labels.
+
+Each milestone has two acceptance tiers (see the criu companion for the criu
+column in full):
+- **Dev testcase** — the synthetic, targeted round-trip (`run_vfmig_cr.sh` pass /
+  rxe validator), fast dev loop.
+- **Whole-workflow E2E gate** — a *live workload* migrated across hosts (e.g.
+  `ib_write_bw` swapped between the two VMs) in the end-to-end migration
+  environment. **Passing this is the final gate to advance to the next step.**
+
+**Phase T1 — core uverbs + RXE (complete first; rig-cheap):**
+
+| M | Round-trip | Kernel (feeds §6) | criu | Dev testcase → whole-workflow gate |
+|---|-----------|-------------------|------|------------------------------------|
+| T1.1 | PD | `D-restmode`, `D-restore-pd`, `A-nldev-ufile` | uobj DAG + claim + cdev-open + PD restore | rxe PD strict round-trip → rxe `ib_write_bw` migrate |
+| T1.2 | MR | `A-querymr`, `D-restore-mr`, `A-core-acc` (umem_pin) | RESTORE_MR via pie blob | rxe MR + RDMA-WRITE acid → " |
+| T1.3 | CQ | `C-querycq`, `C-cq-rt`, `D-restore-cq` | per-CQ save/restore | rxe CQ ring → " |
+| T1.4 | QP (drained) | `B-freeze`, `C-queryqp`, `D-restore-qp` | per-QP dump + master/PIE RESTORE_QP | rxe born-frozen thaw → " |
+| T1.5 | QP (in-flight) | `B-idem`/`B-gate`/`B-trace`, `C-inflight` | non-drained-SQ replay, thaw@RESUME_DEVICES_LATE | rxe in-flight (B1) → rxe `ib_write_bw` mid-flight migrate |
+
+**T1 exit gate:** full RXE suite green + a whole-workflow RXE migration passes. T1
+is now a postable core+rxe series (→ rdma-next / rxe), independent of vfmig.
+
+**Phase T2 — mlx5 (layered on the complete T1 core framework; rig-bound):**
+
+| M | Round-trip | Kernel (feeds §6) | criu | Dev testcase → whole-workflow gate |
+|---|-----------|-------------------|------|------------------------------------|
+| T2.0 | VHCA foundation | `E-chardev`/`E-ioctls`/`E-saveload`/`E-iova`/`E-dma`/`E-restore-probe` (2a) | plugin claim/presence, SAVE + GET_CONTEXT, cdev VMAs | VF migrates + RC ping-pong survives (`52021cc`) → — |
+| T2.1 | UAR + restore-mode uctx | `F-restmode`, `F-uar` | VFMIG QUERY/RESTORE ucontext (static + dyn UAR) | uctx round-trip → — |
+| T2.2 | PD | `F-pd`, `F-querypd` | mlx5 PD via UHW | `pd` → `ib_write_bw` swap |
+| T2.3 | MR | `F-mr`, `E-replay`(MR), `E-bind` | mlx5 MR UHW | `pd_mr` + RDMA-WRITE acid → `ib_write_bw` swap |
+| T2.4 | CQ | `F-cq` | per-CQ UHW | `pd_cq`, `pd_2cq` → `ib_write_bw` swap |
+| T2.5 | QP (+ in-flight) | `F-qp`, `E-queryqp`, `E-susp-split` | per-QP UHW, snapshot-ordering | `pd_cq_qp`, `pd_cq_qp_sq` → `ib_write_bw` swap |
+| T2.6 | Cross-host hardening | `E-directional`, `E-teardown`, `E-fused`, `E-uuid`, `E-move` | prerestore binary (KS7.x), rendezvous barrier | cross-host `pd_cq_qp_sq` → `ib_write_bw` swap across hosts (final) |
+
+T2.0's `2a` foundation (chardev / SAVE-LOAD / IOVA / DMA / restored-VF probe) is
+itself E2E-checkable as "VF migrates + RC ping-pong survives" *before* any
+uverbs-object adoption.
+
+### Two gates
+- **Per-patch (rig-free, kernel agent):** compiles + `scripts/checkpatch.pl
+  --strict`, on every curated commit.
+- **Per-milestone (criu agent):** the dev testcase (setup 1) then the
+  whole-workflow migration (setup 2) — the latter needs the **vermagic-matched
+  build-up kernel** booted on the rig. Reconcile which worktree is the boot/build
+  tree (the §7 table says `linux-stable-poc`, but the live worktree is
+  `linux-poc-ref`; confirm it matches the running `6.19.0-raphael-criu-dev+`).
+
+### Hardware scheduling (2-3 two-VM CX-7 setups)
+- **Kernel agent is never rig-bound** (breakdown + compile-only) → keep it 1-2
+  milestones ahead.
+- **criu agent + E2E is the throughput limiter.** Setup roles: **setup 1** = dev /
+  incremental testcases; **setup 2** = the whole-workflow migration environment
+  (the final gate, e.g. `ib_write_bw` swapped across hosts); **setup 3** (if
+  available) = regression baseline of the last-green milestone.
+- **Phase T1 barely touches the CX-7 rigs** — RXE runs single-host/loopback for dev
+  and over a plain VM-pair netdev for the whole-workflow migration; the CX-7 vfmig
+  path is not exercised until T2. Spend the reserved rig time on T2.
+- **T2.6 is the most rig-hungry** (true cross-host migration + barrier); schedule it
+  when a full setup can be dedicated.
 
