@@ -5,13 +5,15 @@ base `8fb0d17` ("Add -raphael-criu version", a local version stamp on the
 `archive/f-save-restore-fixup-allocator` mainline tag). Note: `f7e71a81b2ad` is
 *not* the fork point; the first 5 commits (`8fb0d17..f7e71a81`) are
 CRIU-enabling prerequisites (see the `P` group in section 6 / Group P in
-section 2). **Curation starts from the real dev branch at `f7e71a81`** (branch
-`rebase-P-0` = `origin/criu-dev-build-up-rebase` = `origin/6.19-dev-criu`),
-keeping the 5 P commits as-is; new functional patches (Group A onward) are built
-on top. Underneath: `f7e71a81` sits on `8fb0d17` (a `-raphael-criu` `Makefile`
-version stamp) which sits on the real mainline fork point `05f7e89` (`Linux
-6.19`). The `umr.c` diagnostic + `mr.c` gate cleanup are parked on a separate
-branch and are **out of scope** for this inventory.
+section 2). **The build-up starts from the real dev branch at `f7e71a81`**
+(branch `criu-dev-build-up-rebase`, checked out in the build/boot tree
+`/opt/builds/linux`), keeping the 5 P commits as-is; new functional groups
+(Group A onward) are built on top, growing toward the **authoritative endpoint
+`origin/criu-dev-poc-rebase`** (the fully-curated series). Underneath:
+`f7e71a81` sits on `8fb0d17` (a `-raphael-criu` `Makefile` version stamp) which
+sits on the real mainline fork point `05f7e89` (`Linux 6.19`). The `umr.c`
+diagnostic + `mr.c` gate cleanup are parked on a separate branch and are **out
+of scope** for this inventory.
 
 ## 0. Approach (agreed)
 
@@ -69,10 +71,10 @@ framework patch with its RXE reference impl, on top of the CRIU-enabling
 prerequisites (Group P):
 
 **Group P — CRIU-enabling prerequisites (T1.0, `base..f7e71a81`)**
-The 5 commits below `f7e71a81`. **We start curation from the real dev branch at
-`f7e71a81` and keep these commits as-is** — this is the `rebase-P-0` branch
-(`origin/criu-dev-build-up-rebase`), NOT a re-curation onto pristine mainline.
-Group A onward is built on top of `rebase-P-0`. The 5 commits, in branch order:
+The 5 commits below `f7e71a81`. **The build-up starts from the real dev branch at
+`f7e71a81` and keeps these commits as-is** — this is where
+`criu-dev-build-up-rebase` begins (in `/opt/builds/linux`), NOT a re-curation onto
+pristine mainline. Group A onward is built on top. The 5 commits, in branch order:
 - **`eb6bb8b` `P-rxe-netns`** — per-netns rxe sockets. Third-party ("original
   patch from Enfabrica"); a carried dependency to keep rxe testable, to be
   dropped once the upstream netns series lands. `rxe_net.c`.
@@ -161,17 +163,21 @@ posted together in the RFC.
 
 ## 4. Curation mechanics
 
-1. `git switch -c upstream-t1 f7e71a81b2ad`
-2. per patch: `git checkout criu-dev-poc -- <paths>` then `git add -p` to split
-   hunks (drop debug/scratch); write real commit message + `Signed-off-by:
-   Raphael Norwitz <rnorwitz@nvidia.com>`.
-3. **compile every patch**; run the matching `criu_rdma` harness at each
-   capability-introducing patch (harness stays on the oracle, invoked against
-   the built modules).
+Work in the build/boot tree `/opt/builds/linux` on `criu-dev-build-up-rebase`
+(starts at `f7e71a81`); the oracle is `criu-dev-poc-rebase` (checked out in
+`/opt/builds/linux-poc-ref`).
+
+1. `git switch criu-dev-build-up-rebase` (already at `f7e71a81` with Group P).
+2. per FUNCTIONAL commit: `git checkout criu-dev-poc-rebase -- <paths>` then
+   `git add -p` to split hunks (drop debug/scratch); write real commit message +
+   `Signed-off-by: Raphael Norwitz <rnorwitz@nvidia.com>`.
+3. **build + boot every milestone**; run the matching `criu_rdma` harness at each
+   capability-introducing patch against the freshly-built build-up kernel.
 4. `scripts/checkpatch.pl --strict` per patch.
-5. Acceptance gate: `git diff upstream-t1 criu-dev-poc -- <T1 paths>` is empty
-   (modulo intentional cleanups). Same for `upstream-t2`.
-6. RFC branch = T1 + T2 stacked on a recent -rc for posting.
+5. Acceptance gate: `git diff criu-dev-build-up-rebase criu-dev-poc-rebase --
+   <shipping paths>` is empty (modulo intentional cleanups) once all groups land.
+6. Final submission re-slice (horizontal per-tree T1/T2) + rebase onto a recent
+   -rc for the RFC posting.
 
 ## 5. Open items to resolve before/while curating
 
@@ -519,50 +525,42 @@ only-stale-in-table, if you want the two halves separately.)
 
 Two git worktrees under `/opt/builds` (shared object store, one clone):
 
-| Path | Branch | Tip / tracking | Role |
-|------|--------|----------------|------|
-| `/opt/builds/linux-stable-poc` | `criu-dev-poc-rebase` | `c729d16` (oracle tip `0da0f097` + inventory/plan commits); tracks `origin/criu-dev-poc-rebase` | **Buildable POC** — the tree we build/boot to run the `criu_rdma` harnesses; holds the full kernel build behind the running `6.19.0-raphael-criu-dev+`. Also the diff/behaviour oracle and where these plan docs live. |
-| `/opt/builds/linux` | `rebase-P-0` | `f7e71a81` (dev branch through the 5 P commits); tracks `origin/criu-dev-build-up-rebase` (== `origin/6.19-dev-criu`) | **Curation** — the working tree for building the clean series. Starts at `f7e71a81` (Group P kept as-is); Group A onward is built on top. |
+| Path | Branch | Role |
+|------|--------|------|
+| `/opt/builds/linux` | `criu-dev-build-up-rebase` (starts `f7e71a81`, growing toward `origin/criu-dev-poc-rebase`) | **The build/boot + curation tree.** The running kernel is *always* built here (`/lib/modules/$(uname -r)/build → /opt/builds/linux`). We add one functional group at a time and build/boot this tree at each milestone. |
+| `/opt/builds/linux-poc-ref` | `criu-dev-poc-rebase` (local ref of the authoritative `origin/criu-dev-poc-rebase`) | **Read-only reference / oracle.** Full POC source for `git diff` / hunk lookup, and where these plan docs live. Not built. |
 
-Branch/naming convention:
-- `rebase-P-0` = curation starting point = real dev branch through the P
-  prerequisites (`f7e71a81`). Successive curation stages follow the same
-  `rebase-<group>-<n>` shape (e.g. Group A work on top of `rebase-P-0`).
-- The plan docs (`tools/testing/criu_rdma/plans/`) live only on
-  `criu-dev-poc-rebase`; they do not exist at `f7e71a81`, so edit/commit them in
-  `linux-stable-poc`.
-
-Notes:
-- We build/run from the **rebase / POC** (`linux-stable-poc`), not from the
-  curation tree: a kernel/modules built off the curation branch won't match the
-  running POC kernel's vermagic. Runtime harness validation happens on the POC
-  kernel; the curated series is compile-checked per patch and boot-tested
-  separately later.
-- No `master`/rc worktree — staying on 6.19 for stability; rebase onto a recent
-  `-rc` is a later step for the RFC posting only.
-- Stale branches from an earlier approach exist and can be deleted:
-  `upstream-t1`, `upstream-t1-1` (both `74c9435`, a superseded squash-onto-6.19
-  experiment).
+Model:
+- `origin/criu-dev-poc-rebase` is the **authoritative endpoint** of the rebase
+  (the fully-curated, suite-passing series). We build up `criu-dev-build-up-rebase`
+  toward it, group by group, and may add notes/docs onto the endpoint as we go.
+- **One tree does build + boot + curation** (`/opt/builds/linux`). Because we
+  build and boot the build-up kernel itself, there is no vermagic split — the
+  running kernel matches the tree at each milestone. `linux-poc-ref` is only a
+  source reference and is never booted.
+- The plan docs (`tools/testing/criu_rdma/plans/`) exist on the endpoint branch
+  (checked out in `linux-poc-ref`), not at `f7e71a81`, so edit/commit them there.
+- Staying on 6.19 for stability; no `master`/rc worktree. Rebasing onto a recent
+  `-rc` is a later step, only for the final RFC posting.
 
 ### Curation approach (chosen)
 
-Start from the real branch at `f7e71a81` (`rebase-P-0`), keeping the P commits
-intact, and build the clean functional series forward on top per section 2/3.
-Per FUNCTIONAL patch: assemble the tip (working) hunks from the oracle, write a
-real message + `Signed-off-by`, compile, run the matching harness on the POC
-kernel, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD (`tools/design/
-scratch`) is dropped from the upstream export.
+Build up `criu-dev-build-up-rebase` from `f7e71a81` (Group P kept intact) one
+functional group at a time, per section 2/3 and the §8 vertical spine. Per
+FUNCTIONAL patch: assemble the tip (working) hunks from the oracle
+(`linux-poc-ref`), write a real message + `Signed-off-by`, build + boot the tree,
+run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
+(`tools/design/scratch`) is dropped from the upstream export.
 
 ### Progress
 
-- [x] **Workspace** set up: `linux-stable-poc` (POC/build) + `linux`
-  (`rebase-P-0` @ `f7e71a81`, curation), pushed to
-  `origin/criu-dev-build-up-rebase`.
-- [x] **Group P (T1.0)** adopted as-is via `rebase-P-0` @ `f7e71a81`
-  (`eb6bb8b` rxe-netns, `52721d0`/`551a135`/`a753315` fdinfo, `f7e71a8`
-  safe-file-access). Squash of the fdinfo trio + message polish deferred to
-  final export.
-- [ ] **Group A (T1.1–T1.x)** on top of `rebase-P-0` — `A-querymr`
+- [x] **Workspace** set up: `/opt/builds/linux` (`criu-dev-build-up-rebase` @
+  `f7e71a81`, build/boot + curation) + `/opt/builds/linux-poc-ref`
+  (`criu-dev-poc-rebase`, read-only oracle). Endpoint = `origin/criu-dev-poc-rebase`.
+- [x] **Group P (T1.0)** in place at `f7e71a81` (`eb6bb8b` rxe-netns,
+  `52721d0`/`551a135`/`a753315` fdinfo, `f7e71a8` safe-file-access). Squash of
+  the fdinfo trio + message polish deferred to final export.
+- [ ] **Group A (T1.1–T1.x)** on top of `criu-dev-build-up-rebase` — `A-querymr`
   (`35fb924`,`ff4544a`), `A-nldev-ufile` (`0601c49`, split tools), `A-nldev-cqn`
   (`5fe60bc`), `A-core-acc` (`5b6f13a` umem_pin split + `2727d8a`
   qp_user_handle). NEXT.
@@ -648,10 +646,11 @@ uverbs-object adoption.
 - **Per-patch (rig-free, kernel agent):** compiles + `scripts/checkpatch.pl
   --strict`, on every curated commit.
 - **Per-milestone (criu agent):** the dev testcase (setup 1) then the
-  whole-workflow migration (setup 2) — the latter needs the **vermagic-matched
-  build-up kernel** booted on the rig. Reconcile which worktree is the boot/build
-  tree (the §7 table says `linux-stable-poc`, but the live worktree is
-  `linux-poc-ref`; confirm it matches the running `6.19.0-raphael-criu-dev+`).
+  whole-workflow migration (setup 2) — the latter needs the build-up kernel
+  booted on the rig. The boot/build tree is **`/opt/builds/linux`**
+  (`criu-dev-build-up-rebase`); the running kernel is always built there
+  (`/lib/modules/$(uname -r)/build → /opt/builds/linux`), so it is vermagic-matched
+  by construction. `linux-poc-ref` is a source-only reference and is never booted.
 
 ### Hardware scheduling (2-3 two-VM CX-7 setups)
 - **Kernel agent is never rig-bound** (breakdown + compile-only) → keep it 1-2
