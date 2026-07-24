@@ -7,7 +7,7 @@
 #   - body wrapped at <= 72 chars (trailers and unwrappable long tokens exempt)
 # Ensures (auto-appended at the end, in this order, deduplicated):
 #   - Assisted-by: Cursor:claude-opus-4.8-high
-#   - Signed-off-by: Raphael Norwitz <rnorwitz@nvidia.com>
+#   - Signed-off-by: <derived from git config user.name/user.email>
 #
 # Bypass with:  git commit --no-verify
 #
@@ -17,7 +17,17 @@ MSG_FILE="$1"
 SUBJECT_MAX=52
 WRAP_MAX=72
 ASSISTED="Assisted-by: Cursor:claude-opus-4.8-high"
-SIGNOFF="Signed-off-by: Raphael Norwitz <rnorwitz@nvidia.com>"
+
+# Signed-off-by is derived from the repo's git identity (user.name/user.email)
+# rather than hard-coded. If either is unset it is omitted -- git will reject
+# the commit for the missing identity anyway.
+git_name="$(git config user.name 2>/dev/null || true)"
+git_email="$(git config user.email 2>/dev/null || true)"
+if [ -n "$git_name" ] && [ -n "$git_email" ]; then
+	SIGNOFF="Signed-off-by: $git_name <$git_email>"
+else
+	SIGNOFF=""
+fi
 
 mapfile -t RAW < "$MSG_FILE"
 
@@ -85,11 +95,18 @@ if [ "${#errors[@]}" -gt 0 ]; then
 	exit 1
 fi
 
-# Ensure the two trailers, in order, at the very end (dedup our exact lines).
+# Trailers to ensure at the end, in order (skip any that are empty).
+trailers=("$ASSISTED")
+[ -n "$SIGNOFF" ] && trailers+=("$SIGNOFF")
+
+# Dedup our exact trailer lines from the existing body.
 filtered=()
 for line in "${msg[@]}"; do
-	[ "$line" = "$ASSISTED" ] && continue
-	[ "$line" = "$SIGNOFF" ] && continue
+	skip=0
+	for t in "${trailers[@]}"; do
+		[ "$line" = "$t" ] && { skip=1; break; }
+	done
+	[ "$skip" -eq 1 ] && continue
 	filtered+=("$line")
 done
 while [ "${#filtered[@]}" -gt 0 ] && [ -z "${filtered[$((${#filtered[@]} - 1))]}" ]; do
@@ -101,7 +118,7 @@ if [ "${#out[@]}" -gt 0 ]; then
 	last="${out[$((${#out[@]} - 1))]}"
 	is_trailer "$last" || out+=("")
 fi
-out+=("$ASSISTED" "$SIGNOFF")
+out+=("${trailers[@]}")
 
 printf '%s\n' "${out[@]}" > "$MSG_FILE"
 exit 0

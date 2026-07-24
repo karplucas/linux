@@ -22,7 +22,8 @@ These are the single source of truth; the copies living inside each repo's
   (e.g. URLs), which cannot be wrapped.
 - Auto-appends these trailers at the very end, in order, de-duplicated:
   - `Assisted-by: Cursor:claude-opus-4.8-high`
-  - `Signed-off-by: Raphael Norwitz <rnorwitz@nvidia.com>`
+  - `Signed-off-by: <name> <email>` — derived from the repo's
+    `git config user.name` / `user.email` (omitted if either is unset).
 - Skips `Merge`, `Revert "..."`, `fixup!`, `squash!`, `amend!` commits.
 
 ### `pre-commit`
