@@ -577,8 +577,11 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
   match every existing `uverbs_std_types_*.c`; that one commit used
   `--no-verify` with the rationale in its trailer. Deferred: `beea656`
   (restore-mode ufile WARN-silence — mlx5-motivated, not needed for rxe PD).
-  Exercised by `nldev_res_handle_probe.c` + `pd_restore_probe_rxe.c` (see §8).
-  Pending: compile/boot gate in `/opt/builds/linux`.
+  Built + booted from `/opt/builds/linux`; **dev gate GREEN** on rxe0/loopback:
+  `nldev_res_handle_probe rxe0` (RES_HANDLE on PD/CQ/QP/MR/SRQ, 0 failures) and
+  `pd_restore_probe_rxe rxe0` (gate→-EPERM, RESTORE_PD@0x4242, -EBUSY collision,
+  legacy ALLOC_PD non-interference, DEALLOC round-trip) both PASS. Remaining:
+  whole-workflow E2E (rxe `ib_write_bw` migrate) — the criu agent's gate.
 - [ ] **Group A (T1.1–T1.x)** on top of `criu-dev-build-up-rebase` — `A-querymr`
   (`35fb924`,`ff4544a`), `A-nldev-ufile` (`0601c49`, split tools), `A-nldev-cqn`
   (`5fe60bc`), `A-core-acc` (`5b6f13a` umem_pin split + `2727d8a`
