@@ -527,7 +527,7 @@ Two git worktrees under `/opt/builds` (shared object store, one clone):
 
 | Path | Branch | Role |
 |------|--------|------|
-| `/opt/builds/linux` | `criu-dev-build-up-rebase` (starts `f7e71a81`, growing toward `origin/criu-dev-poc-rebase`) | **The build/boot + curation tree.** The running kernel is *always* built here (`/lib/modules/$(uname -r)/build → /opt/builds/linux`). We add one functional group at a time and build/boot this tree at each milestone. |
+| `/opt/builds/linux` | maintainer-managed milestone WIP branch off `f7e71a81` (e.g. `criu-rebase-t1.1-rxe-pd-wip`), growing toward `origin/criu-dev-poc-rebase` | **The build/boot + curation tree — the ONLY kernel build tree.** The running kernel is *always* built here (`/lib/modules/$(uname -r)/build → /opt/builds/linux`). We add one functional group at a time and build/boot this tree at each milestone. |
 | `/opt/builds/linux-poc-ref` | `criu-dev-poc-rebase` (local ref of the authoritative `origin/criu-dev-poc-rebase`) | **Read-only reference / oracle.** Full POC source for `git diff` / hunk lookup, and where these plan docs live. Not built. |
 
 Model:
@@ -538,6 +538,12 @@ Model:
   build and boot the build-up kernel itself, there is no vermagic split — the
   running kernel matches the tree at each milestone. `linux-poc-ref` is only a
   source reference and is never booted.
+- **Hosts are severely disk-constrained: build ONLY in `/opt/builds/linux`.**
+  Never create a second checkout/worktree to build the kernel — there is only
+  room for one kernel build tree. The kernel agent curates commits and runs
+  the compile/checkpatch gate in place on `/opt/builds/linux`. Branch
+  management, worktree creation, pushing, and moving a milestone's WIP branch
+  onto the build tree are handled by the maintainer (human), not the agent.
 - The plan docs (`tools/testing/criu_rdma/plans/`) exist on the endpoint branch
   (checked out in `linux-poc-ref`), not at `f7e71a81`, so edit/commit them there.
 - Staying on 6.19 for stability; no `master`/rc worktree. Rebasing onto a recent
@@ -560,6 +566,19 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
 - [x] **Group P (T1.0)** in place at `f7e71a81` (`eb6bb8b` rxe-netns,
   `52721d0`/`551a135`/`a753315` fdinfo, `f7e71a8` safe-file-access). Squash of
   the fdinfo trio + message polish deferred to final export.
+- [x] **T1.1 (PD, rxe) curated** — 5 commits off `f7e71a81` (branch
+  `criu-rebase-t1.1-rxe-pd-wip`): `A-nldev-ufile` (`0601c49`, code-only,
+  tools dropped), `D-restmode` core (`c57115c`) + rxe (`f0623eb`), `D-ufile`
+  core helper `rdma_alloc_begin_uobject_at_handle` (`b8264c0` core hunks only —
+  a T1.1 prerequisite not previously listed; the rest of `b8264c0` is mlx5
+  F-uar), `D-restore-pd` (`e068683`). Verified subset-clean vs oracle tip.
+  checkpatch: the PD dispatcher trips 2 idiomatic uverbs-macro CHECKs
+  (`UVERBS_HANDLER()` / `DECLARE_UVERBS_NAMED_METHOD` lines ending in `(`) that
+  match every existing `uverbs_std_types_*.c`; that one commit used
+  `--no-verify` with the rationale in its trailer. Deferred: `beea656`
+  (restore-mode ufile WARN-silence — mlx5-motivated, not needed for rxe PD).
+  Exercised by `nldev_res_handle_probe.c` + `pd_restore_probe_rxe.c` (see §8).
+  Pending: compile/boot gate in `/opt/builds/linux`.
 - [ ] **Group A (T1.1–T1.x)** on top of `criu-dev-build-up-rebase` — `A-querymr`
   (`35fb924`,`ff4544a`), `A-nldev-ufile` (`0601c49`, split tools), `A-nldev-cqn`
   (`5fe60bc`), `A-core-acc` (`5b6f13a` umem_pin split + `2727d8a`
@@ -617,7 +636,7 @@ column in full):
 
 | M | Round-trip | Kernel (feeds §6) | criu | Dev testcase → whole-workflow gate |
 |---|-----------|-------------------|------|------------------------------------|
-| T1.1 | PD | `D-restmode`, `D-restore-pd`, `A-nldev-ufile` | uobj DAG + claim + cdev-open + PD restore | rxe PD strict round-trip → rxe `ib_write_bw` migrate |
+| T1.1 | PD | `D-restmode`, `D-ufile` (alloc-at-handle helper), `D-restore-pd`, `A-nldev-ufile` | uobj DAG + claim + cdev-open + PD restore | rxe PD strict round-trip → rxe `ib_write_bw` migrate |
 | T1.2 | MR | `A-querymr`, `D-restore-mr`, `A-core-acc` (umem_pin) | RESTORE_MR via pie blob | rxe MR + RDMA-WRITE acid → " |
 | T1.3 | CQ | `C-querycq`, `C-cq-rt`, `D-restore-cq` | per-CQ save/restore | rxe CQ ring → " |
 | T1.4 | QP (drained) | `B-freeze`, `C-queryqp`, `D-restore-qp` | per-QP dump + master/PIE RESTORE_QP | rxe born-frozen thaw → " |
