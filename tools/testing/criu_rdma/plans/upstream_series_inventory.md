@@ -646,9 +646,13 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
   pid+res_cqn+handle match, destroy round-trip). Subtest [8] fails as expected at
   `QUERY_CQ -> -EPROTONOSUPPORT` (deferred T1.3b); its RESTORE_CQ-with-16B-UHW
   restore leg (vm_pgoff=0) succeeds first, so commit F's UHW copy + reserved
-  validation + monotonic fallback are exercised. Still uncovered by the runnable
-  subset: F's *non-zero* vm_pgoff honor / -EEXIST collision / inline-attr-trap
-  rejection. Remaining: whole-workflow E2E — criu agent's gate.
+  validation + monotonic fallback are exercised. Commit F's *non-zero* paths are
+  now covered by a dedicated skeleton subtest [8] `vm_pgoff forced-offset`
+  (`cq_restore_probe_rxe`): forced offset honored (mminfo.offset == req.vm_pgoff),
+  duplicate offset → -EEXIST, distinct offset coexists, inline-attr window
+  (len==8) → -EINVAL, reserved!=0 → -EINVAL — all PASS on rxe0. Only [9] (ring
+  round-trip, ex-[8]) still needs the deferred QUERY_CQ. Remaining: whole-workflow
+  E2E — criu agent's gate.
 - [ ] **Group A (T1.1–T1.x)** on top of `criu-dev-build-up-rebase` — `A-querymr`
   (`35fb924`,`ff4544a`) ✅ curated in T1.2, `A-nldev-ufile` (`0601c49`, split
   tools) ✅ curated in T1.1, `A-nldev-cqn` (`5fe60bc`), `A-core-acc` (`5b6f13a`
