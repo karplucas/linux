@@ -566,13 +566,13 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
 - [x] **Group P (T1.0)** in place at `f7e71a81` (`eb6bb8b` rxe-netns,
   `52721d0`/`551a135`/`a753315` fdinfo, `f7e71a8` safe-file-access). Squash of
   the fdinfo trio + message polish deferred to final export.
-- [x] **T1.1 (PD, rxe) curated** — 5 commits off `f7e71a81` (branch
-  `criu-rebase-t1.1-rxe-pd-wip`): `A-nldev-ufile` (`0601c49`, code-only,
-  tools dropped), `D-restmode` core (`c57115c`) + rxe (`f0623eb`), `D-ufile`
-  core helper `rdma_alloc_begin_uobject_at_handle` (`b8264c0` core hunks only —
-  a T1.1 prerequisite not previously listed; the rest of `b8264c0` is mlx5
-  F-uar), `D-restore-pd` (`e068683`). Verified subset-clean vs oracle tip.
-  checkpatch: the PD dispatcher trips 2 idiomatic uverbs-macro CHECKs
+- [x] **T1.1 (PD, rxe) curated** — 5 commits off `f7e71a81` (branch `rebase-1`,
+  pushed as `origin/criu-rebase-t1.1-rxe-pd-wip`): `A-nldev-ufile` (`0601c49`,
+  code-only, tools dropped), `D-restmode` core (`c57115c`) + rxe (`f0623eb`),
+  `D-ufile` core helper `rdma_alloc_begin_uobject_at_handle` (`b8264c0` core
+  hunks only — a T1.1 prerequisite not previously listed; the rest of `b8264c0`
+  is mlx5 F-uar), `D-restore-pd` (`e068683`). Verified subset-clean vs oracle
+  tip. checkpatch: the PD dispatcher trips 2 idiomatic uverbs-macro CHECKs
   (`UVERBS_HANDLER()` / `DECLARE_UVERBS_NAMED_METHOD` lines ending in `(`) that
   match every existing `uverbs_std_types_*.c`; that one commit used
   `--no-verify` with the rationale in its trailer. Deferred: `beea656`
@@ -582,10 +582,70 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
   `pd_restore_probe_rxe rxe0` (gate→-EPERM, RESTORE_PD@0x4242, -EBUSY collision,
   legacy ALLOC_PD non-interference, DEALLOC round-trip) both PASS. Remaining:
   whole-workflow E2E (rxe `ib_write_bw` migrate) — the criu agent's gate.
+- [x] **T1.2 (MR, rxe) curated** — 3 commits stacked on the T1.1 tip
+  (`2d45ad8`), branch `rebase-1`: `D-restore-mr` (`d5ec7d7` → RESTORE_MR + rxe
+  impl, `4007a86`), `D-restore-mr (rxe)` (`f422e6b` → lkey/rkey identity hint +
+  `__rxe_add_to_pool_at_index`, `7aa8a27`), `A-querymr` (`35fb924` + 2-line
+  `ff4544a` squashed → QUERY_MR user_addr/access_flags, `bad3586`).
+  (Re-curated after a host wipe destroyed the first, unpushed cut; the redo is
+  byte-for-byte the same modulo commit hashes.) Subset-parity vs oracle: the
+  MR-complete files (`uverbs_std_types_mr.c`, `uverbs_cmd.c`, `rxe_pool.c/.h`)
+  are byte-identical to the tip; `rxe_restore_mr` differs only by 4 intentional
+  checkpatch fixes (dropped redundant `rxe_restore_mr:` literals — the
+  `rxe_dbg_*`/`rxe_err_*` macros already inject `%s:__func__` — and split two
+  chained assignments). checkpatch: `D-restore-mr` trips the same 2 idiomatic
+  uverbs-macro CHECKs as PD (`--no-verify` + trailer note); the other two
+  commits are 0/0/0 clean and pass the pre-commit gate normally. Compile gate
+  GREEN (all 6 changed IB/rxe objects rebuild). `A-core-acc` (`5b6f13a`
+  umem_pin) intentionally **not** in T1.2 — reclassified to T2.3 (see the
+  finding note under the Phase-T1 table). Harness: `mr_restore_probe_rxe.c`
+  (exercises RESTORE_MR + all 10 attrs; QUERY_MR is exercised by the criu dump
+  side). Built + booted from `/opt/builds/linux`; **dev gate GREEN** on
+  rxe0/loopback: `mr_restore_probe_rxe rxe0` PASS (8/8 subtests): gate→-EPERM,
+  lkey!=rkey→-EINVAL, happy-path RESTORE_MR@0x4242 with resp keys
+  byte-identical to hints (wire-visible identity preserved) + INFO_HANDLES(MR)
+  visible, ufile collision→-EBUSY, pool-index collision→-EBUSY (validates
+  `__rxe_add_to_pool_at_index`), bogus-PD→-ENOENT, cross-uobj refcount
+  (DEALLOC_PD with live MR→-EBUSY), DEREG_MR round-trip. Remaining:
+  whole-workflow E2E (rxe MR + RDMA-WRITE acid) — the criu agent's gate.
+- [x] **T1.3 (CQ, rxe) skeleton curated — refactor-first 4-commit reorder** on
+  top of the MR tip (`bad3586`), branch `rebase-3-cqsplit`. The original
+  monolithic vm_pgoff commit (`8f713f6`) bundled an mmap-layer refactor with the
+  new feature; per the "evolve existing code first, then add functionality, with
+  API changes as granular as possible" principle it was split and reordered so
+  the refactor lands *before* the new RESTORE_CQ verb:
+  1. `RDMA/rxe: register mmap info at allocation time` (`b3ac069`) — pure
+     code-motion: move the `pending_mmaps` list insertion into
+     `rxe_create_mmap_info()` (+ `do_mmap_info()` undo-on-copy-fail). No
+     signature change, behavior-identical.
+  2. `RDMA/rxe: allow callers to force an mmap offset` (`7d13db4`) — thread a
+     `u64 forced_offset` through `rxe_create_mmap_info`/`do_mmap_info`/
+     `rxe_cq_from_init`; unify claim+insert under `pending_lock ->
+     mmap_offset_lock`; add the non-zero collision(-EEXIST)/claim/ratchet.
+     Dormant — every existing caller passes 0.
+  3. `RDMA/uverbs: add RESTORE_CQ + rxe impl` (`5cea05a` = `6244d78` with
+     `rxe_restore_cq` adjusted to pass `forced_vm_pgoff=0`) — the new verb.
+  4. `RDMA/rxe: honor source vm_pgoff in restore_cq` (`9fc787f`) — the CRIU
+     feature only: `struct rxe_restore_cq_req` + `rxe_restore_cq` req
+     parse/validate + wire the claimed pgoff into the mechanism from (2) + trace.
+
+  **Tip-tree parity: `HEAD^{tree}` == `8f713f6^{tree}` (byte-identical end
+  state); each commit compiles standalone.** Earlier fix-up squashes retained
+  (`5e5b27a` destroy_cq guard into RESTORE_CQ; `35297c0` 8->16B struct +
+  `cf70504` trace into vm_pgoff), so no "fix the previous commit" churn ships.
+  checkpatch: RESTORE_CQ (commit 3) trips the same 2 idiomatic uverbs-macro
+  CHECKs as PD/MR (`--no-verify` + trailer note); commits 1/2/4 pass the gate
+  normally. **Deferred to T1.3b (post-freeze/QP):** `C-querycq` (`66a32b4`, needs
+  `rxe_vfmig.c`) and the full ring-content `C-cq-rt` (`2418524`, needs
+  `rxe_migrate.c`); `53bf38a` scaffold dropped. Harness: `cq_restore_probe_rxe.c`
+  is the *tip* probe (uses QUERY_CQ/MIGRATE) — for the skeleton dev-gate run only
+  its RESTORE_CQ/vm_pgoff subtests until T1.3b lands. Remaining: build+boot, run
+  the skeleton subtests, then whole-workflow E2E — criu agent's gate.
 - [ ] **Group A (T1.1–T1.x)** on top of `criu-dev-build-up-rebase` — `A-querymr`
-  (`35fb924`,`ff4544a`), `A-nldev-ufile` (`0601c49`, split tools), `A-nldev-cqn`
-  (`5fe60bc`), `A-core-acc` (`5b6f13a` umem_pin split + `2727d8a`
-  qp_user_handle). NEXT.
+  (`35fb924`,`ff4544a`) ✅ curated in T1.2, `A-nldev-ufile` (`0601c49`, split
+  tools) ✅ curated in T1.1, `A-nldev-cqn` (`5fe60bc`), `A-core-acc` (`5b6f13a`
+  umem_pin split → **T2.3** + `2727d8a` qp_user_handle → QP milestone). Remaining
+  Group A discovery: `A-nldev-cqn`.
 - [ ] Group B / C / D — see section 2.
 
 ## 8. Development ordering (incremental-test) vs submission ordering — the two-agent workflow
@@ -639,14 +699,50 @@ column in full):
 
 | M | Round-trip | Kernel (feeds §6) | criu | Dev testcase → whole-workflow gate |
 |---|-----------|-------------------|------|------------------------------------|
-| T1.1 | PD | `D-restmode`, `D-ufile` (alloc-at-handle helper), `D-restore-pd`, `A-nldev-ufile` | uobj DAG + claim + cdev-open + PD restore | rxe PD strict round-trip → rxe `ib_write_bw` migrate |
-| T1.2 | MR | `A-querymr`, `D-restore-mr`, `A-core-acc` (umem_pin) | RESTORE_MR via pie blob | rxe MR + RDMA-WRITE acid → " |
-| T1.3 | CQ | `C-querycq`, `C-cq-rt`, `D-restore-cq` | per-CQ save/restore | rxe CQ ring → " |
+| T1.1 | PD | `D-restmode`, `D-restore-pd`, `A-nldev-ufile` | uobj DAG + claim + cdev-open + PD restore | rxe PD strict round-trip → rxe `ib_write_bw` migrate |
+| T1.2 | MR | `A-querymr`, `D-restore-mr` | RESTORE_MR via pie blob | rxe MR + RDMA-WRITE acid → " |
+| T1.3 | CQ (skeleton) | `D-restore-cq`, `C-cq-rt` (vm_pgoff ring-mmap only) | per-CQ restore-at-handle | rxe CQ restore + mmap remap → " |
+| T1.3b | CQ (ring round-trip) | `C-querycq`, `C-cq-rt` (ring content) — **deferred to freeze/QP layer** | per-CQ save/restore | rxe CQ ring content → " |
 | T1.4 | QP (drained) | `B-freeze`, `C-queryqp`, `D-restore-qp` | per-QP dump + master/PIE RESTORE_QP | rxe born-frozen thaw → " |
 | T1.5 | QP (in-flight) | `B-idem`/`B-gate`/`B-trace`, `C-inflight` | non-drained-SQ replay, thaw@RESUME_DEVICES_LATE | rxe in-flight (B1) → rxe `ib_write_bw` mid-flight migrate |
 
 **T1 exit gate:** full RXE suite green + a whole-workflow RXE migration passes. T1
 is now a postable core+rxe series (→ rdma-next / rxe), independent of vfmig.
+
+> **T1.2 curation finding — `A-core-acc` (`5b6f13a`, `ib_umem_pin` split) is a
+> T2 prerequisite, not T1.2.** At the oracle tip the only consumers of
+> `ib_umem_pin` are mlx5 (`main.c`, `mem.c`, `doorbell.c`); neither rxe nor the
+> core RESTORE_MR dispatcher calls it. Including it in T1.2 would ship a dead
+> core helper. It is therefore deferred to **T2.3 (mlx5 MR)** where `F-mr`
+> actually uses it. (Mirror of the T1.1 `D-ufile` finding, inverted: there a
+> prereq was missing, here one was spurious.)
+
+> **T1.3 curation finding — "CQ" splits across the spine.** The core CQ
+> restore skeleton (`D-restore-cq` = `a77cc4d` + the `5e5b27a` destroy_cq
+> guard; `C-cq-rt` ring-mmap = `e48f4e3` vm_pgoff + `35297c0` sizing + `cf70504`
+> trace) is self-contained and lands at T1.3, before QP. But the CQ **ring
+> content** round-trip and the `QUERY_CQ` dump verb depend on QP-era files:
+> `66a32b4` (`C-querycq`) adds to `rxe_vfmig.c` (created by `ed1173a`, QP
+> save/restore) and `2418524` (full `C-cq-rt`) adds to `rxe_migrate.c` (created
+> by `6f5c8be`, `B-freeze`). This is semantically correct — a CQ's ring content
+> only matters once QPs post CQEs and the freeze/migrate substrate exists to
+> snapshot it — so those land as **T1.3b after the freeze/QP layer**, not with
+> the standalone CQ object. `53bf38a` is harness-only scaffold (dropped).
+> Upstream hygiene: the skeleton commits fold their own fix-ups
+> (`5e5b27a` destroy_cq guard into RESTORE_CQ; `35297c0` 8->16B struct sizing
+> into the vm_pgoff commit) so no "fix the previous commit" churn ships.
+>
+> **Refactor-first split of the vm_pgoff commit.** The monolithic `8f713f6`
+> mixed a behavior-preserving mmap-layer refactor with the new pgoff feature.
+> To keep the series "evolve existing code first, then add functionality" with
+> granular API changes, it was decomposed and reordered so the refactor precedes
+> the RESTORE_CQ verb: (1) `b3ac069` relocate `pending_mmaps` insert into
+> `rxe_create_mmap_info` (code-motion, no signature change); (2) `7d13db4` thread
+> `forced_offset` through the mmap-info path + unified locking + collision/claim/
+> ratchet (dormant, all callers pass 0); then the verb (3) `5cea05a` RESTORE_CQ
+> (`6244d78`, `rxe_restore_cq` passes `forced_vm_pgoff=0`); then the feature
+> (4) `9fc787f` `rxe_restore_cq_req` + honor the pgoff via the mechanism from (2).
+> Verified: tip tree == `8f713f6` tree byte-for-byte, every commit compiles.
 
 **Phase T2 — mlx5 (layered on the complete T1 core framework; rig-bound):**
 
@@ -655,7 +751,7 @@ is now a postable core+rxe series (→ rdma-next / rxe), independent of vfmig.
 | T2.0 | VHCA foundation | `E-chardev`/`E-ioctls`/`E-saveload`/`E-iova`/`E-dma`/`E-restore-probe` (2a) | plugin claim/presence, SAVE + GET_CONTEXT, cdev VMAs | VF migrates + RC ping-pong survives (`52021cc`) → — |
 | T2.1 | UAR + restore-mode uctx | `F-restmode`, `F-uar` | VFMIG QUERY/RESTORE ucontext (static + dyn UAR) | uctx round-trip → — |
 | T2.2 | PD | `F-pd`, `F-querypd` | mlx5 PD via UHW | `pd` → `ib_write_bw` swap |
-| T2.3 | MR | `F-mr`, `E-replay`(MR), `E-bind` | mlx5 MR UHW | `pd_mr` + RDMA-WRITE acid → `ib_write_bw` swap |
+| T2.3 | MR | `A-core-acc` (umem_pin), `F-mr`, `E-replay`(MR), `E-bind` | mlx5 MR UHW | `pd_mr` + RDMA-WRITE acid → `ib_write_bw` swap |
 | T2.4 | CQ | `F-cq` | per-CQ UHW | `pd_cq`, `pd_2cq` → `ib_write_bw` swap |
 | T2.5 | QP (+ in-flight) | `F-qp`, `E-queryqp`, `E-susp-split` | per-QP UHW, snapshot-ordering | `pd_cq_qp`, `pd_cq_qp_sq` → `ib_write_bw` swap |
 | T2.6 | Cross-host hardening | `E-directional`, `E-teardown`, `E-fused`, `E-uuid`, `E-move` | prerestore binary (KS7.x), rendezvous barrier | cross-host `pd_cq_qp_sq` → `ib_write_bw` swap across hosts (final) |
