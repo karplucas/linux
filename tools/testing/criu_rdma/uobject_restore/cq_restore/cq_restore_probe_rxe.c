@@ -52,7 +52,14 @@
  *      kernel-side QP children at v0. (mlx5 S5b's analogous subtest
  *      8 will assert the inverse -- BAD_RES_STATE -- since mlx5 FW
  *      tracks cqn in QPCs as a tracked dep; design §10.8.)
- *   8. In-flight CQE ring round-trip. RESTORE_CQ ships the ring bytes
+ *   8. Forced vm_pgoff (skeleton). Drives the "honor source vm_pgoff in
+ *      restore_cq" ABI without QUERY_CQ: a non-zero req.vm_pgoff is
+ *      reflected in the published rxe_create_cq_resp mminfo.offset,
+ *      a duplicate offset collides -EEXIST, a distinct offset coexists,
+ *      and the inline-attr-window / non-zero-reserved requests are
+ *      rejected -EINVAL. This is the runnable-on-the-skeleton coverage
+ *      for the vm_pgoff commit; subtest 9 additionally needs QUERY_CQ.
+ *   9. In-flight CQE ring round-trip. RESTORE_CQ ships the ring bytes
  *      + producer/consumer cursors (the QP SQ/RQ image path applied to
  *      the CQ); QUERY_CQ reads them straight back. Asserts the cursors
  *      and the CQE image are byte-identical, and -- via the producer
@@ -217,6 +224,18 @@ struct rxe_restore_cq_req_local {
 };
 
 /*
+ * Skeleton (pre-ring, T1.3) shape of struct rxe_restore_cq_req: just the
+ * forced vm_pgoff plus a reserved __u64 tail so sizeof() is 16 (> 8) and
+ * escapes the uverbs inline-attr window. Distinct from the tip mirror
+ * above, which grew producer/consumer/cqe_image_bytes for the ring
+ * round-trip (T1.3b). subtest_vm_pgoff_forced() drives the skeleton path.
+ */
+struct rxe_restore_cq_req_skel {
+	uint64_t	vm_pgoff;
+	uint64_t	reserved;
+};
+
+/*
  * Mirrors include/uapi/rdma/rdma_user_rxe.h's struct rxe_create_cq_resp
  * (one struct mminfo: __aligned_u64 offset, __u32 size, __u32 pad).
  * rxe_restore_cq insists on udata->outlen >= sizeof(rxe_create_cq_resp)
@@ -243,6 +262,13 @@ struct rxe_create_cq_resp_local {
 #define TARGET_HANDLE_3				0x4244u
 #define USER_HANDLE_TAG				0xDEADBEEFCAFEBABEull
 #define CQE_REQUESTED				64u
+
+/* Forced-vm_pgoff (skeleton) subtest: fresh ufile handles + offsets. */
+#define VMPGOFF_HANDLE_A			0x4250u
+#define VMPGOFF_HANDLE_B			0x4251u
+#define VMPGOFF_HANDLE_C			0x4252u
+#define FORCED_PGOFF_A				0x40000000ull
+#define FORCED_PGOFF_B				0x40010000ull
 
 /* ----------------------- legacy-write helpers ---------------------------- */
 
@@ -414,6 +440,93 @@ static int do_restore_cq(int fd, uint32_t target_handle, uint32_t cqe,
 
 	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
 		return -errno;
+	return 0;
+}
+
+/*
+ * RESTORE_CQ carrying a skeleton struct rxe_restore_cq_req UHW_IN
+ * (vm_pgoff + reserved, no ring image) and reading the resulting
+ * rxe_create_cq_resp mminfo back out. Used by subtest_vm_pgoff_forced
+ * to prove the forced-offset path added by "RDMA/rxe: honor source
+ * vm_pgoff in restore_cq".
+ *
+ * @vm_pgoff / @reserved populate the UHW_IN request. @inlen_override,
+ * when non-zero, overrides the UHW_IN attr length (used to poke the
+ * inline-attr trap window with len == sizeof(u64)); 0 means "use the
+ * natural sizeof(req)". On success @offset_out receives the kernel's
+ * published mminfo.offset (which must equal @vm_pgoff when it is
+ * non-zero and not colliding).
+ */
+static int do_restore_cq_forced(int fd, uint32_t target_handle, uint32_t cqe,
+				uint64_t vm_pgoff, uint64_t reserved,
+				uint16_t inlen_override, uint64_t *offset_out,
+				uint32_t *resp_cqe_out)
+{
+	struct rxe_create_cq_resp_local uhw_out = {};
+	struct rxe_restore_cq_req_skel req = {
+		.vm_pgoff = vm_pgoff,
+		.reserved = reserved,
+	};
+	uint16_t inlen = inlen_override ? inlen_override : (uint16_t)sizeof(req);
+	struct {
+		struct ib_uverbs_ioctl_hdr	hdr;
+		struct ib_uverbs_attr		attrs[7];
+	} cmd = {};
+	unsigned int n = 0;
+
+	cmd.hdr.object_id	= UVERBS_OBJECT_RESTORE;
+	cmd.hdr.method_id	= UVERBS_METHOD_RESTORE_CQ;
+	cmd.hdr.driver_id	= RDMA_DRIVER_RXE_LOCAL;
+
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_RESTORE_CQ_HANDLE;
+	cmd.attrs[n].len	= sizeof(uint32_t);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= target_handle;
+	n++;
+
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_RESTORE_CQ_CQE;
+	cmd.attrs[n].len	= sizeof(uint32_t);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= cqe;
+	n++;
+
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_RESTORE_CQ_USER_HANDLE;
+	cmd.attrs[n].len	= sizeof(uint64_t);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= USER_HANDLE_TAG;
+	n++;
+
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_RESTORE_CQ_COMP_VECTOR;
+	cmd.attrs[n].len	= sizeof(uint32_t);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= 0;
+	n++;
+
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_RESTORE_CQ_RESP_CQE;
+	cmd.attrs[n].len	= sizeof(uint32_t);
+	cmd.attrs[n].flags	= UVERBS_ATTR_F_MANDATORY;
+	cmd.attrs[n].data	= (uintptr_t)resp_cqe_out;
+	n++;
+
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_UHW_IN;
+	cmd.attrs[n].len	= inlen;
+	cmd.attrs[n].flags	= 0;
+	cmd.attrs[n].data	= (uintptr_t)&req;
+	n++;
+
+	cmd.attrs[n].attr_id	= UVERBS_ATTR_UHW_OUT;
+	cmd.attrs[n].len	= sizeof(uhw_out);
+	cmd.attrs[n].flags	= 0;
+	cmd.attrs[n].data	= (uintptr_t)&uhw_out;
+	n++;
+
+	cmd.hdr.num_attrs = n;
+	cmd.hdr.length = sizeof(cmd.hdr) + n * sizeof(cmd.attrs[0]);
+
+	if (ioctl(fd, RDMA_VERBS_IOCTL, &cmd) < 0)
+		return -errno;
+	if (offset_out)
+		*offset_out = uhw_out.mi.offset;
 	return 0;
 }
 
@@ -1181,7 +1294,111 @@ static int subtest_destroy_round_trip(int fd)
 }
 
 /*
- * [8] In-flight CQE ring round-trip. RESTORE_CQ ships the ring bytes +
+ * [8] Forced vm_pgoff (skeleton path, no QUERY_CQ). Exercises the
+ * "RDMA/rxe: honor source vm_pgoff in restore_cq" ABI on its own, without
+ * the ring round-trip that needs the deferred QUERY_CQ/MIGRATE verb:
+ *   (a) a non-zero req.vm_pgoff is honored -- the published
+ *       rxe_create_cq_resp mminfo.offset equals the requested value
+ *       (rxe_create_mmap_info's forced-offset claim, not the monotonic
+ *       counter);
+ *   (b) a second CQ forced to the same offset collides -> -EEXIST
+ *       (the pending_mmaps walk under pending_lock);
+ *   (c) a distinct offset still succeeds and coexists;
+ *   (d) a UHW_IN whose len sits in the inline-attr window
+ *       (0 < len <= sizeof(u64)) is rejected -EINVAL up front;
+ *   (e) a non-zero reserved tail is rejected -EINVAL.
+ * The restored CQs are left installed (never mmap'd, so their offsets
+ * stay claimed in pending_mmaps for the collision check); the ucontext
+ * close at the end of main() tears them down.
+ */
+static int subtest_vm_pgoff_forced(int fd)
+{
+	uint32_t resp_cqe = 0;
+	uint64_t off = 0;
+	int ret;
+
+	printf("[8] vm_pgoff forced-offset (skeleton, no QUERY_CQ)\n");
+
+	ret = do_restore_cq_forced(fd, VMPGOFF_HANDLE_A, CQE_REQUESTED,
+				   FORCED_PGOFF_A, 0, 0, &off, &resp_cqe);
+	if (ret) {
+		fprintf(stderr,
+			"  FAIL RESTORE_CQ(vm_pgoff=0x%llx): %s%s\n",
+			(unsigned long long)FORCED_PGOFF_A, strerror(-ret),
+			ret == -EINVAL
+			? "  (rxe_restore_cq rejecting the 16B req? check the\n"
+			  "   inline-attr-threshold branch)"
+			: "");
+		return 1;
+	}
+	if (off != FORCED_PGOFF_A) {
+		fprintf(stderr,
+			"  FAIL forced offset not honored: mi.offset=0x%llx want 0x%llx\n"
+			"       (rxe_create_mmap_info must bind mi.offset to the\n"
+			"        caller's vm_pgoff, not rxe->mmap_offset)\n",
+			(unsigned long long)off,
+			(unsigned long long)FORCED_PGOFF_A);
+		return 1;
+	}
+	printf("  PASS RESTORE_CQ(vm_pgoff=0x%llx) -> mi.offset=0x%llx\n",
+	       (unsigned long long)FORCED_PGOFF_A, (unsigned long long)off);
+
+	ret = do_restore_cq_forced(fd, VMPGOFF_HANDLE_B, CQE_REQUESTED,
+				   FORCED_PGOFF_A, 0, 0, NULL, &resp_cqe);
+	if (ret != -EEXIST) {
+		fprintf(stderr,
+			"  FAIL duplicate vm_pgoff=0x%llx -> %s (expected -EEXIST;\n"
+			"       rxe_create_mmap_info must reject a pending-mmaps\n"
+			"       offset collision)\n",
+			(unsigned long long)FORCED_PGOFF_A,
+			ret ? strerror(-ret) : "0");
+		return 1;
+	}
+	printf("  PASS duplicate vm_pgoff=0x%llx -> -EEXIST\n",
+	       (unsigned long long)FORCED_PGOFF_A);
+
+	off = 0;
+	ret = do_restore_cq_forced(fd, VMPGOFF_HANDLE_B, CQE_REQUESTED,
+				   FORCED_PGOFF_B, 0, 0, &off, &resp_cqe);
+	if (ret || off != FORCED_PGOFF_B) {
+		fprintf(stderr,
+			"  FAIL RESTORE_CQ(vm_pgoff=0x%llx) -> ret=%s mi.offset=0x%llx\n",
+			(unsigned long long)FORCED_PGOFF_B,
+			ret ? strerror(-ret) : "0", (unsigned long long)off);
+		return 1;
+	}
+	printf("  PASS distinct forced offset 0x%llx coexists\n",
+	       (unsigned long long)FORCED_PGOFF_B);
+
+	ret = do_restore_cq_forced(fd, VMPGOFF_HANDLE_C, CQE_REQUESTED,
+				   FORCED_PGOFF_A, 0, (uint16_t)sizeof(uint64_t),
+				   NULL, &resp_cqe);
+	if (ret != -EINVAL) {
+		fprintf(stderr,
+			"  FAIL UHW_IN len=%zu -> %s (expected -EINVAL; the\n"
+			"       inline-attr window must be refused up front)\n",
+			sizeof(uint64_t), ret ? strerror(-ret) : "0");
+		return 1;
+	}
+	printf("  PASS UHW_IN len=%zu (inline-attr trap) -> -EINVAL\n",
+	       sizeof(uint64_t));
+
+	ret = do_restore_cq_forced(fd, VMPGOFF_HANDLE_C, CQE_REQUESTED,
+				   FORCED_PGOFF_A, 1, 0, NULL, &resp_cqe);
+	if (ret != -EINVAL) {
+		fprintf(stderr,
+			"  FAIL reserved=1 -> %s (expected -EINVAL; forward-compat\n"
+			"       reserved bits must be zero)\n",
+			ret ? strerror(-ret) : "0");
+		return 1;
+	}
+	printf("  PASS reserved!=0 -> -EINVAL\n");
+
+	return 0;
+}
+
+/*
+ * [9] In-flight CQE ring round-trip. RESTORE_CQ ships the ring bytes +
  * cursors (the QP SQ/RQ image path, applied to the CQ), QUERY_CQ reads them
  * straight back. We validate the new kernel paths end to end:
  *   - QUERY_CQ emits producer/consumer/cqe_image_bytes + the CQE image;
@@ -1203,7 +1420,7 @@ static int subtest_inflight_round_trip(int fd)
 	uint8_t *src = NULL, *dst = NULL;
 	int ret, fails = 0;
 
-	printf("[8] in-flight round-trip: RESTORE_CQ(image+cursors) -> QUERY_CQ byte-identical\n");
+	printf("[9] in-flight round-trip: RESTORE_CQ(image+cursors) -> QUERY_CQ byte-identical\n");
 
 	/*
 	 * Learn the authoritative ring geometry from a freshly-created CQ:
@@ -1347,6 +1564,7 @@ int main(int argc, char **argv)
 	fails += subtest_comp_channel_rejected(fd_restore);
 	fails += subtest_nldev_handle_match(ibdev);
 	fails += subtest_destroy_round_trip(fd_restore);
+	fails += subtest_vm_pgoff_forced(fd_restore);
 	fails += subtest_inflight_round_trip(fd_restore);
 
 	close(fd_restore);
