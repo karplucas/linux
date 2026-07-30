@@ -638,9 +638,17 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
   normally. **Deferred to T1.3b (post-freeze/QP):** `C-querycq` (`66a32b4`, needs
   `rxe_vfmig.c`) and the full ring-content `C-cq-rt` (`2418524`, needs
   `rxe_migrate.c`); `53bf38a` scaffold dropped. Harness: `cq_restore_probe_rxe.c`
-  is the *tip* probe (uses QUERY_CQ/MIGRATE) — for the skeleton dev-gate run only
-  its RESTORE_CQ/vm_pgoff subtests until T1.3b lands. Remaining: build+boot, run
-  the skeleton subtests, then whole-workflow E2E — criu agent's gate.
+  is the *tip* probe (uses QUERY_CQ/MIGRATE) — for the skeleton dev-gate only
+  subtests [1]–[7] apply until T1.3b lands. **Dev gate GREEN** on rxe0/loopback
+  (built+booted from `/opt/builds/linux`): `cq_restore_probe_rxe rxe0` subtests
+  [1]–[7] all PASS (gate→-EPERM, comp_vector→-EINVAL, happy-path RESTORE_CQ@0x4242
+  resp_cqe=127, -EBUSY collision, COMP_CHANNEL→-EOPNOTSUPP, NLDEV RES_CQ identity
+  pid+res_cqn+handle match, destroy round-trip). Subtest [8] fails as expected at
+  `QUERY_CQ -> -EPROTONOSUPPORT` (deferred T1.3b); its RESTORE_CQ-with-16B-UHW
+  restore leg (vm_pgoff=0) succeeds first, so commit F's UHW copy + reserved
+  validation + monotonic fallback are exercised. Still uncovered by the runnable
+  subset: F's *non-zero* vm_pgoff honor / -EEXIST collision / inline-attr-trap
+  rejection. Remaining: whole-workflow E2E — criu agent's gate.
 - [ ] **Group A (T1.1–T1.x)** on top of `criu-dev-build-up-rebase` — `A-querymr`
   (`35fb924`,`ff4544a`) ✅ curated in T1.2, `A-nldev-ufile` (`0601c49`, split
   tools) ✅ curated in T1.1, `A-nldev-cqn` (`5fe60bc`), `A-core-acc` (`5b6f13a`
