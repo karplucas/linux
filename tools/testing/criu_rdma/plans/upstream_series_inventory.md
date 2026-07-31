@@ -653,6 +653,72 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
   (len==8) → -EINVAL, reserved!=0 → -EINVAL — all PASS on rxe0. Only [9] (ring
   round-trip, ex-[8]) still needs the deferred QUERY_CQ. Remaining: whole-workflow
   E2E — criu agent's gate.
+- [x] **T1.3b slice 1 (QUERY_CQ dump verb) curated** on top of the CQ tip
+  (`9fc787f`), branch `rebase-qp-split-4`, single commit
+  `RDMA/rxe: add MIGRATE object with QUERY_CQ verb` (`e7b0452`). Pulled ahead of
+  QP per the vertical CQ-object spine: finish CQ (dump + restore) before QP.
+  This is a *synthesis*, not a cherry-pick — in the oracle the migrate object is
+  born inside the 2.4k-line QP mega-commit (`ed1173a`) with `QUERY_QP` as its
+  first method, and `66a32b4` only *adds* `QUERY_CQ` to it; here the object is
+  stood up minimally with `QUERY_CQ` as its **first and only** method. New files:
+  `include/uapi/rdma/rxe_user_ioctl_cmds.h` (`RXE_IB_OBJECT_MIGRATE`,
+  `RXE_IB_METHOD_QUERY_CQ` pinned to `(1<<12)+2` reserving +0/+1 for
+  `FREEZE_DATAPATH`/`QUERY_QP`, attrs `QUERY_CQ_{HANDLE,RESP_BLOB,RESP_CQE_IMAGE}`)
+  and `drivers/infiniband/sw/rxe/rxe_migrate.c` (the `QUERY_CQ` handler +
+  `rxe_migrate_defs`); wired via `dev->driver_def` in `rxe_register_device` +
+  `Makefile`. `struct rxe_query_cq_resp` (full 32B: `vm_pgoff/cqe/producer/
+  consumer/cqe_image_bytes/reserved[2]`) added to `rdma_user_rxe.h`. **ABI parity
+  verified byte-for-byte** vs the `cq_restore_probe_rxe.c` local shims (object
+  `(1<<12)`, method `+2`, attrs `+0/+1/+2`, 32B struct) — the hard CRIU-plugin
+  contract. **Slice boundary (per handoff):** handler fills
+  `vm_pgoff/cqe/producer/consumer`, sets `cqe_image_bytes=0`, declares
+  `RESP_CQE_IMAGE` `UA_OPTIONAL` but leaves it **unfilled**. The in-flight
+  `[consumer,producer)` CQE-image blit (grow `rxe_restore_cq_req`, restore-side
+  scatter) is **slice 2** (in-flight CQ, T1.5 analogue). Kernel-mode CQ → -ENXIO;
+  bogus handle → -ENOENT. **Compile gate GREEN** (`rxe_migrate.o` + full
+  `rdma_rxe.ko` link). checkpatch: 3 idiomatic uverbs-macro `(`-CHECKs
+  (`UVERBS_HANDLER`/`DECLARE_UVERBS_NAMED_METHOD`/`DECLARE_UVERBS_GLOBAL_METHODS`,
+  same class as PD/MR/CQ) → `--no-verify` + trailer note; the one plain
+  `uverbs_attr_get_obj(` call was reformatted away. **Dev gate GREEN** on
+  rxe0/loopback (built+booted from `/opt/builds/linux`): `cq_restore_probe_rxe
+  rxe0` subtests [1]–[8] all PASS; [9] now advances *past* the old
+  `QUERY_CQ -> -EPROTONOSUPPORT` — the seed `do_query_cq` returns 0, proving the
+  MIGRATE object + QUERY_CQ verb register and the blob copies out — and stops
+  exactly at its geometry-learning step (`cqe_image_bytes==0` on a fresh drained
+  CQ), the slice-2 boundary. NB the probe's [9] learns ring geometry from
+  `cqe_image_bytes` (a whole-ring assumption from an earlier design) which
+  clashes with the final in-flight-subspan semantic; slice 2 must reconcile that
+  (size the round-trip buffer from the actual `[consumer,producer)` span, not a
+  fresh-CQ query) to green [9].
+- [x] **T1.3b slice 2 (in-flight CQ ring image) curated** — branch
+  `rebase-qp-split-5`, **2 commits off the slice-1 tip `e7b0452`**, each pairing a
+  ring primitive with its first user (no dormant-helper commit):
+  - `ae7679f` **RDMA/rxe: emit the in-flight CQ ring on QUERY_CQ** — adds
+    `queue_inflight_capture()` (linearize the live `[consumer,producer)` subspan)
+    and teaches `QUERY_CQ` to fill `producer/consumer/cqe_image_bytes` + emit
+    `RESP_CQE_IMAGE`. Cursors snapshotted under `cq_lock`, dropped before the
+    faulting copy.
+  - `9fabc98` **RDMA/rxe: seed the in-flight CQ ring on RESTORE_CQ** — adds
+    `queue_inflight_restore()` + `rxe_cq_seed_ring()`, grows `rxe_restore_cq_req`
+    with `producer/consumer/cqe_image_bytes` (ABI stays >8B), and `rxe_restore_cq`
+    validates cursors → blits the image (`rxe_restore_cq_inflight`) → seeds via the
+    `TO_CLIENT`-direction `rxe_cq_seed_ring` (NOT `rxe_qp_seed_ring`).
+  Reworked from the earlier 3-commit split (`cabe773` dormant helpers + `f72b48e`
+  query + staged seed): the standalone helper commit was dissolved and
+  `queue_data_size()` **dropped** (unused in the CQ-only series — a QP-era helper).
+  Each commit is **bisectable** (compiles standalone), **checkpatch-clean**, and
+  carries the `Assisted-by`/`Signed-off-by` trailers. The inaccurate `9fc787f`
+  comment ("pending CQEs … arrive via the dumped CQ VMA") is corrected in
+  `9fabc98` — the shared `VMA_EXT_PLUGIN` mapping is not written back by CRIU;
+  unreaped CQEs ride only the explicit QUERY_CQ image + RESTORE_CQ blit.
+  **Probe [9] reworked** (`cq_restore_probe_rxe.c`): instead of learning geometry
+  from `QUERY_CQ.cqe_image_bytes` (a whole-ring assumption that now correctly reads
+  0 on a drained CQ), it mmaps the fresh ring header for `log2_elem_size`, derives
+  the subspan byte length itself, asserts the drained-CQ telemetry (`0/0/0`), then
+  validates the real `[consumer,producer)` round-trip byte-for-byte. Subtest [8]'s
+  `do_restore_cq_forced` unified onto the 24B `rxe_restore_cq_req` (skeleton mirror
+  dropped) so its `reserved!=0` case exercises the real reserved field.
+  **Dev gate: probe compiles; kernel rebuild+reboot pending to run [1]–[9] green.**
 - [ ] **Group A (T1.1–T1.x)** on top of `criu-dev-build-up-rebase` — `A-querymr`
   (`35fb924`,`ff4544a`) ✅ curated in T1.2, `A-nldev-ufile` (`0601c49`, split
   tools) ✅ curated in T1.1, `A-nldev-cqn` (`5fe60bc`), `A-core-acc` (`5b6f13a`
@@ -714,7 +780,8 @@ column in full):
 | T1.1 | PD | `D-restmode`, `D-restore-pd`, `A-nldev-ufile` | uobj DAG + claim + cdev-open + PD restore | rxe PD strict round-trip → rxe `ib_write_bw` migrate |
 | T1.2 | MR | `A-querymr`, `D-restore-mr` | RESTORE_MR via pie blob | rxe MR + RDMA-WRITE acid → " |
 | T1.3 | CQ (skeleton) | `D-restore-cq`, `C-cq-rt` (vm_pgoff ring-mmap only) | per-CQ restore-at-handle | rxe CQ restore + mmap remap → " |
-| T1.3b | CQ (ring round-trip) | `C-querycq`, `C-cq-rt` (ring content) — **deferred to freeze/QP layer** | per-CQ save/restore | rxe CQ ring content → " |
+| T1.3b.1 | CQ (dump verb) | `MIGRATE`+`QUERY_CQ` (synthesized minimal object; `vm_pgoff`+`cqe`+cursors, image unfilled) ✅ | per-CQ dump-side query | rxe CQ query field-fidelity → " |
+| T1.3b.2 | CQ (in-flight ring) | `ae7679f` QUERY_CQ image emit (`queue_inflight_capture`) + `9fabc98` RESTORE_CQ blit/seed (`queue_inflight_restore`+`rxe_cq_seed_ring`, grow `rxe_restore_cq_req`) ✅ | per-CQ ring save/restore | rxe unreaped-CQE round-trip → " |
 | T1.4 | QP (drained) | `B-freeze`, `C-queryqp`, `D-restore-qp` | per-QP dump + master/PIE RESTORE_QP | rxe born-frozen thaw → " |
 | T1.5 | QP (in-flight) | `B-idem`/`B-gate`/`B-trace`, `C-inflight` | non-drained-SQ replay, thaw@RESUME_DEVICES_LATE | rxe in-flight (B1) → rxe `ib_write_bw` mid-flight migrate |
 
@@ -733,13 +800,20 @@ is now a postable core+rxe series (→ rdma-next / rxe), independent of vfmig.
 > restore skeleton (`D-restore-cq` = `a77cc4d` + the `5e5b27a` destroy_cq
 > guard; `C-cq-rt` ring-mmap = `e48f4e3` vm_pgoff + `35297c0` sizing + `cf70504`
 > trace) is self-contained and lands at T1.3, before QP. But the CQ **ring
-> content** round-trip and the `QUERY_CQ` dump verb depend on QP-era files:
-> `66a32b4` (`C-querycq`) adds to `rxe_vfmig.c` (created by `ed1173a`, QP
-> save/restore) and `2418524` (full `C-cq-rt`) adds to `rxe_migrate.c` (created
-> by `6f5c8be`, `B-freeze`). This is semantically correct — a CQ's ring content
-> only matters once QPs post CQEs and the freeze/migrate substrate exists to
-> snapshot it — so those land as **T1.3b after the freeze/QP layer**, not with
-> the standalone CQ object. `53bf38a` is harness-only scaffold (dropped).
+> content** round-trip and the `QUERY_CQ` dump verb touch the migrate object,
+> which in the oracle is born inside QP-era files: `66a32b4` (`C-querycq`) adds
+> to `rxe_vfmig.c` (created by `ed1173a`, QP save/restore) and `2418524` (full
+> `C-cq-rt`) adds to `rxe_migrate.c` (created by `6f5c8be`, `B-freeze`).
+>
+> **Update — QUERY_CQ pulled ahead of QP (T1.3b.1).** To finish the CQ object
+> end-to-end before starting QP (vertical spine), the migrate object was *not*
+> deferred to the QP layer; instead it was **synthesized minimally** with
+> `QUERY_CQ` as its first and only method (commit `e7b0452`, off `9fc787f`),
+> reserving method ids +0/+1 for `FREEZE_DATAPATH`/`QUERY_QP`. This retires the
+> CQ-only smaps-FIFO crutch (a mixed PD+CQ+QP ufile would corrupt it) at the CQ
+> milestone. Only the CQ **ring content** (unreaped-CQE image + restore blit)
+> remains deferred, as **T1.3b.2**, since it is the exact analogue of the QP
+> SQ/RQ in-flight subspan (T1.5). `53bf38a` is harness-only scaffold (dropped).
 > Upstream hygiene: the skeleton commits fold their own fix-ups
 > (`5e5b27a` destroy_cq guard into RESTORE_CQ; `35297c0` 8->16B struct sizing
 > into the vm_pgoff commit) so no "fix the previous commit" churn ships.

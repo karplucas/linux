@@ -96,6 +96,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -224,15 +225,16 @@ struct rxe_restore_cq_req_local {
 };
 
 /*
- * Skeleton (pre-ring, T1.3) shape of struct rxe_restore_cq_req: just the
- * forced vm_pgoff plus a reserved __u64 tail so sizeof() is 16 (> 8) and
- * escapes the uverbs inline-attr window. Distinct from the tip mirror
- * above, which grew producer/consumer/cqe_image_bytes for the ring
- * round-trip (T1.3b). subtest_vm_pgoff_forced() drives the skeleton path.
+ * Head of include/uapi/rdma/rdma_user_rxe.h struct rxe_queue_buf. Only
+ * the leading log2_elem_size matters here: subtest_inflight_round_trip
+ * mmaps the freshly-restored CQ ring and reads it to learn the kernel's
+ * per-slot stride (the kernel rounds cqe / elem_size independently), so
+ * the in-flight image length is derived from real ring geometry rather
+ * than assumed. The trailing ring fields are elided.
  */
-struct rxe_restore_cq_req_skel {
-	uint64_t	vm_pgoff;
-	uint64_t	reserved;
+struct rxe_queue_buf_head {
+	uint32_t	log2_elem_size;
+	uint32_t	index_mask;
 };
 
 /*
@@ -240,9 +242,8 @@ struct rxe_restore_cq_req_skel {
  * (one struct mminfo: __aligned_u64 offset, __u32 size, __u32 pad).
  * rxe_restore_cq insists on udata->outlen >= sizeof(rxe_create_cq_resp)
  * and writes the kernel-allocated CQ ring's mmap offset/size into it.
- * The probe never actually mmaps the resulting buffer (subtest 7
- * tears it down via DESTROY_CQ before it would matter); we just need
- * a buffer of the right size to satisfy rxe's pre-check.
+ * subtest_inflight_round_trip uses the published offset to mmap the ring
+ * (to read its slot stride); the other subtests never map it.
  */
 struct rxe_mminfo_local {
 	uint64_t	offset;
@@ -444,8 +445,8 @@ static int do_restore_cq(int fd, uint32_t target_handle, uint32_t cqe,
 }
 
 /*
- * RESTORE_CQ carrying a skeleton struct rxe_restore_cq_req UHW_IN
- * (vm_pgoff + reserved, no ring image) and reading the resulting
+ * RESTORE_CQ carrying a struct rxe_restore_cq_req UHW_IN with zeroed
+ * cursors and no ring image (vm_pgoff-only), then reading the resulting
  * rxe_create_cq_resp mminfo back out. Used by subtest_vm_pgoff_forced
  * to prove the forced-offset path added by "RDMA/rxe: honor source
  * vm_pgoff in restore_cq".
@@ -463,9 +464,9 @@ static int do_restore_cq_forced(int fd, uint32_t target_handle, uint32_t cqe,
 				uint32_t *resp_cqe_out)
 {
 	struct rxe_create_cq_resp_local uhw_out = {};
-	struct rxe_restore_cq_req_skel req = {
+	struct rxe_restore_cq_req_local req = {
 		.vm_pgoff = vm_pgoff,
-		.reserved = reserved,
+		.reserved = (uint32_t)reserved,
 	};
 	uint16_t inlen = inlen_override ? inlen_override : (uint16_t)sizeof(req);
 	struct {
@@ -1294,7 +1295,7 @@ static int subtest_destroy_round_trip(int fd)
 }
 
 /*
- * [8] Forced vm_pgoff (skeleton path, no QUERY_CQ). Exercises the
+ * [8] Forced vm_pgoff (cursor-less req, no QUERY_CQ). Exercises the
  * "RDMA/rxe: honor source vm_pgoff in restore_cq" ABI on its own, without
  * the ring round-trip that needs the deferred QUERY_CQ/MIGRATE verb:
  *   (a) a non-zero req.vm_pgoff is honored -- the published
@@ -1317,7 +1318,7 @@ static int subtest_vm_pgoff_forced(int fd)
 	uint64_t off = 0;
 	int ret;
 
-	printf("[8] vm_pgoff forced-offset (skeleton, no QUERY_CQ)\n");
+	printf("[8] vm_pgoff forced-offset (cursor-less req, no QUERY_CQ)\n");
 
 	ret = do_restore_cq_forced(fd, VMPGOFF_HANDLE_A, CQE_REQUESTED,
 				   FORCED_PGOFF_A, 0, 0, &off, &resp_cqe);
@@ -1326,7 +1327,7 @@ static int subtest_vm_pgoff_forced(int fd)
 			"  FAIL RESTORE_CQ(vm_pgoff=0x%llx): %s%s\n",
 			(unsigned long long)FORCED_PGOFF_A, strerror(-ret),
 			ret == -EINVAL
-			? "  (rxe_restore_cq rejecting the 16B req? check the\n"
+			? "  (rxe_restore_cq rejecting the 24B req? check the\n"
 			  "   inline-attr-threshold branch)"
 			: "");
 		return 1;
@@ -1411,24 +1412,67 @@ static int subtest_vm_pgoff_forced(int fd)
  * datapath (out of scope for a raw-cdev probe); the producer readback is the
  * proxy, since q->index==producer is precisely what makes the next post land.
  */
+
+/*
+ * mmap one page of the CQ ring at its published mminfo.offset and read
+ * log2_elem_size out of the struct rxe_queue_buf header, returning the
+ * per-slot stride in bytes (1 << log2_elem_size) or 0 on failure. This
+ * is how the in-flight image length is derived from the kernel's real
+ * ring geometry (cqe and elem_size are rounded independently, so it
+ * cannot be assumed). rxe permits a mapping smaller than the object, so
+ * a single page reaches the header; the successful mmap consumes the
+ * pending_mmaps entry, so the caller must tear this CQ down and re-mint
+ * before mapping again.
+ */
+static uint32_t query_ring_slot_size(int fd, uint64_t mmap_offset)
+{
+	long pg = sysconf(_SC_PAGESIZE);
+	struct rxe_queue_buf_head *hdr;
+	uint32_t log2;
+	void *map;
+
+	map = mmap(NULL, (size_t)pg, PROT_READ, MAP_SHARED, fd,
+		   (off_t)mmap_offset);
+	if (map == MAP_FAILED) {
+		fprintf(stderr, "  FAIL mmap CQ ring @0x%llx: %s\n",
+			(unsigned long long)mmap_offset, strerror(errno));
+		return 0;
+	}
+	hdr = map;
+	log2 = hdr->log2_elem_size;
+	munmap(map, (size_t)pg);
+
+	if (log2 == 0 || log2 > 16) {
+		fprintf(stderr, "  FAIL implausible ring log2_elem_size=%u\n",
+			log2);
+		return 0;
+	}
+	return 1u << log2;
+}
+
 static int subtest_inflight_round_trip(int fd)
 {
 	struct rxe_query_cq_resp_local blob = {};
 	const uint32_t producer = 5, consumer = 2;
 	uint32_t resp_cqe = 0;
-	uint32_t image_bytes;
+	uint32_t image_bytes, slot;
+	uint64_t seed_off = 0;
 	uint8_t *src = NULL, *dst = NULL;
 	int ret, fails = 0;
 
 	printf("[9] in-flight round-trip: RESTORE_CQ(image+cursors) -> QUERY_CQ byte-identical\n");
 
 	/*
-	 * Learn the authoritative ring geometry from a freshly-created CQ:
-	 * the kernel rounds cqe / elem_size, so cqe_image_bytes can't be
-	 * computed here.
+	 * Seed a fresh (drained) CQ, then learn the authoritative ring
+	 * geometry: the kernel rounds cqe / elem_size, so the per-slot stride
+	 * is read straight from the mmapped ring header rather than assumed.
+	 * A drained CQ is also the correct place to assert the empty-ring
+	 * telemetry -- cursors 0 and, now that only the in-flight [consumer,
+	 * producer) subspan ships (not the whole ring), cqe_image_bytes 0.
+	 * vm_pgoff is left monotonic (0) so seed_off is the real mmap offset.
 	 */
-	ret = do_restore_cq(fd, TARGET_HANDLE_3, CQE_REQUESTED, USER_HANDLE_TAG,
-			    0, -1, &resp_cqe);
+	ret = do_restore_cq_forced(fd, TARGET_HANDLE_3, CQE_REQUESTED,
+				   0, 0, 0, &seed_off, &resp_cqe);
 	if (ret) {
 		fprintf(stderr, "  FAIL seed RESTORE_CQ(0x%x): %s\n",
 			TARGET_HANDLE_3, strerror(-ret));
@@ -1442,20 +1486,24 @@ static int subtest_inflight_round_trip(int fd)
 		do_destroy_cq(fd, TARGET_HANDLE_3);
 		return 1;
 	}
-	image_bytes = blob.cqe_image_bytes;
-	if (image_bytes == 0) {
-		fprintf(stderr, "  FAIL QUERY_CQ reported cqe_image_bytes=0\n");
+	if (blob.cqe_image_bytes != 0 || blob.producer != 0 ||
+	    blob.consumer != 0) {
+		fprintf(stderr,
+			"  FAIL fresh CQ not drained (prod=%u cons=%u image=%u; "
+			"expected 0/0/0)\n",
+			blob.producer, blob.consumer, blob.cqe_image_bytes);
 		do_destroy_cq(fd, TARGET_HANDLE_3);
 		return 1;
 	}
-	if (blob.producer != 0 || blob.consumer != 0) {
-		fprintf(stderr,
-			"  FAIL fresh CQ cursors not zero (prod=%u cons=%u)\n",
-			blob.producer, blob.consumer);
-		fails++;
+
+	slot = query_ring_slot_size(fd, seed_off);
+	if (slot == 0) {
+		do_destroy_cq(fd, TARGET_HANDLE_3);
+		return 1;
 	}
-	printf("  PASS QUERY_CQ(fresh) cqe=%u image_bytes=%u prod=0 cons=0\n",
-	       blob.cqe, image_bytes);
+	image_bytes = (producer - consumer) * slot;
+	printf("  PASS QUERY_CQ(fresh) cqe=%u drained; ring slot=%u -> image_bytes=%u\n",
+	       blob.cqe, slot, image_bytes);
 
 	/* Re-mint at the same handle with a synthetic image + cursors. */
 	(void)do_destroy_cq(fd, TARGET_HANDLE_3);
