@@ -719,11 +719,51 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
   `do_restore_cq_forced` unified onto the 24B `rxe_restore_cq_req` (skeleton mirror
   dropped) so its `reserved!=0` case exercises the real reserved field.
   **Dev gate: probe compiles; kernel rebuild+reboot pending to run [1]–[9] green.**
+- [x] **T1.4 slice C (QUERY_QP drained dump verb) curated** — branch `rebase-qp-7`,
+  **1 commit** `093a9ab` on top of the NLDEV CQN tip (`464040c`). Reorders QP so the
+  two dump verbs (`C`=QUERY_QP, `D`=RESTORE_QP) land before `B`=FREEZE_DATAPATH: a
+  drained QP restores directly without pause/resume, so FREEZE defers to the
+  in-flight milestone and the CRIU agent gets the dump ABI earlier.
+  - `093a9ab` **RDMA/rxe: add QUERY_QP migrate verb** — synthesized from oracle
+    `ed1173a` (QP mega-commit) + `6fdc71f` (user_handle) + `736b80d` (MIGRATE
+    rename), pulling **only the drained QUERY_QP arm** onto the existing MIGRATE
+    object. Adds `RXE_IB_METHOD_QUERY_QP=(1<<12)+1`, attrs
+    `QUERY_QP_{HANDLE,RESP_BLOB,RESP_USER_HANDLE}` (`+0/+1/+2`; image ids `+3/+4/+5`
+    reserved for the in-flight slice), and `struct rxe_restore_qp_req` in
+    `rdma_user_rxe.h`. Handler gates RC/UC/UD (`rxe_migrate_chk_qp_type` →
+    `-EOPNOTSUPP`), kernel QP → `-ENXIO`, bogus handle → `-ENOENT`, fills the
+    drained fields (identity, AV, PSN bases, live req/comp/resp cursors, ssn,
+    transport attrs, SQ/RQ mmap offsets) + emits `RESP_USER_HANDLE`.
+  - Folds in the core accessor (oracle `2727d8a`, reworded rxe-first): thin
+    `ib_qp_user_handle()` in `core/verbs.c` + `<rdma/ib_verbs.h>`, needed because
+    `ib_qp.uobject` is the opaque `ib_uqp_object *` (XRC) so the driver verb can't
+    read `user_handle` directly. Kept in the **same** commit as its sole caller
+    (no caller-less EXPORT_SYMBOL between commits) per maintainer review.
+  **ABI decision:** the struct is declared at its **full final layout** (drained +
+  in-flight `sq/rq producer/consumer`, responder scalars, `*_image_bytes`,
+  `reserved2`) — byte-identical to `qp_query_probe_rxe.c`'s local mirror — but
+  QUERY_QP fills only the drained subset and leaves the in-flight group zero. Same
+  pattern as `rxe_query_cq_resp` (full 32B, subset filled): stable CRIU contract
+  now, no probe struct rework when in-flight lands. `UVERBS_ATTR_TYPE` enforces an
+  exact blob size, so a smaller drained struct would have `-EINVAL`'d the probe.
+  **Compile gate GREEN** (`verbs.o` + `rxe_migrate.o`). checkpatch: 2 idiomatic
+  uverbs-macro `(`-CHECKs (`UVERBS_HANDLER`/`DECLARE_UVERBS_NAMED_METHOD`) →
+  `--no-verify` + trailer note; core accessor clean. **Dev gate GREEN** on
+  rxe0/loopback (built+booted from `/opt/builds/linux`): `qp_query_probe_rxe rxe0`
+  → **[1] QUERY_QP field-fidelity + user_handle PASS, [2] QUERY_CQ PASS, [4]
+  bad-handle→-ENOENT PASS, [3]/[5] FREEZE SKIP** (verb not landed). Probe fixes
+  committed to `linux-poc-ref` (`ec5ec82`): gate the FREEZE legs on
+  `-EPROTONOSUPPORT` (unregistered uverbs method; `-EOPNOTSUPP` is the driver's
+  wrong-QP-type signal) so they SKIP not FAIL, and fix the `[2]` `cqe_image_bytes`
+  assertion to the drained subspan (`==0`). **Next:** `D` (RESTORE_QP dispatcher
+  `db93076` + drained rxe restore) then `B` (FREEZE_DATAPATH) with the in-flight QP
+  slice.
 - [ ] **Group A (T1.1–T1.x)** on top of `criu-dev-build-up-rebase` — `A-querymr`
   (`35fb924`,`ff4544a`) ✅ curated in T1.2, `A-nldev-ufile` (`0601c49`, split
   tools) ✅ curated in T1.1, `A-nldev-cqn` (`5fe60bc`), `A-core-acc` (`5b6f13a`
-  umem_pin split → **T2.3** + `2727d8a` qp_user_handle → QP milestone). Remaining
-  Group A discovery: `A-nldev-cqn`.
+  umem_pin split → **T2.3** + `2727d8a` qp_user_handle ✅ folded into `093a9ab` in
+  T1.4 C). `A-nldev-cqn` (`5fe60bc`) ✅ curated as `RES_SEND_CQN` + `RES_RECV_CQN`
+  (tip `464040c`).
 - [ ] Group B / C / D — see section 2.
 
 ## 8. Development ordering (incremental-test) vs submission ordering — the two-agent workflow
