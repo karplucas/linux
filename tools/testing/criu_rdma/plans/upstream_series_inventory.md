@@ -808,6 +808,55 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
   drained probe (`qp_restore_drained_probe_rxe.c`, the FREEZE-free sibling of the
   in-flight `qp_restore_probe_rxe.c`) + Makefile target committed to `linux-poc-ref`.
   **Next:** `B` (FREEZE_DATAPATH) with the in-flight QP slice.
+- [x] **T1.4 slice B (FREEZE_DATAPATH) curated** — branch `rebase-qp-10`,
+  **5 commits** on top of slice D. **Scoped to FREEZE_DATAPATH only:** the
+  handle-less, ucontext-scoped `FREEZE_CONTEXT` (+ its `ib_qp_ucontext` core
+  accessor) is deferred to the restore-thaw / in-flight slice. Uses the **full**
+  oracle `rxe_qp_resume` (thaw-and-replay kicks), which are safe no-ops for a
+  dump-side freeze/thaw of a drained QP now and are already correct once in-flight
+  restore lands.
+  - `5fc7140` / `f96886b` **RDMA/rxe: expose rxe_drain_{req,resp}_pkts** — 2
+    no-functional-change prep renames un-static-ing `drain_req_pkts` (rxe_resp.c)
+    and `drain_resp_pkts` (rxe_comp.c) + `rxe_loc.h` protos, so the freeze path can
+    drain a parked QP's inbound queues. Split one-helper-per-commit per maintainer
+    style.
+  - `9991997` **RDMA/rxe: add dp_frozen QP datapath-freeze flag** — per-QP
+    `bool dp_frozen` (rxe_verbs.h, state_lock-guarded) + the `check_type_state()`
+    receive-path drop that honors it (rxe_recv.c). No setter yet, so a pure no-op:
+    the flag exists and inbound packets are dropped while it is set (else a queued
+    skb pins a QP ref the parked responder/completer never releases → destroy hang;
+    RC peer retransmits after thaw).
+  - `87caab8` **RDMA/rxe: add FREEZE_DATAPATH migrate verb** — synthesized from
+    oracle `rxe_qp_pause` + the `RXE_IB_METHOD_FREEZE_DATAPATH` arm. `rxe_qp_pause`
+    sets `dp_frozen`, `rxe_disable_task`s send/recv, then `synchronize_net()` +
+    `rxe_drain_{req,resp}_pkts` so no leaked skb pins a QP ref across the freeze;
+    **no** IBTA state change (QP stays RTS, `ibv_query_qp` unaffected). Adds
+    `RXE_IB_METHOD_FREEZE_DATAPATH=(1<<12)+0` + attrs
+    `FREEZE_DATAPATH_{QP_HANDLE,FREEZE}` (method `+3` reserved for `FREEZE_CONTEXT`)
+    on the existing MIGRATE object; handler gates RC/UC/UD, kernel QP → `-ENXIO`.
+    Wires **only** the `freeze=1` (park) path — `freeze=0` returns `-EOPNOTSUPP`
+    until the next commit, so `D1`-style there is no broken-at-bisect intermediate.
+  - `f1284a8` **RDMA/rxe: add datapath thaw (rxe_qp_resume)** — `rxe_qp_resume`
+    clears `dp_frozen`, re-enables the tasks, and replays freeze-stalled work: an
+    RTS QP with unconsumed SQ WQEs arms a retry (`need_retry`, mirroring
+    `rnr_nak_timer`) + reschedules `send_task`, and a request pkt that arrived while
+    parked reschedules `recv_task`. `dp_frozen` makes both pause/resume idempotent
+    (a redundant thaw must not `rxe_enable_task` a live task and leak a task
+    reservation `num_sched > num_done`). Swaps the temporary `-EOPNOTSUPP` for the
+    real `else rxe_qp_resume()` branch.
+  **Compile + checkpatch GREEN** (full `rdma_rxe.ko` links; `9991997`/`f1284a8` +
+  the 2 renames 0/0/0; `87caab8` has the 2 idiomatic uverbs-macro `(`-CHECKs
+  (`UVERBS_HANDLER`/`DECLARE_UVERBS_NAMED_METHOD`) → `--no-verify` + trailer note).
+  **Dev gate GREEN** on rxe0/loopback (built+booted from `/opt/builds/linux`):
+  `qp_query_probe_rxe rxe0` → **[3] FREEZE_DATAPATH(freeze=1/0) now PASS** (was SKIP
+  pre-verb), **[5] FREEZE_CONTEXT SKIP** (deferred, correct); `[1]/[2]/[4]` still
+  PASS. Freeze→thaw→destroy in `[3]` teardown proves resume re-enables the tasks
+  (no leaked-ref destroy hang). `qp_restore_drained_probe_rxe rxe0` → **[1]–[8]
+  still PASS** (no regression). The in-flight `qp_restore_probe_rxe` is
+  **expected-red** (`rq=0B`, needs the in-flight image slice) — unrelated to FREEZE.
+  **Next:** in-flight QP restore slice (SQ/RQ/responder ring image capture in
+  QUERY_QP + `rxe_restore_qp`), which also pulls in `FREEZE_CONTEXT` + the
+  `ib_qp_ucontext` accessor.
 - [ ] **Group A (T1.1–T1.x)** on top of `criu-dev-build-up-rebase` — `A-querymr`
   (`35fb924`,`ff4544a`) ✅ curated in T1.2, `A-nldev-ufile` (`0601c49`, split
   tools) ✅ curated in T1.1, `A-nldev-cqn` (`5fe60bc`), `A-core-acc` (`5b6f13a`
