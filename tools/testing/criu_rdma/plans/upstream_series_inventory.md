@@ -758,6 +758,56 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
   assertion to the drained subspan (`==0`). **Next:** `D` (RESTORE_QP dispatcher
   `db93076` + drained rxe restore) then `B` (FREEZE_DATAPATH) with the in-flight QP
   slice.
+- [x] **T1.4 slice D (drained RESTORE_QP) curated** — branch `rebase-qp-10`,
+  **6 commits** on top of slice C. Splits cleanly into the core dispatcher (`D1`),
+  the mmap-pgoff prep refactor (`C1`–`C3`), and the rxe handler (`D2`). Drained-only
+  scope throughout: the QP lands directly at its final IBTA state, so **no**
+  born-frozen install, **no** `rxe_qp_pause/resume`, **no** FREEZE dependency — an
+  in-flight ring image tail is rejected `-EOPNOTSUPP` (a later slice).
+  - `fb670da` **RDMA/core: rename __ib_qp_event_handler** — pure rename (kept
+    static) so the `__`-prefixed name isn't what gets exported next.
+  - `b22c6a5` **RDMA/core: add UVERBS_METHOD_RESTORE_QP framework** — synthesized
+    from oracle `db93076`. Adds `UVERBS_METHOD_RESTORE_QP` + `enum
+    uverbs_attrs_restore_qp` (HANDLE/PD/SEND_CQ/RECV_CQ/SRQ/TYPE/STATE/USER_HANDLE/
+    CAP/CREATE_FLAGS/EVENT_FD/RESP_QPN), the `ib_device_ops.restore_qp` op, and the
+    `uverbs_std_types_restore.c` dispatcher (gate restore-mode ucontext, v0
+    type={RC,UC,UD}/state={RESET,INIT,RTR,RTS} switches, reject SRQ,
+    `rdma_alloc_begin_uobject_at_handle`, shell init with `event_handler =
+    ib_qp_event_handler` — made non-static + `EXPORT_SYMBOL` here alongside its sole
+    caller — `rdma_zalloc_drv_obj_numa`, driver `restore_qp`, security + usecnt,
+    commit, copy `RESP_QPN`). **Folds the `device.c` fix**
+    `SET_DEVICE_OP(dev_ops, restore_qp)` — without it `ib_set_device_ops()` never
+    propagates the driver op and the dispatcher NULL-guard returns `-EOPNOTSUPP`
+    (caught by the dev gate below; the missing line belonged in this framework
+    commit so `D1` isn't a broken-at-bisect intermediate).
+  - `c5a5d07` / `7a921b3` / `4becc20` **RDMA/rxe: add sq/rq/ring pgoff args** —
+    3 no-functional-change refactors threading `sq_forced_vm_pgoff` /
+    `rq_forced_vm_pgoff` through `rxe_qp_init_req` → `rxe_init_sq`,
+    `rxe_qp_init_resp` → `rxe_init_rq`, and `rxe_qp_from_init` (create path passes
+    `0/0`). Split out per maintainer-style prep so the `D2` diff is purely the new
+    feature. Verified byte-identical to the squashed form (peel-and-reapply left
+    zero deletions when the final files were restored).
+  - `c5d4844` **RDMA/rxe: implement drained RESTORE_QP handler** — synthesized from
+    oracle `ed1173a` (rxe arm) with `06b56a4` (cursor seed) **folded in** so there
+    is no known-buggy intermediate. `rxe_restore_qp` installs at the **source qpn**
+    (`rxe_add_to_pool_at_index` — rxe qpns are wire-visible BTH DestQP), forces the
+    SQ/RQ ring mmaps to the source vm_pgoffs, then `rxe_qp_restore_wire_state`
+    stamps AV/PSN bases/live req-comp-resp cursors/rd_atomic/timers and
+    `rxe_qp_seed_ring`-seeds the ring cursors to the source base (else the first
+    post-restore `post_send` computes `wqe_index == producer` and hangs). Adapted to
+    our **final** struct layout: reserved check uses `reserved`/`reserved2` (no
+    `reserved1`), and a non-zero `sq/rq/res_image_bytes` tail is rejected
+    `-EOPNOTSUPP`.
+  **Compile + checkpatch GREEN** (`D2` 0/0/0, no `--no-verify` needed). **Dev gate
+  GREEN** on rxe0/loopback (built+booted from `/opt/builds/linux`):
+  `qp_restore_drained_probe_rxe rxe0` → **[1]–[8] all PASS** — QUERY_QP drained
+  snapshot, DESTROY (no FREEZE), RESTORE_PD/CQ, `RESTORE_QP → RESP_QPN == src qpn`,
+  INFO_HANDLES, byte-identical re-query, and the 3 forced-offset ring `mmap`s on one
+  fd; repeatable across runs (qpn reuse + offset re-claim clean). The `device.c`
+  gap surfaced here first as `[4] RESTORE_QP → -EOPNOTSUPP` before the fix. New
+  drained probe (`qp_restore_drained_probe_rxe.c`, the FREEZE-free sibling of the
+  in-flight `qp_restore_probe_rxe.c`) + Makefile target committed to `linux-poc-ref`.
+  **Next:** `B` (FREEZE_DATAPATH) with the in-flight QP slice.
 - [ ] **Group A (T1.1–T1.x)** on top of `criu-dev-build-up-rebase` — `A-querymr`
   (`35fb924`,`ff4544a`) ✅ curated in T1.2, `A-nldev-ufile` (`0601c49`, split
   tools) ✅ curated in T1.1, `A-nldev-cqn` (`5fe60bc`), `A-core-acc` (`5b6f13a`
