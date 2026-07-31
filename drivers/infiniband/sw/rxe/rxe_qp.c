@@ -333,7 +333,8 @@ static int rxe_qp_init_req(struct rxe_dev *rxe, struct rxe_qp *qp,
 
 static int rxe_init_rq(struct rxe_qp *qp, struct ib_qp_init_attr *init,
 		       struct ib_udata *udata,
-		       struct rxe_create_qp_resp __user *uresp)
+		       struct rxe_create_qp_resp __user *uresp,
+		       u64 forced_vm_pgoff)
 {
 	struct rxe_dev *rxe = to_rdev(qp->ibqp.device);
 	int wqe_size;
@@ -352,10 +353,14 @@ static int rxe_init_rq(struct rxe_qp *qp, struct ib_qp_init_attr *init,
 		goto err_out;
 	}
 
-	/* prepare info for caller to mmap recv queue if user space qp */
+	/*
+	 * prepare info for caller to mmap recv queue if user space qp.
+	 * @forced_vm_pgoff is non-zero only on the CRIU restore path;
+	 * see the SQ counterpart in rxe_init_sq.
+	 */
 	err = do_mmap_info(rxe, uresp ? &uresp->rq_mi : NULL, udata,
 			   qp->rq.queue->buf, qp->rq.queue->buf_size,
-			   &qp->rq.queue->ip, 0);
+			   &qp->rq.queue->ip, forced_vm_pgoff);
 	if (err) {
 		rxe_err_qp(qp, "do_mmap_info failed, err = %d\n", err);
 		goto err_free;
@@ -379,7 +384,8 @@ err_out:
 static int rxe_qp_init_resp(struct rxe_dev *rxe, struct rxe_qp *qp,
 			    struct ib_qp_init_attr *init,
 			    struct ib_udata *udata,
-			    struct rxe_create_qp_resp __user *uresp)
+			    struct rxe_create_qp_resp __user *uresp,
+			    u64 rq_forced_vm_pgoff)
 {
 	int err;
 
@@ -387,7 +393,7 @@ static int rxe_qp_init_resp(struct rxe_dev *rxe, struct rxe_qp *qp,
 	skb_queue_head_init(&qp->resp_pkts);
 
 	if (!qp->srq) {
-		err = rxe_init_rq(qp, init, udata, uresp);
+		err = rxe_init_rq(qp, init, udata, uresp, rq_forced_vm_pgoff);
 		if (err)
 			return err;
 	}
@@ -433,7 +439,7 @@ int rxe_qp_from_init(struct rxe_dev *rxe, struct rxe_qp *qp, struct rxe_pd *pd,
 	if (err)
 		goto err1;
 
-	err = rxe_qp_init_resp(rxe, qp, init, udata, uresp);
+	err = rxe_qp_init_resp(rxe, qp, init, udata, uresp, 0);
 	if (err)
 		goto err2;
 
