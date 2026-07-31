@@ -606,7 +606,8 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
  */
 int rxe_qp_restore_inflight(struct rxe_qp *qp,
 			    const struct rxe_restore_qp_req *req,
-			    const void *sq_image, const void *rq_image)
+			    const void *sq_image, const void *rq_image,
+			    const void *res_image)
 {
 	int err;
 
@@ -640,6 +641,27 @@ int rxe_qp_restore_inflight(struct rxe_qp *qp,
 		rxe_qp_seed_ring(qp->rq.queue, req->rq_producer,
 				 req->rq_consumer);
 	}
+
+	if (res_image) {
+		size_t want = (size_t)qp->attr.max_dest_rd_atomic *
+			      sizeof(struct resp_res);
+
+		if (!qp->resp.resources || want == 0 ||
+		    want != req->res_image_bytes)
+			return -EINVAL;
+		memcpy(qp->resp.resources, res_image, want);
+		qp->resp.res_head = req->res_head;
+		qp->resp.res_tail = req->res_tail;
+	}
+
+	/*
+	 * Responder continuity scalars, not covered by
+	 * rxe_qp_restore_wire_state() (which stamps only resp psn/msn).
+	 */
+	qp->resp.ack_psn	= req->resp_ack_psn & BTH_PSN_MASK;
+	qp->resp.opcode		= req->resp_opcode;
+	qp->resp.status		= req->resp_status;
+	qp->resp.aeth_syndrome	= req->resp_aeth_syndrome;
 
 	return 0;
 }
