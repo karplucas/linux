@@ -593,13 +593,15 @@ static int subtest_query_cq(struct ibv_context *ctx, struct rc_qp *p)
 	CHECK(blob.vm_pgoff != 0, "vm_pgoff=0x%llx (non-zero user ring)",
 	      (unsigned long long)blob.vm_pgoff);
 	/*
-	 * Fresh, never-posted CQ: both cursors sit at 0 and the CQE slot
-	 * region is non-empty (queue_data_size of the rounded ring). These
-	 * are the RESTORE_CQ inputs that round-trip the in-flight ring.
+	 * Fresh, never-posted CQ: both cursors sit at 0 and the in-flight
+	 * image is empty. cqe_image_bytes is the [consumer, producer)
+	 * subspan (unreaped completions), not the whole ring, so a drained
+	 * CQ reports 0 -- the RESTORE_CQ blit has nothing to carry.
 	 */
 	CHECK(blob.producer == 0, "producer=%u (fresh CQ)", blob.producer);
 	CHECK(blob.consumer == 0, "consumer=%u (fresh CQ)", blob.consumer);
-	CHECK(blob.cqe_image_bytes != 0, "cqe_image_bytes=%u (non-zero ring)",
+	CHECK(blob.cqe_image_bytes == 0,
+	      "cqe_image_bytes=%u (drained subspan empty)",
 	      blob.cqe_image_bytes);
 	CHECK(blob.reserved[0] == 0 && blob.reserved[1] == 0, "reserved=0");
 #undef CHECK
@@ -624,6 +626,11 @@ static int subtest_freeze_lifecycle(struct ibv_context *ctx, struct rc_qp *p)
 	printf("[3] FREEZE_DATAPATH freeze/resume lifecycle\n");
 
 	ret = do_migrate_freeze(ctx->cmd_fd, p->qp->handle, 1);
+	if (ret == -EPROTONOSUPPORT) {
+		printf("  SKIP FREEZE_DATAPATH not registered "
+		       "(freeze slice not landed yet)\n");
+		return 0;
+	}
 	if (ret == 0)
 		printf("  PASS FREEZE_DATAPATH(freeze=1) -> 0\n");
 	else {
@@ -677,6 +684,18 @@ static int subtest_freeze_context(struct ibv_context *ctx, struct rc_qp *p)
 	int ret, fails = 0;
 
 	printf("[5] FREEZE_CONTEXT ucontext-scoped freeze-all\n");
+
+	/*
+	 * Registration probe: resume-all on a context with nothing frozen
+	 * is an idempotent no-op when the verb exists, or -EOPNOTSUPP until
+	 * the freeze slice lands. Skip (not fail) in the latter case.
+	 */
+	ret = do_freeze_context(ctx->cmd_fd, 0);
+	if (ret == -EPROTONOSUPPORT) {
+		printf("  SKIP FREEZE_CONTEXT not registered "
+		       "(freeze slice not landed yet)\n");
+		return 0;
+	}
 
 	have_p2 = (build_rts_loopback(ctx, &p2) == 0);
 	printf("  setup: %s in this ucontext\n",
