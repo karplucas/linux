@@ -25,6 +25,7 @@ PROBE_BINARIES :=						\
 	uobject_restore/pd_query/pd_query_probe_mlx5_vfmig	\
 	uobject_restore/qp_restore/qp_restore_probe_mlx5_vfmig	\
 	uobject_restore/qp_restore/qp_restore_probe_rxe		\
+	uobject_restore/qp_restore/qp_restore_drained_probe_rxe	\
 	uobject_restore/qp_query/qp_query_probe_mlx5_vfmig	\
 	uobject_restore/qp_query/qp_query_probe_rxe		\
 	uobject_restore/qp_query/qp_nlattr_probe		\
@@ -211,6 +212,16 @@ uobject_restore/qp_query/qp_query_probe_rxe: \
 # reason as the other rxe restore probes.
 uobject_restore/qp_restore/qp_restore_probe_rxe: \
 		uobject_restore/qp_restore/qp_restore_probe_rxe.c
+	$(CC) $(CFLAGS) -o $@ $< -libverbs
+
+# Drained RESTORE_QP + rxe_restore_qp probe: the FREEZE-free sibling of
+# qp_restore_probe_rxe covering exactly the shipped drained slice (D1/D2).
+# Source QP is driven to RTS with no posted work, QUERY_QP-snapshotted,
+# plainly DESTROY_QP'd (no FREEZE_DATAPATH), then RESTORE_PD + RESTORE_CQ
+# + RESTORE_QP at the source qpn from the snapshot; re-QUERY_QP asserts
+# byte-equality and the 3 forced-offset rings are mmap'd on one fd.
+uobject_restore/qp_restore/qp_restore_drained_probe_rxe: \
+		uobject_restore/qp_restore/qp_restore_drained_probe_rxe.c
 	$(CC) $(CFLAGS) -o $@ $< -libverbs
 
 # Raw NLDEV netlink dumper for QP + CQ resource entries
