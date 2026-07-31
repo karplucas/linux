@@ -197,6 +197,15 @@ Work in the build/boot tree `/opt/builds/linux` on `criu-dev-build-up-rebase`
 - **Commit-level classification**: done — see section 6 (all 261 commits mapped
   to goal + disposition + anticipated FUNCTIONAL commit).
 - **vfmig↔VFIO convergence**: parked for RFC; revisit if maintainers bite.
+- **Post-rebase doc nit (RESTORE_QP `@udata`)**: the `UVERBS_METHOD_RESTORE_QP`
+  kerneldoc in `include/uapi/rdma/ib_user_ioctl_cmds.h` (~line 276) ends
+  "...travels through `@udata` via `UVERBS_ATTR_UHW()`; rxe ignores `@udata`."
+  That is stale/wrong — `rxe_restore_qp()` reads `struct rxe_restore_qp_req`
+  (and, since slice E, the in-flight SQ/RQ/RES image tail) out of `UHW_IN`. Only
+  the cap/type/state come from the generic attrs. Fold a one-line fix (e.g.
+  "rxe uses `@udata` for its private wire state; see `struct rxe_restore_qp_req`")
+  into the core RESTORE_QP framework commit (`b22c6a5`) on the next
+  history-edit pass so the next reader isn't misled. Flagged by the CRIU agent.
 
 ## 6. Commit map (all 266, base `8fb0d17`, verified against the final diff)
 
@@ -857,6 +866,65 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
   **Next:** in-flight QP restore slice (SQ/RQ/responder ring image capture in
   QUERY_QP + `rxe_restore_qp`), which also pulls in `FREEZE_CONTEXT` + the
   `ib_qp_ucontext` accessor.
+- [ ] **T1.4 slice E (in-flight QP restore) LANDED, pending dev-gate** — branch
+  `rebase-qp-12`, **8 commits** on top of slice B. Completes design-v0 in-flight
+  restore (`design/rxe_inflight_qp_restore.md`): a non-drained RC/UC/UD QP
+  (posted-but-unsent + sent-unacked SQ WQEs, pre-posted RQ WQEs, RC responder
+  resources) round-trips QUERY_QP → RESTORE_QP and resumes. **Scope locked:**
+  unconditional born-frozen (every restored QP installs paused, matching oracle
+  §5.4); RC responder resources and `FREEZE_CONTEXT` both **in** (required by
+  `qp_restore_probe_rxe`); one slice / one rebuild. Reuses in-tree substrate from
+  the CQ + QP slices: full `struct rxe_restore_qp_req` layout (slice C),
+  `queue_inflight_capture`/`queue_inflight_restore` + `rxe_query_emit_ring` (CQ
+  slice), `rxe_qp_seed_ring` + ring-seed/rd_atomic-alloc in
+  `rxe_qp_restore_wire_state` (slice D), `rxe_qp_pause`/`rxe_qp_resume` (slice B),
+  and the CQ in-flight UHW-tail template `rxe_restore_cq_inflight`. Curated from
+  oracle `dd1f482` (B1 in-flight) + `0da0f09` (subspan) + `6f5c8be` (FREEZE_CONTEXT
+  + `ib_qp_ucontext`); the born-frozen install is oracle `4eb1792`. **Decomposed
+  one data structure per commit** (save side first, then restore side) so each is
+  independently bisectable; `rxe_qp_restore_inflight()`'s signature grows
+  `sq → +rq → +res` and the RESTORE_QP `-EOPNOTSUPP` image reject narrows then
+  drops across the three restore commits.
+  - `4f8d0ae` **save in-flight SQ ring in QUERY_QP** — uapi `QUERY_QP_RESP_SQ_IMAGE`
+    attr; relocate `rxe_query_emit_ring` above QUERY_QP; fill `sq_producer/consumer`
+    + `sq_image_bytes`; emit SQ subspan.
+  - `6bb15dd` **save in-flight RQ ring in QUERY_QP** — uapi `..._RQ_IMAGE`; fill
+    `rq_producer/consumer` + `rq_image_bytes` (SRQ-fed QP stays zero); emit RQ subspan.
+  - `4114b62` **save responder resources in QUERY_QP** — uapi `..._RES`; add
+    `rxe_query_emit_image()` (whole-array copy); fill responder scalars
+    (`resp_ack_psn/opcode/status/aeth_syndrome`, `res_head/res_tail`) +
+    `res_image_bytes`; emit the `max_dest_rd_atomic`-entry table verbatim.
+  - `ec6ad5d` **restore in-flight SQ ring in RESTORE_QP** — `rxe_qp.c`
+    `rxe_qp_restore_inflight(qp, req, sq_image)` (`queue_inflight_restore`,
+    `rxe_qp_seed_ring`, rewind `req.wqe_index = sq_consumer` for `[consumer,producer)`
+    replay) + `rxe_loc.h` proto; `rxe_verbs.c` static `rxe_restore_qp_inflight()`
+    tail-slicer (mirrors `rxe_restore_cq_inflight`); narrow the reject to `rq||res`.
+  - `e383719` **restore in-flight RQ ring in RESTORE_QP** — grow signature `+rq_image`
+    + RQ block (`-EINVAL` on SRQ-fed); narrow the reject to `res`.
+  - `e31befa` **restore responder resources in RESTORE_QP** — grow signature
+    `+res_image` + memcpy `resp.resources` + `res_head/tail` + stamp responder
+    scalars; drop the last `-EOPNOTSUPP` reject.
+  - `d745631` **install restored QP datapath-frozen** — `rxe_qp_pause(qp)` immediately
+    before `rxe_finalize(qp)` in `rxe_restore_qp()`, unconditional; neither requester
+    nor responder runs until the orchestrator thaws (do NOT kick send_task here —
+    peers / MR pages may not exist yet).
+  - `e0a5437` **add FREEZE_CONTEXT migrate verb** — core `ib_qp_ucontext()` (mirror
+    `ib_qp_user_handle`, `EXPORT_SYMBOL`) folded with its sole caller; `rxe_migrate.c`
+    handle-less `RXE_IB_METHOD_FREEZE_CONTEXT` handler (RCU walk `rxe->qp_pool`,
+    `kref_get_unless_zero`, filter `is_user && ib_qp_ucontext==ucontext`,
+    `rxe_qp_pause/resume`); uapi method `(1<<12)+3` + `FREEZE_CONTEXT_FREEZE` attr.
+    `dp_frozen` keeps the per-QP + ucontext double-freeze idempotent.
+  Comments self-contained (no design-doc/§-refs in kernel source). `e0a5437` carries
+  the idiomatic uverbs-macro `(`-CHECKs → `--no-verify` + trailer note; the rest
+  clean. Each commit compiles + checkpatch-clean; full vmlinux relink + `rdma_rxe.ko`
+  link verified (`ib_qp_ucontext` lands in `Module.symvers` on the full build).
+  **Dev-gate targets** (rebuild+reboot from `/opt/builds/linux`):
+  `qp_restore_probe_rxe` **[1]–[8] PASS** (RQ pre-post, byte-identical SQ/RQ/RES
+  round-trip, born-frozen `[6b]` FREEZE_CONTEXT thaw); `qp_query_probe_rxe`
+  **[5] FREEZE_CONTEXT PASS** (was SKIP), `[3]` still PASS;
+  `qp_restore_drained_probe_rxe` **[1]–[8] still PASS** (re-validate unconditional
+  born-frozen). **Deferred:** oracle `46f0788` freeze/thaw tracepoints, SRQ-backed
+  RQ image path, CRIU-side peer-traffic harness modes (§6.2).
 - [ ] **Group A (T1.1–T1.x)** on top of `criu-dev-build-up-rebase` — `A-querymr`
   (`35fb924`,`ff4544a`) ✅ curated in T1.2, `A-nldev-ufile` (`0601c49`, split
   tools) ✅ curated in T1.1, `A-nldev-cqn` (`5fe60bc`), `A-core-acc` (`5b6f13a`
