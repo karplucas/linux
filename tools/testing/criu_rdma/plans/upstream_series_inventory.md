@@ -866,8 +866,8 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
   **Next:** in-flight QP restore slice (SQ/RQ/responder ring image capture in
   QUERY_QP + `rxe_restore_qp`), which also pulls in `FREEZE_CONTEXT` + the
   `ib_qp_ucontext` accessor.
-- [ ] **T1.4 slice E (in-flight QP restore) LANDED, pending dev-gate** — branch
-  `rebase-qp-12`, **8 commits** on top of slice B. Completes design-v0 in-flight
+- [x] **T1.4 slice E (in-flight QP restore) curated — dev-gate GREEN** — branch
+  `criu-rebase-t1.1-rxe-pd-wip`, **8 commits** on top of slice B. Completes design-v0 in-flight
   restore (`design/rxe_inflight_qp_restore.md`): a non-drained RC/UC/UD QP
   (posted-but-unsent + sent-unacked SQ WQEs, pre-posted RQ WQEs, RC responder
   resources) round-trips QUERY_QP → RESTORE_QP and resumes. **Scope locked:**
@@ -918,13 +918,23 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
   the idiomatic uverbs-macro `(`-CHECKs → `--no-verify` + trailer note; the rest
   clean. Each commit compiles + checkpatch-clean; full vmlinux relink + `rdma_rxe.ko`
   link verified (`ib_qp_ucontext` lands in `Module.symvers` on the full build).
-  **Dev-gate targets** (rebuild+reboot from `/opt/builds/linux`):
-  `qp_restore_probe_rxe` **[1]–[8] PASS** (RQ pre-post, byte-identical SQ/RQ/RES
-  round-trip, born-frozen `[6b]` FREEZE_CONTEXT thaw); `qp_query_probe_rxe`
-  **[5] FREEZE_CONTEXT PASS** (was SKIP), `[3]` still PASS;
-  `qp_restore_drained_probe_rxe` **[1]–[8] still PASS** (re-validate unconditional
-  born-frozen). **Deferred:** oracle `46f0788` freeze/thaw tracepoints, SRQ-backed
-  RQ image path, CRIU-side peer-traffic harness modes (§6.2).
+  **Dev-gate GREEN** on rxe0/loopback (built+booted from `/opt/builds/linux`):
+  `qp_restore_probe_rxe` **[1]–[8] PASS** — snapshot captured `rq=192B` (3
+  pre-posted recv WQEs) + `res=56B` (RC responder resources), `[6]` restored wire
+  state **and** SQ/RQ/RES images byte-identical, `[6b]` born-frozen QP thawed via
+  `FREEZE_CONTEXT(freeze=0)`; `qp_query_probe_rxe` **[5] FREEZE_CONTEXT PASS** (was
+  SKIP — idempotent freeze/thaw + compose-with-FREEZE_DATAPATH), `[3]` still PASS;
+  `qp_restore_drained_probe_rxe` **[1]–[8] PASS**. **Drained-probe adjustment:** the
+  in-flight slice makes QUERY_QP emit a responder-resources image for *any* RC QP
+  with `max_dest_rd_atomic > 0` (rxe allocates `qp->resp.resources` at RTR
+  regardless of whether an inbound read/atomic ran; the oracle's QUERY_QP gates the
+  same way, so this is correct not over-emission). That means an RC QP with
+  `max_dest_rd_atomic = 1` no longer round-trips with an empty UHW tail, so the
+  drained probe (asserts a zero-length tail) was updated to drive its source QP to
+  RTR with `max_dest_rd_atomic = 0` — keeping it a focused regression test for the
+  header-only RESTORE_QP fast path (poc-ref `5c33547`). **Deferred:** oracle
+  `46f0788` freeze/thaw tracepoints, SRQ-backed RQ image path, CRIU-side
+  peer-traffic harness modes (§6.2).
 - [ ] **Group A (T1.1–T1.x)** on top of `criu-dev-build-up-rebase` — `A-querymr`
   (`35fb924`,`ff4544a`) ✅ curated in T1.2, `A-nldev-ufile` (`0601c49`, split
   tools) ✅ curated in T1.1, `A-nldev-cqn` (`5fe60bc`), `A-core-acc` (`5b6f13a`
