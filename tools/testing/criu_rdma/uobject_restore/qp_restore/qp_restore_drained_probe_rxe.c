@@ -804,7 +804,16 @@ static int build_rts_loopback(struct ibv_context *ctx, struct rc_qp *out)
 	attr.path_mtu		= IBV_MTU_1024;
 	attr.dest_qp_num	= out->qp->qp_num;
 	attr.rq_psn		= 0x100;
-	attr.max_dest_rd_atomic	= 1;
+	/*
+	 * max_dest_rd_atomic = 0 on purpose: with no inbound RDMA-read/atomic
+	 * capacity rxe never allocates qp->resp.resources, so QUERY_QP emits
+	 * res_image_bytes = 0 and this drained QP round-trips with an empty
+	 * UHW tail. That keeps this probe a regression test for the
+	 * header-only RESTORE_QP fast path. (An RC QP with max_dest_rd_atomic
+	 * > 0 always carries a responder-resources image post in-flight slice,
+	 * which the in-flight qp_restore_probe_rxe covers instead.)
+	 */
+	attr.max_dest_rd_atomic	= 0;
 	attr.min_rnr_timer	= 12;
 	attr.ah_attr.is_global	= 1;
 	attr.ah_attr.port_num	= 1;
