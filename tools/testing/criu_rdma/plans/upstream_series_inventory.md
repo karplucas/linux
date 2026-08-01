@@ -477,7 +477,7 @@ Rows in branch (chronological) order:
 | 244 | 09fe649 | RDMA/rxe: drop inbound packets while frozen QP parked | 1B | U | B-gate |
 | 245 | b60e047 | RDMA/rxe: drain packet queues when freezing a CRIU QP | 1B | U | B-gate |
 | 246 | 46f0788 | RDMA/rxe: trace the CRIU QP freeze/thaw lifecycle | 1B | U | B-trace |
-| 247 | 491dab8 | RDMA/rxe: restore responder continuity on drained path | 1C | U | C-inflight |
+| 247 | 491dab8 | RDMA/rxe: restore responder continuity on drained path | 1C | U | C-inflight; curated → squashed into restore_res (7d797ea) |
 | 248 | cf70504 | RDMA/rxe: trace CQ state on CRIU restore | 1C | U | C-cq-rt (trace) |
 | 249 | 324b366 | net/mlx5: document restored-VF UMR reg_mr hang | 2a | U | comment/doc (en_tx.c); trivial |
 | 250 | 2418524 | RDMA/rxe: round-trip the CQ ring on CRIU save/restore | 1C | U | C-cq-rt; split |
@@ -880,7 +880,8 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
   `rxe_qp_restore_wire_state` (slice D), `rxe_qp_pause`/`rxe_qp_resume` (slice B),
   and the CQ in-flight UHW-tail template `rxe_restore_cq_inflight`. Curated from
   oracle `dd1f482` (B1 in-flight) + `0da0f09` (subspan) + `6f5c8be` (FREEZE_CONTEXT
-  + `ib_qp_ucontext`); the born-frozen install is oracle `4eb1792`. **Decomposed
+  + `ib_qp_ucontext`) + `491dab8` (responder continuity on the drained path);
+  the born-frozen install is oracle `4eb1792`. **Decomposed
   one data structure per commit** (save side first, then restore side) so each is
   independently bisectable; `rxe_qp_restore_inflight()`'s signature grows
   `sq → +rq → +res` and the RESTORE_QP `-EOPNOTSUPP` image reject narrows then
@@ -901,20 +902,25 @@ run the matching harness, and `checkpatch.pl --strict`. Path-disjoint SCAFFOLD
     tail-slicer (mirrors `rxe_restore_cq_inflight`); narrow the reject to `rq||res`.
   - `e383719` **restore in-flight RQ ring in RESTORE_QP** — grow signature `+rq_image`
     + RQ block (`-EINVAL` on SRQ-fed); narrow the reject to `res`.
-  - `e31befa` **restore responder resources in RESTORE_QP** — grow signature
-    `+res_image` + memcpy `resp.resources` + `res_head/tail` + stamp responder
-    scalars; drop the last `-EOPNOTSUPP` reject.
-  - `d745631` **install restored QP datapath-frozen** — `rxe_qp_pause(qp)` immediately
+  - `7d797ea` **restore responder resources in RESTORE_QP** — grow signature
+    `+res_image` + memcpy `resp.resources` + `res_head/tail`; drop the last
+    `-EOPNOTSUPP` reject. Folds oracle `491dab8`: the responder continuity
+    scalars (`resp.ack_psn/opcode/status/aeth_syndrome`) are stamped
+    **unconditionally** in `rxe_qp_restore_wire_state()`, not gated on the
+    in-flight image tail — a drained / pure-responder QP needs them too (without
+    `resp.opcode` a peer replaying a multi-packet RDMA WRITE/SEND hits
+    `check_op_seq()` at `OPCODE_NONE` → `IB_WC_REM_INV_REQ_ERR`).
+  - `2aa753b` **install restored QP datapath-frozen** — `rxe_qp_pause(qp)` immediately
     before `rxe_finalize(qp)` in `rxe_restore_qp()`, unconditional; neither requester
     nor responder runs until the orchestrator thaws (do NOT kick send_task here —
     peers / MR pages may not exist yet).
-  - `e0a5437` **add FREEZE_CONTEXT migrate verb** — core `ib_qp_ucontext()` (mirror
+  - `dfec74c` **add FREEZE_CONTEXT migrate verb** — core `ib_qp_ucontext()` (mirror
     `ib_qp_user_handle`, `EXPORT_SYMBOL`) folded with its sole caller; `rxe_migrate.c`
     handle-less `RXE_IB_METHOD_FREEZE_CONTEXT` handler (RCU walk `rxe->qp_pool`,
     `kref_get_unless_zero`, filter `is_user && ib_qp_ucontext==ucontext`,
     `rxe_qp_pause/resume`); uapi method `(1<<12)+3` + `FREEZE_CONTEXT_FREEZE` attr.
     `dp_frozen` keeps the per-QP + ucontext double-freeze idempotent.
-  Comments self-contained (no design-doc/§-refs in kernel source). `e0a5437` carries
+  Comments self-contained (no design-doc/§-refs in kernel source). `dfec74c` carries
   the idiomatic uverbs-macro `(`-CHECKs → `--no-verify` + trailer note; the rest
   clean. Each commit compiles + checkpatch-clean; full vmlinux relink + `rdma_rxe.ko`
   link verified (`ib_qp_ucontext` lands in `Module.symvers` on the full build).
