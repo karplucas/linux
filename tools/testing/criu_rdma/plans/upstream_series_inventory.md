@@ -161,6 +161,111 @@ Cross-tree handling: shared `include/linux/mlx5/{driver.h,cq.h}` land via
 **mlx5-next**; 2a to net-next, 2b to rdma-next with a stated dependency. All
 posted together in the RFC.
 
+### 3a. 2a execution plan — curation order for `vfmig-rebase-0` (TENTATIVE)
+
+Bottom-up build-up order for the mlx5_core datapath, curated onto
+`vfmig-rebase-0` (a branch off `criu-rebase-t1.1-rxe-pd-wip`, which already
+carries Track-1 core + rxe through slice E). **Decoupled from
+`drivers/vfio/pci/mlx5/`** — the vfmig chardev migration path stands on its
+own; no convergence with the VFIO migration driver at this stage (this is a
+legible POC, expecting many more mlx5/vfmig iterations). All sources born in
+`core/vfmig/` (the oracle's `E-move` relocation folded in from the start).
+
+Sequencing intent (per directional feedback): introduce the **vfmig concept
++ the pre-restore control-plane APIs early** (incl. VF identity/UUID), then
+reach **context restore ASAP** — `mlx5_core` cleanly binding a tracked →
+saved → restored VF is the mid-series milestone (#9) — and only *then* layer
+the uverbs-object bridge (#14–#15) that feeds 2b.
+
+Notes:
+- The oracle (`criu-dev-poc-rebase`) is trusted-as-tested; per milestone the
+  acceptance gate is (a) curated hunks match the oracle's final tree state
+  for those paths and (b) the matching `run_all_harnesses.sh` test is GREEN
+  (or a documented XFAIL). No oracle re-validation ceremony.
+- **The milestone numbers below are functional checkpoints, not final commit
+  counts.** Each may fan out into several one-concept commits at curation
+  time (esp. #6–#8 IOVA/DMA and #14 user-page tracking); the *shape* and
+  order are what's locked here.
+- `PROBE_*` validation ioctls (`E-dbgioctl`) stay on the build-up branch for
+  dev-gating each milestone and are stripped at the final RFC re-slice.
+
+**Phase 1 — introduce vfmig + pre-restore control plane**
+1. **`net/mlx5: add vfmig chardev framework, UAPI, per-PF state`** (`E-chardev`)
+   — cdev, `mlx5_vfmig.h` UAPI, per-PF state, Kconfig/Makefile.
+   ← `68e92ad` (+`d95db0c` layout). *Gate: compile; `pf_cdev_smoke`.*
+2. **`net/mlx5: add vfmig control ioctls`** (`E-ioctls`) — `ENABLE_MIGRATABLE`
+   / `GET_VHCA_ID` / `QUERY_VF` (incl. `restored`, KS7.1) / `MARK_RESTORED`.
+   ← `3b2ebe6`. *Gate: `pf_cdev_smoke`.*
+3. **`net/mlx5: add orchestrator-owned per-VF UUID`** (`E-uuid`, **moved
+   early**) — `SET_VF_UUID` + `vf_uuid` on `QUERY_VF` (KS7.3), the stable
+   dump↔VF binding identity (`vhca_id` is not stable across SAVE/LOAD).
+   ← `6f68de8`, `9dec87c`. *Gate: `vf_uuid_lifecycle`.*
+4. **`net/mlx5: add SET_TRACKED + per-VF tracked flag`** (`E-tracked`) — mark a
+   VF tracked so its migratable state is logged; surface via `QUERY_VF`.
+   ← `04e15e6`, `b6f1563`, `381aa15`. *Gate: `synthetic_load_plumbing`.*
+
+**Phase 2 — VHCA save/load + deterministic IOVA (VF-state data plane)**
+5. **`net/mlx5: add SAVE_VHCA_STATE / LOAD_VHCA_STATE`** (`E-saveload`).
+   ← `01bbaef` (+`cmd.c`). *Gate: build+boot; `synthetic_load_plumbing`.*
+6. **`net/mlx5: add per-VF IOMMU domain + deterministic IOVA allocator`**
+   (`E-iova`) — allocator core, slot-tagging, stream header, at-probe drift
+   detection. ← `93f54fb`, `6d5e28e`, `862c388`, `1684c26`, `30edd49`,
+   `5cf7346`, `b4f56ff`.
+7. **`net/mlx5: route internal DMA through the IOVA allocator`** (`E-dma`) —
+   command ring, mailboxes (+HOST_PAGE wire), MANAGE_PAGES,
+   `dma_zalloc_coherent`, transient mailbox arena. ← `6f7c6e6`, `eba30f3`,
+   `e55e593`, `a8e8b70`, `053fd01`.
+8. **`net/mlx5: add vfmig DMA ops + put user allocations behind the IOMMU`**
+   (`E-dmaops`) — `vfmig_dma_ops`, kcoherent, early domain detach on remove.
+   ← `083dbb9`, `7d39efd`. *Gates 6–8: build+boot; `iova_tracked_save_load`.*
+
+**Phase 3 — ★ MILESTONE: mlx5_core binds a restored VF ★**
+9. **`net/mlx5: bring up mlx5_core on a restored VF`** (`E-restore-probe`) —
+   skip `ENABLE_HCA(self)`, reconstitute `priv->page_root_xa`, skip netdev +
+   `cmd_use_events` on restored VFs, detach `iova_dom` from driverless VFs
+   before `pci_disable_sriov`. ← `87f9aab`, `76b9777`, `f60c13e`, `e5912555`,
+   `c87d5c6`. **← "mlx5_core successfully binds a tracked/restored VF"
+   milestone.** *Gate: full `iova_tracked_save_load` round-trip.*
+
+**Phase 4 — snapshot ordering / lifecycle robustness**
+10. **`net/mlx5: split SUSPEND/RESUME out of SAVE/LOAD`** (`E-susp-split`).
+    ← `add51d8`. *Gate: `suspend_resume_split`.*
+11. **`net/mlx5: add directional SUSPEND/RESUME + tri-state dp_state`**
+    (`E-directional`). ← `1ff2483`. *Gate: `directional_suspend_resume`.*
+12. **`net/mlx5: keep fused SUSPEND/RESUME all-or-nothing on failure`**
+    (`E-fused`). ← `feade3a`.
+13. **`net/mlx5: force-resume parked VFs before per-VF SR-IOV teardown`**
+    (`E-teardown`). ← `b282d62`. *Gate: `teardown_resume_timing`,
+    `running_p2p_hold_window`, `multi_load_drift_gate`.*
+
+**Phase 5 — bridge to uverbs objects (feeds 2b)**
+14. **`net/mlx5: track host user pages for deterministic replay`** (`E-replay`)
+    — `(kind, fw_id)` identity + secondary rb-tree, `HOST_USER_PAGE` emit on
+    SAVE / replay on LOAD, high-water preservation, multi-page objects,
+    `vfmig_iova_bind_user_object` (D2). ← `504602`, `e088700`, `c44a482`,
+    `c66ad56`, `e878242`, `10fd8ab`. *Gate: `user_object_replay`.*
+15. **`net/mlx5: add restore bind primitives + QP query`** (`E-bind` +
+    `E-queryqp`) — `mlx5_core_adopt_cq` + CQ bind, `mlx5_vfmig_bind_user_qp`,
+    the mlx5_core QP-query API. ← `3dbc121`, `e161e7e`, `14ac2c2`.
+    *Gate: compile (exercised by the 2b harnesses).*
+
+**Held back**
+- `E-dbgioctl` (build-up only, stripped at RFC): `PROBE_PD`/`PROBE_MKEY`/
+  `PROBE_CQN`, `QUERY_AWAITING_BIND`. ← `33904d4`, `e1cb11b`, `54a7a13`,
+  `a0bb5ec`.
+- `Z` net-zeros (never curated): the av.dmac-refresh chain (`b70b662` →
+  `fe188a6` → `6055711` revert) + UAR/UID experiments (`4af41d3`, `ec254bf`).
+
+**Cross-tree wrinkles (resolve at the 2a/2b seam):**
+- The stage-2 **source-side retag callsites live in `mlx5_ib`**
+  (`create_real_mr`/`db_map_user`/`create_cq`/`create_user_qp`/`create_srq`:
+  `b2ff659`, `f6416c8`, `fd81527`, `c0183184`, `4c522ea`) — the dump-time
+  half of #14 but in an rdma-next path. Carve into a dedicated
+  **`RDMA/mlx5: tag user-object pages for vfmig tracking`** commit that opens
+  the 2b set (depends on #14's API), keeping 2a strictly net/mlx5.
+- `d36084b` "gate mlx5_ib dev-resource init on restored VFs" is mlx5_ib —
+  belongs to 2b's `F-gate`, not the #9 core milestone.
+
 ## 4. Curation mechanics
 
 Work in the build/boot tree `/opt/builds/linux` on `criu-dev-build-up-rebase`
