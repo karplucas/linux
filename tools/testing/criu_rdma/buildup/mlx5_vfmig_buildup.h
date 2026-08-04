@@ -51,4 +51,12 @@ struct mlx5_vfmig_query_vf {
 #define MLX5_VFMIG_IOC_QUERY_VF \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x03, struct mlx5_vfmig_query_vf)
 
+struct mlx5_vfmig_enable_migratable {
+	__u32 vf_id;	/* in */
+	__u32 reserved;
+};
+
+#define MLX5_VFMIG_IOC_ENABLE_MIGRATABLE \
+	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x06, struct mlx5_vfmig_enable_migratable)
+
 #endif /* _MLX5_VFMIG_BUILDUP_H */

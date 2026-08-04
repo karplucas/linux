@@ -15,9 +15,10 @@
  *   make -C tools/testing/criu_rdma buildup/mlx5_vfmig_min
  *
  * Use:
- *   mlx5_vfmig_min <pf-bdf> get_vhca_id  <vf_id>
- *   mlx5_vfmig_min <pf-bdf> mark_restored <vf_id>
- *   mlx5_vfmig_min <pf-bdf> query_vf     <vf_id>
+ *   mlx5_vfmig_min <pf-bdf> get_vhca_id       <vf_id>
+ *   mlx5_vfmig_min <pf-bdf> mark_restored     <vf_id>
+ *   mlx5_vfmig_min <pf-bdf> query_vf          <vf_id>
+ *   mlx5_vfmig_min <pf-bdf> enable_migratable <vf_id>
  *   mlx5_vfmig_min <pf-bdf> list
  */
 
@@ -62,6 +63,19 @@ static int do_mark_restored(int fd, unsigned int vf_id)
 		return 1;
 	}
 	printf("vf %u: marked restored\n", vf_id);
+	return 0;
+}
+
+static int do_enable_migratable(int fd, unsigned int vf_id)
+{
+	struct mlx5_vfmig_enable_migratable arg = { .vf_id = vf_id };
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_ENABLE_MIGRATABLE, &arg) < 0) {
+		perror("ENABLE_MIGRATABLE");
+		return 1;
+	}
+	printf("vf %u: migratable cap enabled (call before driver bind)\n",
+	       vf_id);
 	return 0;
 }
 
@@ -120,6 +134,7 @@ static void usage(const char *argv0)
 		"  verbs: get_vhca_id <vf_id>\n"
 		"         mark_restored <vf_id>\n"
 		"         query_vf <vf_id>\n"
+		"         enable_migratable <vf_id>\n"
 		"         list\n",
 		argv0);
 }
@@ -155,6 +170,9 @@ int main(int argc, char **argv)
 		ret = do_mark_restored(fd, strtoul(argv[3], NULL, 0));
 	} else if (!strcmp(verb, "query_vf") || !strcmp(verb, "query-vf")) {
 		ret = do_query_vf(fd, strtoul(argv[3], NULL, 0));
+	} else if (!strcmp(verb, "enable_migratable") ||
+		   !strcmp(verb, "enable-migratable")) {
+		ret = do_enable_migratable(fd, strtoul(argv[3], NULL, 0));
 	} else {
 		usage(argv[0]);
 		ret = 2;
