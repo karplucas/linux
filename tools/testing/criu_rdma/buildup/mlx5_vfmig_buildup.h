@@ -59,4 +59,27 @@ struct mlx5_vfmig_enable_migratable {
 #define MLX5_VFMIG_IOC_ENABLE_MIGRATABLE \
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x06, struct mlx5_vfmig_enable_migratable)
 
+#define MLX5_VFMIG_DIR_FLAG_INITIATOR	0x1u
+#define MLX5_VFMIG_DIR_FLAG_RESPONDER	0x2u
+#define MLX5_VFMIG_DIR_FLAG_ALL \
+	(MLX5_VFMIG_DIR_FLAG_INITIATOR | MLX5_VFMIG_DIR_FLAG_RESPONDER)
+
+struct mlx5_vfmig_suspend_vhca {
+	__u32 vf_id;	/* in  */
+	__u32 flags;	/* in: 0 or a subset of MLX5_VFMIG_DIR_FLAG_* */
+	__u32 reserved[2];
+};
+
+#define MLX5_VFMIG_IOC_SUSPEND_VHCA \
+	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x13, struct mlx5_vfmig_suspend_vhca)
+
+struct mlx5_vfmig_resume_vhca {
+	__u32 vf_id;	/* in  */
+	__u32 flags;	/* in: 0 or a subset of MLX5_VFMIG_DIR_FLAG_* */
+	__u32 reserved[2];
+};
+
+#define MLX5_VFMIG_IOC_RESUME_VHCA \
+	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x14, struct mlx5_vfmig_resume_vhca)
+
 #endif /* _MLX5_VFMIG_BUILDUP_H */

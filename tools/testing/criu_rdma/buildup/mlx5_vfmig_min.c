@@ -19,6 +19,8 @@
  *   mlx5_vfmig_min <pf-bdf> mark_restored     <vf_id>
  *   mlx5_vfmig_min <pf-bdf> query_vf          <vf_id>
  *   mlx5_vfmig_min <pf-bdf> enable_migratable <vf_id>
+ *   mlx5_vfmig_min <pf-bdf> suspend_vhca      <vf_id> [initiator|responder]
+ *   mlx5_vfmig_min <pf-bdf> resume_vhca       <vf_id> [initiator|responder]
  *   mlx5_vfmig_min <pf-bdf> list
  */
 
@@ -79,6 +81,48 @@ static int do_enable_migratable(int fd, unsigned int vf_id)
 	return 0;
 }
 
+/* Map an optional direction word to a MLX5_VFMIG_DIR_FLAG_* mask. */
+static int parse_dir(const char *s, unsigned int *flags)
+{
+	if (!s || !strcmp(s, "all") || !strcmp(s, "both")) {
+		*flags = 0;
+		return 0;
+	}
+	if (!strcmp(s, "initiator") || !strcmp(s, "init")) {
+		*flags = MLX5_VFMIG_DIR_FLAG_INITIATOR;
+		return 0;
+	}
+	if (!strcmp(s, "responder") || !strcmp(s, "resp")) {
+		*flags = MLX5_VFMIG_DIR_FLAG_RESPONDER;
+		return 0;
+	}
+	return -1;
+}
+
+static int do_suspend(int fd, unsigned int vf_id, unsigned int flags)
+{
+	struct mlx5_vfmig_suspend_vhca arg = { .vf_id = vf_id, .flags = flags };
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_SUSPEND_VHCA, &arg) < 0) {
+		perror("SUSPEND_VHCA");
+		return 1;
+	}
+	printf("vf %u: suspended (flags 0x%x)\n", vf_id, flags);
+	return 0;
+}
+
+static int do_resume(int fd, unsigned int vf_id, unsigned int flags)
+{
+	struct mlx5_vfmig_resume_vhca arg = { .vf_id = vf_id, .flags = flags };
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_RESUME_VHCA, &arg) < 0) {
+		perror("RESUME_VHCA");
+		return 1;
+	}
+	printf("vf %u: resumed (flags 0x%x)\n", vf_id, flags);
+	return 0;
+}
+
 static int do_query_vf(int fd, unsigned int vf_id)
 {
 	struct mlx5_vfmig_query_vf info;
@@ -135,6 +179,8 @@ static void usage(const char *argv0)
 		"         mark_restored <vf_id>\n"
 		"         query_vf <vf_id>\n"
 		"         enable_migratable <vf_id>\n"
+		"         suspend_vhca <vf_id> [initiator|responder]\n"
+		"         resume_vhca <vf_id> [initiator|responder]\n"
 		"         list\n",
 		argv0);
 }
@@ -173,6 +219,26 @@ int main(int argc, char **argv)
 	} else if (!strcmp(verb, "enable_migratable") ||
 		   !strcmp(verb, "enable-migratable")) {
 		ret = do_enable_migratable(fd, strtoul(argv[3], NULL, 0));
+	} else if (!strcmp(verb, "suspend_vhca") ||
+		   !strcmp(verb, "suspend-vhca")) {
+		unsigned int flags = 0;
+
+		if (parse_dir(argc > 4 ? argv[4] : NULL, &flags)) {
+			usage(argv[0]);
+			ret = 2;
+		} else {
+			ret = do_suspend(fd, strtoul(argv[3], NULL, 0), flags);
+		}
+	} else if (!strcmp(verb, "resume_vhca") ||
+		   !strcmp(verb, "resume-vhca")) {
+		unsigned int flags = 0;
+
+		if (parse_dir(argc > 4 ? argv[4] : NULL, &flags)) {
+			usage(argv[0]);
+			ret = 2;
+		} else {
+			ret = do_resume(fd, strtoul(argv[3], NULL, 0), flags);
+		}
 	} else {
 		usage(argv[0]);
 		ret = 2;
