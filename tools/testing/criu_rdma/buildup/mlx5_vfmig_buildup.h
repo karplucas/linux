@@ -82,4 +82,28 @@ struct mlx5_vfmig_resume_vhca {
 #define MLX5_VFMIG_IOC_RESUME_VHCA \
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x14, struct mlx5_vfmig_resume_vhca)
 
+struct mlx5_vfmig_save_state {
+	__u32 vf_id;	/* in  */
+	__u32 flags;	/* in: reserved, must be 0 */
+	__s32 save_fd;	/* out */
+	__u32 reserved;
+};
+
+#define MLX5_VFMIG_IOC_SAVE_VHCA_STATE \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x05, struct mlx5_vfmig_save_state)
+
+/*
+ * On-wire framing for the SAVE stream. Each record starts with this
+ * 16-byte little-endian header; the first (and, for this milestone, only)
+ * record is a FW_DATA blob whose payload is @record_size bytes of raw
+ * firmware image following the header.
+ */
+struct vfmig_wire_header {
+	__u64 record_size;	/* payload bytes after this header */
+	__u32 flags;
+	__u32 tag;
+};
+
+#define VFMIG_WIRE_TAG_FW_DATA	0
+
 #endif /* _MLX5_VFMIG_BUILDUP_H */
