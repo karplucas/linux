@@ -6,7 +6,8 @@ CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter
 TOOL_BINARIES :=					\
 	tools/mlx5_vfmig				\
 	tools/synthetic_blob_emit			\
-	tools/ucontext_vendor_verbs
+	tools/ucontext_vendor_verbs			\
+	buildup/mlx5_vfmig_min
 
 # Empirical probes for the various restore designs (see design/).
 # Built by default; depend on libibverbs (and libmlx5 for the FW-id
@@ -56,6 +57,12 @@ tools/synthetic_blob_emit: tools/synthetic_blob_emit.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 tools/ucontext_vendor_verbs: tools/ucontext_vendor_verbs.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+# Minimal build-up helper for the incrementally-upstreamed vfmig ioctl
+# surface. Self-contained (vendors its own UAPI subset) so it stays
+# wire-compatible with a build-up-branch kernel; no external deps.
+buildup/mlx5_vfmig_min: buildup/mlx5_vfmig_min.c buildup/mlx5_vfmig_buildup.h
 	$(CC) $(CFLAGS) -o $@ $<
 
 # FW-id continuity probe (design/uobject_restore.md §8.2 + §6.3).
