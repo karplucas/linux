@@ -147,6 +147,18 @@ mlx5_device_disable_sriov(struct mlx5_core_dev *dev, int num_vfs, bool clear_vf,
 	 */
 	mlx5_vfmig_pf_drop_vf_uuids(dev);
 
+	/*
+	 * Backstop detach + free of per-VF vfmig IOVA domains for the
+	 * driver-unload path (mlx5_sriov_detach() -> here), where the VFs
+	 * are disabled without going through mlx5_sriov_disable(). The VFs
+	 * still exist as PCI devices at this point, so the unmanaged domain
+	 * is detached (restoring the default DMA domain) before they go
+	 * away. Idempotent: on the sriov_numvfs=0 path mlx5_sriov_disable()
+	 * has already dropped the domains before pci_disable_sriov(), so
+	 * this is a no-op there.
+	 */
+	mlx5_vfmig_pf_drop_iova_domains(dev);
+
 	for (vf = num_vfs - 1; vf >= 0; vf--) {
 		if (!sriov->vfs_ctx[vf].enabled)
 			continue;
@@ -221,6 +233,17 @@ void mlx5_sriov_disable(struct pci_dev *pdev, bool num_vf_change)
 	struct mlx5_core_dev *dev  = pci_get_drvdata(pdev);
 	struct devlink *devlink = priv_to_devlink(dev);
 	int num_vfs = pci_num_vf(dev->pdev);
+
+	/*
+	 * Detach + free any per-VF vfmig IOVA domains while the VFs still
+	 * exist as PCI devices. pci_disable_sriov() below removes the VFs;
+	 * the iommu core WARNs (drivers/iommu/iommu.c __iommu_group_free_device)
+	 * if a VF's group is torn down while our unmanaged domain is still
+	 * attached in place of its default DMA domain. A tracked VF is always
+	 * unbound in this milestone and there is no allocator state that must
+	 * outlive pci_disable_sriov(), so a plain detach+free here is enough.
+	 */
+	mlx5_vfmig_pf_drop_iova_domains(dev);
 
 	pci_disable_sriov(pdev);
 	devl_lock(devlink);
