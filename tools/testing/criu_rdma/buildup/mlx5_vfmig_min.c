@@ -319,7 +319,8 @@ out:
 	}
 	fclose(f);
 	if (!ret)
-		printf("vf %u: loaded %zu bytes from %s\n", vf_id, total, infile);
+		printf("vf %u: staged %zu bytes from %s (applies on next probe)\n",
+		       vf_id, total, infile);
 	return ret;
 }
 
