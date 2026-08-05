@@ -82,15 +82,27 @@ struct mlx5_vfmig_resume_vhca {
 #define MLX5_VFMIG_IOC_RESUME_VHCA \
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x14, struct mlx5_vfmig_resume_vhca)
 
+#define MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED	0x1u
+
 struct mlx5_vfmig_save_state {
 	__u32 vf_id;	/* in  */
-	__u32 flags;	/* in: reserved, must be 0 */
+	__u32 flags;	/* in: 0 or MLX5_VFMIG_SAVE_FLAG_* */
 	__s32 save_fd;	/* out */
 	__u32 reserved;
 };
 
 #define MLX5_VFMIG_IOC_SAVE_VHCA_STATE \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x05, struct mlx5_vfmig_save_state)
+
+struct mlx5_vfmig_load_state {
+	__u32 vf_id;	/* in  */
+	__u32 flags;	/* in: reserved, must be 0 */
+	__s32 load_fd;	/* out */
+	__u32 reserved;
+};
+
+#define MLX5_VFMIG_IOC_LOAD_VHCA_STATE \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x04, struct mlx5_vfmig_load_state)
 
 /*
  * On-wire framing for the SAVE stream. Each record starts with this

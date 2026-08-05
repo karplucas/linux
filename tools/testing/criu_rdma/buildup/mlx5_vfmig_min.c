@@ -22,6 +22,8 @@
  *   mlx5_vfmig_min <pf-bdf> suspend_vhca      <vf_id> [initiator|responder]
  *   mlx5_vfmig_min <pf-bdf> resume_vhca       <vf_id> [initiator|responder]
  *   mlx5_vfmig_min <pf-bdf> save_vhca_state   <vf_id> [outfile]
+ *   mlx5_vfmig_min <pf-bdf> save_keep         <vf_id> [outfile]
+ *   mlx5_vfmig_min <pf-bdf> load_vhca_state   <vf_id> <infile>
  *   mlx5_vfmig_min <pf-bdf> list
  */
 
@@ -166,9 +168,10 @@ static int slurp_fd(int save_fd, unsigned char **buf, size_t *len)
 	return 0;
 }
 
-static int do_save_vhca_state(int fd, unsigned int vf_id, const char *outfile)
+static int do_save_vhca_state(int fd, unsigned int vf_id, unsigned int flags,
+			      const char *outfile)
 {
-	struct mlx5_vfmig_save_state arg = { .vf_id = vf_id };
+	struct mlx5_vfmig_save_state arg = { .vf_id = vf_id, .flags = flags };
 	struct vfmig_wire_header hdr;
 	unsigned char *buf = NULL;
 	uint64_t record_size;
@@ -269,6 +272,127 @@ static int do_save_busy(int fd, unsigned int vf_id)
 	return ret;
 }
 
+/* Open a LOAD session and stream @infile's bytes into the load fd. */
+static int do_load_vhca_state(int fd, unsigned int vf_id, const char *infile)
+{
+	struct mlx5_vfmig_load_state arg = { .vf_id = vf_id };
+	unsigned char buf[1 << 16];
+	size_t total = 0;
+	FILE *f;
+	int ret = 0;
+
+	f = fopen(infile, "rb");
+	if (!f) {
+		perror("open infile");
+		return 1;
+	}
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_LOAD_VHCA_STATE, &arg) < 0) {
+		perror("LOAD_VHCA_STATE");
+		fclose(f);
+		return 1;
+	}
+
+	for (;;) {
+		size_t got = fread(buf, 1, sizeof(buf), f);
+		unsigned char *p = buf;
+
+		if (!got)
+			break;
+		while (got) {
+			ssize_t w = write(arg.load_fd, p, got);
+
+			if (w < 0) {
+				perror("write(load_fd)");
+				ret = 1;
+				goto out;
+			}
+			p += w;
+			got -= w;
+			total += w;
+		}
+	}
+out:
+	if (close(arg.load_fd) < 0 && !ret) {
+		perror("close(load_fd)");
+		ret = 1;
+	}
+	fclose(f);
+	if (!ret)
+		printf("vf %u: loaded %zu bytes from %s\n", vf_id, total, infile);
+	return ret;
+}
+
+/*
+ * Open a LOAD session and, while its fd is open, attempt a second LOAD on
+ * the same vf_id. Succeeds (returns 0) only if the second is rejected with
+ * EBUSY. The VF must already be at STOP.
+ */
+static int do_load_busy(int fd, unsigned int vf_id)
+{
+	struct mlx5_vfmig_load_state a = { .vf_id = vf_id };
+	struct mlx5_vfmig_load_state b = { .vf_id = vf_id };
+	int ret = 0;
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_LOAD_VHCA_STATE, &a) < 0) {
+		perror("LOAD_VHCA_STATE (first)");
+		return 1;
+	}
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_LOAD_VHCA_STATE, &b) == 0) {
+		fprintf(stderr,
+			"vf %u: second concurrent LOAD unexpectedly succeeded\n",
+			vf_id);
+		close(b.load_fd);
+		ret = 1;
+	} else if (errno != EBUSY) {
+		fprintf(stderr, "vf %u: second LOAD failed with %s, want EBUSY\n",
+			vf_id, strerror(errno));
+		ret = 1;
+	} else {
+		printf("vf %u: second concurrent LOAD rejected with EBUSY\n",
+		       vf_id);
+	}
+
+	close(a.load_fd);
+	return ret;
+}
+
+/*
+ * Open a LOAD session and, while its fd is open, attempt a SAVE on the
+ * same vf_id. Succeeds (returns 0) only if SAVE is rejected with EBUSY,
+ * proving SAVE/LOAD are mutually exclusive per VF. VF must be at STOP.
+ */
+static int do_save_excl(int fd, unsigned int vf_id)
+{
+	struct mlx5_vfmig_load_state l = { .vf_id = vf_id };
+	struct mlx5_vfmig_save_state s = { .vf_id = vf_id };
+	int ret = 0;
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_LOAD_VHCA_STATE, &l) < 0) {
+		perror("LOAD_VHCA_STATE (first)");
+		return 1;
+	}
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_SAVE_VHCA_STATE, &s) == 0) {
+		fprintf(stderr,
+			"vf %u: SAVE during open LOAD unexpectedly succeeded\n",
+			vf_id);
+		close(s.save_fd);
+		ret = 1;
+	} else if (errno != EBUSY) {
+		fprintf(stderr, "vf %u: SAVE during LOAD failed with %s, want EBUSY\n",
+			vf_id, strerror(errno));
+		ret = 1;
+	} else {
+		printf("vf %u: SAVE during open LOAD rejected with EBUSY\n",
+		       vf_id);
+	}
+
+	close(l.load_fd);
+	return ret;
+}
+
 static int do_query_vf(int fd, unsigned int vf_id)
 {
 	struct mlx5_vfmig_query_vf info;
@@ -328,7 +452,11 @@ static void usage(const char *argv0)
 		"         suspend_vhca <vf_id> [initiator|responder]\n"
 		"         resume_vhca <vf_id> [initiator|responder]\n"
 		"         save_vhca_state <vf_id> [outfile]\n"
+		"         save_keep <vf_id> [outfile]\n"
 		"         save_busy <vf_id>\n"
+		"         load_vhca_state <vf_id> <infile>\n"
+		"         load_busy <vf_id>\n"
+		"         save_excl <vf_id>\n"
 		"         list\n",
 		argv0);
 }
@@ -389,11 +517,31 @@ int main(int argc, char **argv)
 		}
 	} else if (!strcmp(verb, "save_vhca_state") ||
 		   !strcmp(verb, "save-vhca-state")) {
+		ret = do_save_vhca_state(fd, strtoul(argv[3], NULL, 0), 0,
+					 argc > 4 ? argv[4] : NULL);
+	} else if (!strcmp(verb, "save_keep") ||
+		   !strcmp(verb, "save-keep")) {
 		ret = do_save_vhca_state(fd, strtoul(argv[3], NULL, 0),
+					 MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED,
 					 argc > 4 ? argv[4] : NULL);
 	} else if (!strcmp(verb, "save_busy") ||
 		   !strcmp(verb, "save-busy")) {
 		ret = do_save_busy(fd, strtoul(argv[3], NULL, 0));
+	} else if (!strcmp(verb, "load_vhca_state") ||
+		   !strcmp(verb, "load-vhca-state")) {
+		if (argc < 5) {
+			usage(argv[0]);
+			ret = 2;
+		} else {
+			ret = do_load_vhca_state(fd, strtoul(argv[3], NULL, 0),
+						 argv[4]);
+		}
+	} else if (!strcmp(verb, "load_busy") ||
+		   !strcmp(verb, "load-busy")) {
+		ret = do_load_busy(fd, strtoul(argv[3], NULL, 0));
+	} else if (!strcmp(verb, "save_excl") ||
+		   !strcmp(verb, "save-excl")) {
+		ret = do_save_excl(fd, strtoul(argv[3], NULL, 0));
 	} else {
 		usage(argv[0]);
 		ret = 2;
