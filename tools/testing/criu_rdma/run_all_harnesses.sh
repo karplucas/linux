@@ -109,6 +109,7 @@ fi
 TESTS=(
   "pf_cdev_smoke|save_load/test_pf_cdev_smoke.sh||run"
   "synthetic_load_plumbing|save_load/test_synthetic_load_plumbing.sh||run"
+  "set_tracked_lifecycle|save_load/test_set_tracked_domain_lifecycle.sh||run"
   "iova_tracked_save_load|save_load/test_iova_tracked_save_load.sh||run"
   "inkernel_save_load|save_load/test_inkernel_save_load_roundtrip.sh||xfail:non-tracked LOAD superseded by deterministic-IOVA path"
   "vfio_save_load|save_load/test_vfio_save_load_roundtrip.sh||xfail:non-tracked LOAD superseded; SAVE side still validated"
