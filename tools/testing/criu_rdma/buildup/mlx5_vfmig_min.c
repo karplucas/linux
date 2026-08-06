@@ -2,7 +2,8 @@
 /*
  * mlx5_vfmig_min - minimal /dev/mlx5_vfmig/<bdf> helper for the build-up
  * harness. Speaks only the incrementally-upstreamed ioctl surface (see
- * mlx5_vfmig_buildup.h): GET_VHCA_ID, MARK_RESTORED, QUERY_VF.
+ * mlx5_vfmig_buildup.h): GET_VHCA_ID, MARK_RESTORED, QUERY_VF,
+ * ENABLE_MIGRATABLE, SUSPEND/RESUME/SAVE/LOAD_VHCA_STATE, SET_TRACKED.
  *
  * The full-featured tools/mlx5_vfmig helper targets the oracle's
  * complete ABI and will not run against a build-up-branch kernel
@@ -24,6 +25,8 @@
  *   mlx5_vfmig_min <pf-bdf> save_vhca_state   <vf_id> [outfile]
  *   mlx5_vfmig_min <pf-bdf> save_keep         <vf_id> [outfile]
  *   mlx5_vfmig_min <pf-bdf> load_vhca_state   <vf_id> <infile>
+ *   mlx5_vfmig_min <pf-bdf> track             <vf_id>
+ *   mlx5_vfmig_min <pf-bdf> untrack           <vf_id>
  *   mlx5_vfmig_min <pf-bdf> list
  */
 
@@ -83,6 +86,18 @@ static int do_enable_migratable(int fd, unsigned int vf_id)
 	}
 	printf("vf %u: migratable cap enabled (call before driver bind)\n",
 	       vf_id);
+	return 0;
+}
+
+static int do_set_tracked(int fd, unsigned int vf_id, unsigned int enable)
+{
+	struct mlx5_vfmig_set_tracked arg = { .vf_id = vf_id, .enable = enable };
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_SET_TRACKED, &arg) < 0) {
+		perror("SET_TRACKED");
+		return 1;
+	}
+	printf("vf %u: %s\n", vf_id, enable ? "tracked" : "untracked");
 	return 0;
 }
 
@@ -405,8 +420,8 @@ static int do_query_vf(int fd, unsigned int vf_id)
 		perror("QUERY_VF");
 		return 1;
 	}
-	printf("vf %u: vhca_id 0x%04x restored %u (num_vfs %u)\n",
-	       vf_id, info.vhca_id, info.restored, info.num_vfs);
+	printf("vf %u: vhca_id 0x%04x restored %u tracked %u (num_vfs %u)\n",
+	       vf_id, info.vhca_id, info.restored, info.tracked, info.num_vfs);
 	return 0;
 }
 
@@ -428,7 +443,7 @@ static int do_list(int fd)
 		return 0;
 	}
 
-	printf("%-6s %-9s %s\n", "vf_id", "vhca_id", "restored");
+	printf("%-6s %-9s %-9s %s\n", "vf_id", "vhca_id", "restored", "tracked");
 	for (i = 0; i < n; i++) {
 		err = query_one(fd, i, &info);
 		if (err) {
@@ -437,7 +452,8 @@ static int do_list(int fd)
 				i, strerror(errno));
 			continue;
 		}
-		printf("%-6u 0x%04x    %u\n", i, info.vhca_id, info.restored);
+		printf("%-6u 0x%04x    %-9u %u\n",
+		       i, info.vhca_id, info.restored, info.tracked);
 	}
 	return 0;
 }
@@ -458,6 +474,8 @@ static void usage(const char *argv0)
 		"         load_vhca_state <vf_id> <infile>\n"
 		"         load_busy <vf_id>\n"
 		"         save_excl <vf_id>\n"
+		"         track <vf_id>\n"
+		"         untrack <vf_id>\n"
 		"         list\n",
 		argv0);
 }
@@ -543,6 +561,10 @@ int main(int argc, char **argv)
 	} else if (!strcmp(verb, "save_excl") ||
 		   !strcmp(verb, "save-excl")) {
 		ret = do_save_excl(fd, strtoul(argv[3], NULL, 0));
+	} else if (!strcmp(verb, "track")) {
+		ret = do_set_tracked(fd, strtoul(argv[3], NULL, 0), 1);
+	} else if (!strcmp(verb, "untrack")) {
+		ret = do_set_tracked(fd, strtoul(argv[3], NULL, 0), 0);
 	} else {
 		usage(argv[0]);
 		ret = 2;

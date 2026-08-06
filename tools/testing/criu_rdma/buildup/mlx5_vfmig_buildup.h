@@ -2,17 +2,19 @@
 /*
  * Vendored mlx5_vfmig UAPI for the build-up harness.
  *
- * This tracks the *incrementally upstreamed* vfmig ioctl surface (the
- * vfmig-rebase-0 series), which is intentionally a strict subset of the
- * oracle's full include/uapi/linux/mlx5_vfmig.h. It is vendored here --
- * rather than including the in-tree header -- precisely because the two
- * diverge: e.g. the build-up QUERY_VF struct is smaller than the
- * oracle's (no tracked / vf_uuid fields), so its _IOWR command number
- * differs and only this definition is wire-compatible with a kernel
- * built from the build-up branch.
+ * This tracks the *incrementally upstreamed* vfmig ioctl surface, which
+ * is intentionally a subset of the oracle's full
+ * include/uapi/linux/mlx5_vfmig.h. It is vendored here -- rather than
+ * including the in-tree header -- because the two can diverge in struct
+ * layout, and only a definition whose sizeof() matches the running
+ * kernel's is wire-compatible (the _IOWR command number encodes the
+ * struct size).
  *
  * Grow this header one command at a time, in lockstep with the kernel
  * milestones, so `mlx5_vfmig_min` always matches the surface it probes.
+ * As of the deterministic-IOVA tracking milestone, QUERY_VF carries the
+ * @tracked and @vf_uuid fields (matching the in-tree struct byte for
+ * byte) and SET_TRACKED (0x07) is present.
  */
 
 #ifndef _MLX5_VFMIG_BUILDUP_H
@@ -45,7 +47,9 @@ struct mlx5_vfmig_query_vf {
 	__u32 num_vfs;		/* out */
 	__u16 vhca_id;		/* out */
 	__u8  restored;		/* out */
-	__u8  reserved;
+	__u8  tracked;		/* out: 1 if a vfmig IOVA domain is attached */
+	__u8  vf_uuid[16];	/* out: orchestrator UUID, all-zeros if unset */
+	__u8  reserved_out[8];	/* out: zeroed */
 };
 
 #define MLX5_VFMIG_IOC_QUERY_VF \
@@ -58,6 +62,22 @@ struct mlx5_vfmig_enable_migratable {
 
 #define MLX5_VFMIG_IOC_ENABLE_MIGRATABLE \
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x06, struct mlx5_vfmig_enable_migratable)
+
+/*
+ * SET_TRACKED: with @enable=1 the driver attaches an unmanaged paging
+ * iommu_domain to VF @vf_id, staking out a deterministic per-VF IOVA
+ * window; @enable=0 detaches and frees it. The VF must be unbound. See
+ * QUERY_VF.@tracked for the resulting state.
+ */
+struct mlx5_vfmig_set_tracked {
+	__u32 vf_id;		/* in  */
+	__u32 enable;		/* in: 0 = untrack, 1 = track */
+	__u32 flags;		/* in: reserved, must be 0 */
+	__u32 reserved;		/* in: reserved, must be 0 */
+};
+
+#define MLX5_VFMIG_IOC_SET_TRACKED \
+	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x07, struct mlx5_vfmig_set_tracked)
 
 #define MLX5_VFMIG_DIR_FLAG_INITIATOR	0x1u
 #define MLX5_VFMIG_DIR_FLAG_RESPONDER	0x2u
