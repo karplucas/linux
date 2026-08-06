@@ -781,6 +781,26 @@ void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 	mutex_unlock(&dom->lock);
 }
 
+int vfmig_iova_for_each(struct vfmig_iova_domain *dom,
+			vfmig_iova_for_each_fn cb, void *ctx)
+{
+	struct vfmig_iova_page *p;
+	int ret = 0;
+
+	if (!dom || !cb)
+		return -EINVAL;
+
+	mutex_lock(&dom->lock);
+	list_for_each_entry(p, &dom->pages, node) {
+		ret = cb(p->slot, p->instance_key, p->iova, p->vaddr,
+			 p->len, ctx);
+		if (ret)
+			break;
+	}
+	mutex_unlock(&dom->lock);
+	return ret;
+}
+
 int vfmig_iova_transient_get(struct vfmig_iova_domain *dom,
 			     size_t size, gfp_t gfp,
 			     void **vaddr_out, dma_addr_t *iova_out)
