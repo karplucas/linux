@@ -130,9 +130,20 @@ enum vfmig_iova_slot {
 #define VFMIG_IOVA_NR_SLOTS	((unsigned int)VFMIG_SLOT_NR)
 #define VFMIG_IOVA_SLOT_BYTES	(510ULL << 20)	/* 510 MiB, fixed */
 
+/*
+ * Transient sub-window: the topmost slice of each VF's IOVA window,
+ * reserved for vfmig_iova_transient_get/put (short-lived, freelist-
+ * recycled, single-page allocations -- cmd mailbox blocks). Sized to
+ * hold the worst-case cmd-mailbox-cache footprint (~3900 pages); 16 MiB
+ * == 4096 pages leaves headroom. It sits above the deterministic slot
+ * range and must not overlap it (see static_assert below).
+ */
+#define VFMIG_IOVA_TRANSIENT_BYTES	(16ULL << 20)	/* 16 MiB */
+
 static_assert(VFMIG_IOVA_PER_VF >
-	      (u64)VFMIG_IOVA_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES,
-	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: must fit all fixed 510-MiB slots");
+	      (u64)VFMIG_IOVA_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES +
+	      VFMIG_IOVA_TRANSIENT_BYTES,
+	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: must fit all fixed 510-MiB slots + the transient arena");
 static_assert(VFMIG_IOVA_SLOT_BYTES >= (8ULL << 20),
 	      "VFMIG_IOVA_SLOT_BYTES must be >= 8 MiB to host worst-case kernel allocations");
 
@@ -204,6 +215,33 @@ void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
 			  enum vfmig_iova_slot slot,
 			  dma_addr_t iova, size_t size);
 
+/*
+ * Allocate a single transient page from @dom's transient arena (the top
+ * of the per-VF window). Transient allocations are short-lived, single
+ * page (@size must be <= PAGE_SIZE), freelist-recycled, and -- unlike
+ * slot allocations -- do NOT have a deterministic IOVA: they never
+ * appear in a SAVE blob. Intended for the cmd mailbox block cache.
+ *
+ * @gfp:	must not include __GFP_HIGHMEM/COMP/DMA/DMA32.
+ * @vaddr_out:	kernel-virtual base of the page.
+ * @iova_out:	IOVA the firmware will see.
+ *
+ * Returns 0 on success, -ENOMEM if the arena is exhausted, -EINVAL on a
+ * bad argument, or a negative errno from the page allocator / iommu core.
+ */
+int  vfmig_iova_transient_get(struct vfmig_iova_domain *dom,
+			      size_t size, gfp_t gfp,
+			      void **vaddr_out, dma_addr_t *iova_out);
+
+/*
+ * Return a page previously handed out by vfmig_iova_transient_get() to
+ * the arena freelist (the mapping stays installed for reuse). @iova must
+ * be an arena IOVA and @size <= PAGE_SIZE. Safe with @dom == NULL; logs
+ * a warning on an out-of-range IOVA or a double free.
+ */
+void vfmig_iova_transient_put(struct vfmig_iova_domain *dom,
+			      dma_addr_t iova, size_t size);
+
 #else /* !CONFIG_MLX5_VFMIG */
 
 /*
@@ -226,6 +264,20 @@ static inline void
 vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
 		     enum vfmig_iova_slot slot,
 		     dma_addr_t iova, size_t size)
+{
+}
+
+static inline int
+vfmig_iova_transient_get(struct vfmig_iova_domain *dom,
+			 size_t size, gfp_t gfp,
+			 void **vaddr_out, dma_addr_t *iova_out)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void
+vfmig_iova_transient_put(struct vfmig_iova_domain *dom,
+			 dma_addr_t iova, size_t size)
 {
 }
 

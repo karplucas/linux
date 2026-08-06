@@ -42,11 +42,60 @@ struct vfmig_iova_page {
 };
 
 /*
+ * Maximum number of pages the per-VF transient arena can grow to.
+ * Sized from VFMIG_IOVA_TRANSIENT_BYTES; fixed at compile time so the
+ * arena's by-index slot table can be a flat array.
+ */
+#define VFMIG_IOVA_TRANSIENT_MAX_PAGES \
+	(VFMIG_IOVA_TRANSIENT_BYTES / PAGE_SIZE)
+
+/*
+ * One backing page in the transient arena. Lives in one of two states:
+ * on dom->transient.free (available for the next transient_get) or off
+ * the list with arena->slots[idx] still pointing at it (handed out).
+ *
+ * The IOMMU mapping is set up exactly once when the page is first grown
+ * into the arena; transient_get/put never call iommu_map / iommu_unmap
+ * on the hot path. Pages are only unmapped at domain_destroy time.
+ */
+struct vfmig_transient_page {
+	struct list_head free_node;	/* on arena->free when free */
+	u64		 iova;
+	void		*vaddr;
+	struct page	*page;
+};
+
+/*
+ * Per-domain transient arena: the topmost VFMIG_IOVA_TRANSIENT_BYTES of
+ * the per-VF IOVA window, [base, end) with end == dom->base + PER_VF.
+ * Lazily populated: pages are mapped from the cursor on the first _get()
+ * that finds the freelist empty, up to VFMIG_IOVA_TRANSIENT_MAX_PAGES.
+ * Once mapped, pages stay mapped for the lifetime of the domain and are
+ * recycled via the freelist. Protected by dom->lock.
+ *
+ * The arena backs short-lived, single-page, non-migrated allocations
+ * (cmd mailbox blocks): IOVAs here are never recorded in the SAVE
+ * manifest and need no source/destination determinism.
+ */
+struct vfmig_transient_arena {
+	u64		 base;
+	u64		 end;
+	u64		 cursor;	/* next IOVA to map on grow */
+	struct list_head free;		/* of vfmig_transient_page */
+	struct vfmig_transient_page **slots;	/* by-index lookup */
+	unsigned int	 n_mapped;	/* total pages currently mapped */
+	unsigned int	 n_free;	/* len of @free, for diagnostics */
+	unsigned int	 max_pages;	/* arena ceiling, in pages */
+};
+
+/*
  * A per-VF unmanaged paging domain the PF driver fully owns, attached
  * in place of the VF's default DMA domain. @vf_pdev is pinned for the
  * domain's lifetime; @vf_id derives the IOVA window and labels log
  * lines. The deterministic range [base, base + NR_SLOTS * SLOT_BYTES)
- * is partitioned across the slot windows.
+ * is partitioned across the slot windows; the topmost
+ * VFMIG_IOVA_TRANSIENT_BYTES of the per-VF window is the transient
+ * arena (cmd mailboxes).
  */
 struct vfmig_iova_domain {
 	struct iommu_domain *iommu_dom;
@@ -87,6 +136,8 @@ struct vfmig_iova_domain {
 
 	struct list_head     pages;	/* of vfmig_iova_page, sorted */
 	unsigned int	     n_pages;
+
+	struct vfmig_transient_arena transient;
 };
 
 static inline u64
@@ -229,6 +280,84 @@ vfmig_iova_destroy_page_locked(struct vfmig_iova_domain *dom,
 	kfree(p);
 }
 
+/* -------- transient arena ----------------------------------------------- */
+
+/*
+ * dom->lock held. Grow the arena by one page: alloc_pages, iommu_map at
+ * the next cursor IOVA, install in slots[], return the new descriptor
+ * (NOT on the freelist; caller hands it to its requester directly).
+ */
+static struct vfmig_transient_page *
+vfmig_transient_grow_locked(struct vfmig_iova_domain *dom, gfp_t gfp)
+{
+	struct vfmig_transient_arena *a = &dom->transient;
+	struct vfmig_transient_page *tp;
+	unsigned int idx;
+	int err;
+
+	if (a->n_mapped >= a->max_pages)
+		return ERR_PTR(-ENOMEM);
+
+	tp = kzalloc(sizeof(*tp), gfp);
+	if (!tp)
+		return ERR_PTR(-ENOMEM);
+	INIT_LIST_HEAD(&tp->free_node);	/* enables list_empty() double-free
+					 * detection in transient_put() */
+
+	tp->page = alloc_pages(gfp | __GFP_ZERO, 0);
+	if (!tp->page) {
+		kfree(tp);
+		return ERR_PTR(-ENOMEM);
+	}
+	tp->vaddr = page_address(tp->page);
+	tp->iova  = a->cursor;
+
+	err = iommu_map(dom->iommu_dom, tp->iova, page_to_phys(tp->page),
+			PAGE_SIZE, IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE,
+			gfp);
+	if (err) {
+		__free_pages(tp->page, 0);
+		kfree(tp);
+		return ERR_PTR(err);
+	}
+
+	idx = (tp->iova - a->base) >> PAGE_SHIFT;
+	a->slots[idx] = tp;
+	a->cursor    += PAGE_SIZE;
+	a->n_mapped++;
+
+	return tp;
+}
+
+/*
+ * dom->lock held. Tear down every page in the transient arena: walk
+ * arena->slots[], iommu_unmap each mapped page, free the backing page
+ * and the bookkeeping. Drains via slots[] rather than the freelist so a
+ * leaked (never _put()) page is still torn down. Does not free the
+ * slots[] array itself (the caller does).
+ */
+static void vfmig_transient_drain_locked(struct vfmig_iova_domain *dom)
+{
+	struct vfmig_transient_arena *a = &dom->transient;
+	unsigned int i;
+
+	if (!a->slots)
+		return;
+	for (i = 0; i < a->max_pages; i++) {
+		struct vfmig_transient_page *tp = a->slots[i];
+
+		if (!tp)
+			continue;
+		(void)iommu_unmap(dom->iommu_dom, tp->iova, PAGE_SIZE);
+		__free_pages(tp->page, 0);
+		kfree(tp);
+		a->slots[i] = NULL;
+	}
+	INIT_LIST_HEAD(&a->free);
+	a->n_mapped = 0;
+	a->n_free   = 0;
+}
+
 /* -------- exported API -------------------------------------------------- */
 
 int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
@@ -269,6 +398,26 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 		dom->cursor[s] = vfmig_iova_slot_base(dom,
 						      (enum vfmig_iova_slot)s);
 
+	/*
+	 * Transient arena owns the topmost VFMIG_IOVA_TRANSIENT_BYTES of the
+	 * per-VF window, [base + PER_VF - TRANSIENT_BYTES, base + PER_VF).
+	 * The static_assert in vfmig_iova.h guarantees it does not overlap
+	 * the deterministic slot range. Pages are mapped lazily on demand.
+	 */
+	INIT_LIST_HEAD(&dom->transient.free);
+	dom->transient.base      = base + VFMIG_IOVA_PER_VF -
+				   VFMIG_IOVA_TRANSIENT_BYTES;
+	dom->transient.end       = base + VFMIG_IOVA_PER_VF;
+	dom->transient.cursor    = dom->transient.base;
+	dom->transient.max_pages = VFMIG_IOVA_TRANSIENT_MAX_PAGES;
+	dom->transient.slots = kcalloc(dom->transient.max_pages,
+				       sizeof(*dom->transient.slots),
+				       GFP_KERNEL);
+	if (!dom->transient.slots) {
+		err = -ENOMEM;
+		goto err_free_dom;
+	}
+
 	idom = iommu_paging_domain_alloc(&vf_pdev->dev);
 	if (IS_ERR(idom)) {
 		err = PTR_ERR(idom);
@@ -286,20 +435,20 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	}
 
 	/*
-	 * Validate that the deterministic IOVA window fits inside the
-	 * IOMMU's geometry aperture. The underlying iommu driver picks
-	 * aperture_end from the hardware address width (e.g. 39 bits on
-	 * some Intel VT-d), and iommu_map() returns -ERANGE for any IOVA
-	 * outside it. Catch the mismatch here so the failure surfaces at
-	 * "set_tracked enable=1" with a printed reason rather than deep
-	 * inside a later cmd-ring DMA.
+	 * Validate that the full IOVA window (deterministic slots +
+	 * transient arena) fits inside the IOMMU's geometry aperture. The
+	 * underlying iommu driver picks aperture_end from the hardware
+	 * address width (e.g. 39 bits on some Intel VT-d), and iommu_map()
+	 * returns -ERANGE for any IOVA outside it. Catch the mismatch here
+	 * so the failure surfaces at "set_tracked enable=1" with a printed
+	 * reason rather than deep inside a later cmd-ring DMA.
 	 */
 	det_end = base + (u64)VFMIG_IOVA_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES;
 	if (dom->base < dom->iommu_dom->geometry.aperture_start ||
-	    det_end - 1 > dom->iommu_dom->geometry.aperture_end) {
+	    dom->transient.end - 1 > dom->iommu_dom->geometry.aperture_end) {
 		dev_warn(&vf_pdev->dev,
 			 "vfmig_iova: vf %u IOVA window [0x%llx, 0x%llx) does not fit IOMMU aperture [0x%llx, 0x%llx]\n",
-			 vf_id, dom->base, det_end,
+			 vf_id, dom->base, dom->transient.end,
 			 dom->iommu_dom->geometry.aperture_start,
 			 dom->iommu_dom->geometry.aperture_end);
 		err = -EOPNOTSUPP;
@@ -309,9 +458,10 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	dom->vf_pdev = pci_dev_get(vf_pdev);
 
 	dev_info(&vf_pdev->dev,
-		 "vfmig_iova: vf %u domain attached, IOVA window [0x%llx, 0x%llx) (%u slots x 0x%llx) within IOMMU aperture [0x%llx, 0x%llx]\n",
+		 "vfmig_iova: vf %u domain attached, IOVA window [0x%llx, 0x%llx) (%u slots x 0x%llx) + [0x%llx, 0x%llx) (transient) within IOMMU aperture [0x%llx, 0x%llx]\n",
 		 vf_id, dom->base, det_end,
 		 VFMIG_IOVA_NR_SLOTS, (u64)VFMIG_IOVA_SLOT_BYTES,
+		 dom->transient.base, dom->transient.end,
 		 dom->iommu_dom->geometry.aperture_start,
 		 dom->iommu_dom->geometry.aperture_end);
 
@@ -323,6 +473,7 @@ err_detach:
 err_free_idom:
 	iommu_domain_free(dom->iommu_dom);
 err_free_dom:
+	kfree(dom->transient.slots);
 	mutex_destroy(&dom->lock);
 	kfree(dom);
 	return err;
@@ -384,6 +535,7 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 	vf_pdev = dom->vf_pdev;
 
 	mutex_lock(&dom->lock);
+	vfmig_transient_drain_locked(dom);
 	list_for_each_entry_safe(p, tmp, &dom->pages, node) {
 		list_del(&p->node);
 		vfmig_iova_destroy_page_locked(dom, p);
@@ -411,6 +563,7 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 	if (vf_pdev)
 		pci_dev_put(vf_pdev);
 
+	kfree(dom->transient.slots);
 	mutex_destroy(&dom->lock);
 	kfree(dom);
 }
@@ -506,5 +659,110 @@ void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
 	vfmig_iova_destroy_page_locked(dom, p);
 
 out_unlock:
+	mutex_unlock(&dom->lock);
+}
+
+int vfmig_iova_transient_get(struct vfmig_iova_domain *dom,
+			     size_t size, gfp_t gfp,
+			     void **vaddr_out, dma_addr_t *iova_out)
+{
+	struct vfmig_transient_arena *a;
+	struct vfmig_transient_page *tp;
+	int err;
+
+	if (!dom || !vaddr_out || !iova_out || size == 0)
+		return -EINVAL;
+
+	if (size > PAGE_SIZE) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: transient_get(size=%zu) > PAGE_SIZE not supported\n",
+				     size);
+		return -EINVAL;
+	}
+
+	if (gfp & (__GFP_COMP | __GFP_DMA | __GFP_DMA32 | __GFP_HIGHMEM)) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: transient_get: rejected gfp 0x%x (must not include __GFP_HIGHMEM/COMP/DMA/DMA32)\n",
+				     gfp);
+		return -EINVAL;
+	}
+
+	a = &dom->transient;
+	mutex_lock(&dom->lock);
+
+	tp = list_first_entry_or_null(&a->free,
+				      struct vfmig_transient_page, free_node);
+	if (tp) {
+		/*
+		 * list_del_init() so list_empty(&tp->free_node) is true
+		 * while @tp is out with the caller; _put() uses that for
+		 * double-free detection.
+		 */
+		list_del_init(&tp->free_node);
+		a->n_free--;
+	} else {
+		tp = vfmig_transient_grow_locked(dom, gfp);
+		if (IS_ERR(tp)) {
+			err = PTR_ERR(tp);
+			mutex_unlock(&dom->lock);
+			return err;
+		}
+	}
+
+	*iova_out  = tp->iova;
+	*vaddr_out = tp->vaddr;
+	mutex_unlock(&dom->lock);
+	return 0;
+}
+
+void vfmig_iova_transient_put(struct vfmig_iova_domain *dom,
+			      dma_addr_t iova, size_t size)
+{
+	struct vfmig_transient_arena *a;
+	struct vfmig_transient_page *tp;
+	unsigned int idx;
+
+	if (!dom)
+		return;
+
+	a = &dom->transient;
+	if ((u64)iova < a->base || (u64)iova >= a->end ||
+	    !IS_ALIGNED((u64)iova, PAGE_SIZE)) {
+		dev_warn(&dom->vf_pdev->dev,
+			 "vfmig_iova: transient_put: IOVA 0x%llx outside arena [0x%llx, 0x%llx) or unaligned\n",
+			 (u64)iova, a->base, a->end);
+		return;
+	}
+	if (size > PAGE_SIZE) {
+		dev_warn(&dom->vf_pdev->dev,
+			 "vfmig_iova: transient_put: size=%zu > PAGE_SIZE\n",
+			 size);
+		return;
+	}
+
+	idx = ((u64)iova - a->base) >> PAGE_SHIFT;
+
+	mutex_lock(&dom->lock);
+	tp = a->slots[idx];
+	if (!tp) {
+		mutex_unlock(&dom->lock);
+		dev_warn(&dom->vf_pdev->dev,
+			 "vfmig_iova: transient_put: IOVA 0x%llx never allocated\n",
+			 (u64)iova);
+		return;
+	}
+	if (WARN_ON_ONCE(tp->iova != (u64)iova)) {
+		mutex_unlock(&dom->lock);
+		return;
+	}
+	if (!list_empty(&tp->free_node)) {
+		mutex_unlock(&dom->lock);
+		dev_warn(&dom->vf_pdev->dev,
+			 "vfmig_iova: transient_put: double-free of IOVA 0x%llx\n",
+			 (u64)iova);
+		return;
+	}
+	list_add(&tp->free_node, &a->free);
+	a->n_free++;
 	mutex_unlock(&dom->lock);
 }
