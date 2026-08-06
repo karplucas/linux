@@ -40,6 +40,7 @@
 #include <linux/mlx5/driver.h>
 
 #include "mlx5_core.h"
+#include "vfmig/vfmig_iova.h"
 
 struct mlx5_db_pgdir {
 	struct list_head	list;
@@ -52,14 +53,54 @@ struct mlx5_db_pgdir {
  * register it in a memory region at HCA virtual address 0.
  */
 
+/*
+ * Slot-aware DMA-coherent allocation helper.
+ *
+ * On a tracked VF, coherent host buffers must be routed through the
+ * per-VF deterministic IOVA allocator: attaching our unmanaged IOMMU
+ * domain displaces the device's dma-iommu default domain, so
+ * dma_alloc_coherent() would hand back IOVAs that don't translate in
+ * the actually-attached domain and FW would fault on first access. The
+ * @slot argument selects which per-VF IOVA sub-window to draw from, so
+ * adding/removing allocations in one consumer category cannot shift the
+ * IOVAs of another.
+ *
+ * @slot == VFMIG_SLOT_INVALID means "not yet converted to a per-purpose
+ * slot": such callers keep the legacy dma_alloc_coherent path even on a
+ * tracked VF (where it fails, which is the intended gate until the
+ * caller is routed in a later change). On an untracked VF / PF
+ * (vfmig_dom == NULL) @slot is ignored and the legacy path runs
+ * unchanged.
+ */
 static void *mlx5_dma_zalloc_coherent_node(struct mlx5_core_dev *dev,
 					   size_t size, dma_addr_t *dma_handle,
-					   int node)
+					   int node,
+					   enum vfmig_iova_slot slot)
 {
+	struct vfmig_iova_domain *vfmig_dom = dev->cmd.vfmig_iova_dom;
 	struct device *device = mlx5_core_dma_dev(dev);
 	struct mlx5_priv *priv = &dev->priv;
 	int original_node;
 	void *cpu_handle;
+
+	if (vfmig_dom && slot != VFMIG_SLOT_INVALID) {
+		dma_addr_t iova;
+		void *vaddr;
+		int err;
+
+		err = vfmig_iova_alloc_slot(vfmig_dom, slot,
+					    /*instance_key=*/0, size,
+					    GFP_KERNEL, &iova, &vaddr);
+		if (err) {
+			mlx5_core_warn(dev,
+				       "vfmig: dma_zalloc_coherent_node: vfmig_iova_alloc_slot(slot=%u, size=%zu): %d\n",
+				       slot, size, err);
+			return NULL;
+		}
+		memset(vaddr, 0, size);
+		*dma_handle = iova;
+		return vaddr;
+	}
 
 	mutex_lock(&priv->alloc_mutex);
 	original_node = dev_to_node(device);
@@ -71,14 +112,46 @@ static void *mlx5_dma_zalloc_coherent_node(struct mlx5_core_dev *dev,
 	return cpu_handle;
 }
 
-int mlx5_frag_buf_alloc_node(struct mlx5_core_dev *dev, int size,
-			     struct mlx5_frag_buf *buf, int node)
+/*
+ * Symmetric release helper for mlx5_dma_zalloc_coherent_node(). @slot
+ * must match the alloc-time slot; callers remember it via the
+ * surrounding struct (mlx5_frag_buf::vfmig_slot) or a hard-coded
+ * literal. INVALID / untracked frees fall through to
+ * dma_free_coherent, matching the alloc-time branching.
+ */
+static void mlx5_dma_free_coherent_node(struct mlx5_core_dev *dev,
+					size_t size, void *cpu_handle,
+					dma_addr_t dma_handle,
+					enum vfmig_iova_slot slot)
+{
+	struct vfmig_iova_domain *vfmig_dom = dev->cmd.vfmig_iova_dom;
+
+	if (vfmig_dom && slot != VFMIG_SLOT_INVALID) {
+		vfmig_iova_free_slot(vfmig_dom, slot, dma_handle, size);
+		return;
+	}
+	dma_free_coherent(mlx5_core_dma_dev(dev), size, cpu_handle,
+			  dma_handle);
+}
+
+/*
+ * Slot-aware variant of mlx5_frag_buf_alloc_node, used by in-tree
+ * mlx5_core call sites (eq.c, wq.c) to route the backing pages into a
+ * per-purpose vfmig IOVA slot. The chosen slot is stamped onto @buf so
+ * the symmetric mlx5_frag_buf_free routes the free back to the same
+ * slot without an exported-ABI change visible to mlx5_ib /
+ * vfio_pci_mlx5 / vdpa.
+ */
+int mlx5_frag_buf_alloc_node_slot(struct mlx5_core_dev *dev, int size,
+				  struct mlx5_frag_buf *buf, int node,
+				  enum vfmig_iova_slot slot)
 {
 	int i;
 
 	buf->size = size;
 	buf->npages = DIV_ROUND_UP(size, PAGE_SIZE);
 	buf->page_shift = PAGE_SHIFT;
+	buf->vfmig_slot = (u8)slot;
 	buf->frags = kcalloc(buf->npages, sizeof(struct mlx5_buf_list),
 			     GFP_KERNEL);
 	if (!buf->frags)
@@ -89,12 +162,14 @@ int mlx5_frag_buf_alloc_node(struct mlx5_core_dev *dev, int size,
 		int frag_sz = min_t(int, size, PAGE_SIZE);
 
 		frag->buf = mlx5_dma_zalloc_coherent_node(dev, frag_sz,
-							  &frag->map, node);
+							  &frag->map, node,
+							  slot);
 		if (!frag->buf)
 			goto err_free_buf;
 		if (frag->map & ((1 << buf->page_shift) - 1)) {
-			dma_free_coherent(mlx5_core_dma_dev(dev), frag_sz,
-					  buf->frags[i].buf, buf->frags[i].map);
+			mlx5_dma_free_coherent_node(dev, frag_sz,
+						    buf->frags[i].buf,
+						    buf->frags[i].map, slot);
 			mlx5_core_warn(dev, "unexpected map alignment: %pad, page_shift=%d\n",
 				       &frag->map, buf->page_shift);
 			goto err_free_buf;
@@ -106,24 +181,39 @@ int mlx5_frag_buf_alloc_node(struct mlx5_core_dev *dev, int size,
 
 err_free_buf:
 	while (i--)
-		dma_free_coherent(mlx5_core_dma_dev(dev), PAGE_SIZE, buf->frags[i].buf,
-				  buf->frags[i].map);
+		mlx5_dma_free_coherent_node(dev, PAGE_SIZE, buf->frags[i].buf,
+					    buf->frags[i].map, slot);
 	kfree(buf->frags);
 err_out:
 	return -ENOMEM;
+}
+
+/*
+ * Backward-compat wrapper preserving the exported ABI used by mlx5_ib /
+ * vfio_pci_mlx5 / vdpa. These callers have not been converted to a
+ * per-purpose slot, so they route through VFMIG_SLOT_INVALID (legacy
+ * dma_alloc_coherent path). In-tree mlx5_core code should call
+ * mlx5_frag_buf_alloc_node_slot directly with a per-purpose slot.
+ */
+int mlx5_frag_buf_alloc_node(struct mlx5_core_dev *dev, int size,
+			     struct mlx5_frag_buf *buf, int node)
+{
+	return mlx5_frag_buf_alloc_node_slot(dev, size, buf, node,
+					     VFMIG_SLOT_INVALID);
 }
 EXPORT_SYMBOL_GPL(mlx5_frag_buf_alloc_node);
 
 void mlx5_frag_buf_free(struct mlx5_core_dev *dev, struct mlx5_frag_buf *buf)
 {
+	enum vfmig_iova_slot slot = buf->vfmig_slot;
 	int size = buf->size;
 	int i;
 
 	for (i = 0; i < buf->npages; i++) {
 		int frag_sz = min_t(int, size, PAGE_SIZE);
 
-		dma_free_coherent(mlx5_core_dma_dev(dev), frag_sz, buf->frags[i].buf,
-				  buf->frags[i].map);
+		mlx5_dma_free_coherent_node(dev, frag_sz, buf->frags[i].buf,
+					    buf->frags[i].map, slot);
 		size -= frag_sz;
 	}
 	kfree(buf->frags);
@@ -149,7 +239,8 @@ static struct mlx5_db_pgdir *mlx5_alloc_db_pgdir(struct mlx5_core_dev *dev,
 	bitmap_fill(pgdir->bitmap, db_per_page);
 
 	pgdir->db_page = mlx5_dma_zalloc_coherent_node(dev, PAGE_SIZE,
-						       &pgdir->db_dma, node);
+						       &pgdir->db_dma, node,
+						       VFMIG_SLOT_INVALID);
 	if (!pgdir->db_page) {
 		bitmap_free(pgdir->bitmap);
 		kfree(pgdir);
