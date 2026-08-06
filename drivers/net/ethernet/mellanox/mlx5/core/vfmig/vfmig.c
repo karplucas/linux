@@ -1919,7 +1919,7 @@ struct mlx5_vfmig_load_ctx {
 	u64  hp_seen;
 	u32  manifest_crc_want;
 	u32  manifest_crc_have;
-	bool records_finalized;		/* manifest CRC verified (once) */
+	bool records_finalized;		/* CRC verified + drift armed (once) */
 	bool cursor_reset_done;		/* reset_cursor called at release (once) */
 
 	/*
@@ -2063,8 +2063,8 @@ err_pages:
 /*
  * Once every HOST_PAGE record the STREAM_HEADER promised has been
  * replayed, verify the running manifest CRC matches what the source
- * pinned. Latched by @records_finalized; a no-op until
- * hp_seen == hp_expected.
+ * pinned and arm at-probe drift detection. Latched by @records_finalized;
+ * a no-op until hp_seen == hp_expected.
  */
 static int vfmig_load_maybe_finalize_records(struct mlx5_vfmig_load_ctx *ctx)
 {
@@ -2080,6 +2080,7 @@ static int vfmig_load_maybe_finalize_records(struct mlx5_vfmig_load_ctx *ctx)
 			       ctx->manifest_crc_want);
 		return -EPROTO;
 	}
+	vfmig_iova_arm_drift_detection(ctx->iova_dom);
 	ctx->records_finalized = true;
 	return 0;
 }
@@ -2343,6 +2344,8 @@ static int vfmig_load_step(struct mlx5_vfmig_load_ctx *ctx,
 					       ctx->manifest_crc_want);
 				return -EPROTO;
 			}
+			if (ctx->iova_dom)
+				vfmig_iova_arm_drift_detection(ctx->iova_dom);
 			ctx->records_finalized = true;
 		}
 
