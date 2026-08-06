@@ -198,24 +198,34 @@ err_out:
 
 /*
  * Backward-compat wrapper preserving the exported ABI used by mlx5_ib /
- * vfio_pci_mlx5 / vdpa. These callers have not been converted to a
- * per-purpose slot, so they route through VFMIG_SLOT_INVALID (legacy
- * dma_alloc_coherent path). In-tree mlx5_core code should call
+ * vfio_pci_mlx5 / vdpa. These callers are not converted to a
+ * per-purpose slot, so they route through the legacy DMA_COHERENT
+ * catch-all. In-tree mlx5_core code should call
  * mlx5_frag_buf_alloc_node_slot directly with a per-purpose slot.
  */
 int mlx5_frag_buf_alloc_node(struct mlx5_core_dev *dev, int size,
 			     struct mlx5_frag_buf *buf, int node)
 {
 	return mlx5_frag_buf_alloc_node_slot(dev, size, buf, node,
-					     VFMIG_SLOT_INVALID);
+					     VFMIG_SLOT_DMA_COHERENT);
 }
 EXPORT_SYMBOL_GPL(mlx5_frag_buf_alloc_node);
 
 void mlx5_frag_buf_free(struct mlx5_core_dev *dev, struct mlx5_frag_buf *buf)
 {
-	enum vfmig_iova_slot slot = buf->vfmig_slot;
+	enum vfmig_iova_slot slot;
 	int size = buf->size;
 	int i;
+
+	/*
+	 * Coerce a zero-init slot back to DMA_COHERENT so an
+	 * external-module caller that did not go through the slot-aware
+	 * alloc still routes its free into a non-INVALID slot. The
+	 * vfmig_iova_free_slot() path WARN_ON_ONCEs on INVALID -- correct
+	 * for a kernel bug but a confusing splat for the legitimate
+	 * "external module zero-init" case.
+	 */
+	slot = buf->vfmig_slot ? buf->vfmig_slot : VFMIG_SLOT_DMA_COHERENT;
 
 	for (i = 0; i < buf->npages; i++) {
 		int frag_sz = min_t(int, size, PAGE_SIZE);
