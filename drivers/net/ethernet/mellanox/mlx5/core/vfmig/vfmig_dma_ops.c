@@ -35,8 +35,8 @@
  * Routing (this patch)
  * --------------------
  *   - .alloc / .free        -> kcoherent arena (dma_alloc_coherent).
- *   - .map_phys/.unmap_phys -> streaming maps, deferred: fail cleanly
- *                              until the map_phys routing lands.
+ *   - .map_phys/.unmap_phys -> kcoherent arena, registry-less streaming
+ *                              maps (dma_map_page/single).
  *   - .map_sg / .unmap_sg   -> migration-tracked USER_PAGE registry,
  *                              deferred: fail cleanly until it lands.
  *   - .sync_* / .dma_supported / .get_required_mask are final.
@@ -186,24 +186,88 @@ static void vfmig_kcoherent_drain(struct device *dev,
 	priv->n_pages = 0;
 }
 
+/*
+ * Map @aligned bytes of caller-owned, page-aligned @phys into the arena
+ * at a fresh bump IOVA. Registry-less: streaming maps are high-rate and
+ * their IOVAs are never migrated, so there is no per-map tracking node
+ * (unmap is by range). Returns 0 and *@iova_out, or a negative errno.
+ */
+static int vfmig_kcoherent_map_phys(struct vfmig_dma_ops_priv *priv,
+				    phys_addr_t phys, size_t aligned,
+				    gfp_t gfp, u64 *iova_out)
+{
+	gfp_t gfp_iommu;
+	u64 iova;
+	int err;
+
+	if (!IS_ALIGNED(phys, PAGE_SIZE))
+		return -EINVAL;
+
+	/*
+	 * Strip flags iommu_map rejects; keep the atomicity bits since
+	 * streaming callers frequently map from softirq with GFP_ATOMIC.
+	 * No __GFP_ZERO: @phys is caller-owned and already populated.
+	 */
+	gfp_iommu = gfp & ~(__GFP_HIGHMEM | __GFP_COMP |
+			    __GFP_DMA | __GFP_DMA32);
+
+	iova = vfmig_kcoherent_reserve(priv, aligned);
+	if (iova == U64_MAX)
+		return -ENOSPC;
+
+	err = iommu_map(priv->iommu_dom, iova, phys, aligned,
+			IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, gfp_iommu);
+	if (err)
+		return err;	/* iova leaks; bump-only arena */
+
+	*iova_out = iova;
+	return 0;
+}
+
 /* -------- dma_map_ops callbacks ----------------------------------------- */
 
 /*
  * dma_map_phys / dma_map_single / dma_map_page land here. On a tracked
- * VF these are mlx5e's streaming RX/TX buffers, which route to the
- * kcoherent arena. That routing lands in a follow-up patch; until then
- * fail cleanly rather than install a mapping the hardware can't see via
- * the (now-detached) default dma-iommu path.
+ * VF these are mlx5e's streaming RX/TX buffers (page_pool dma_map_page
+ * per RX buffer, dma_map_single per TX skb fragment). Route to the
+ * kcoherent arena: the IOVA is not migrated (the destination re-maps
+ * fresh) and the bump path is O(1), which matters because ndo_open
+ * posts thousands of RX WQEs in tight succession.
+ *
+ * DMA_ATTR_MMIO marks a peer-to-peer mapping of MMIO BAR space rather
+ * than system memory; its IOVA isn't reconstructible across hosts (BAR
+ * bases differ), so reject it rather than map something un-migratable.
  */
 static dma_addr_t vfmig_dma_ops_map_phys(struct device *dev, phys_addr_t phys,
 					 size_t size,
 					 enum dma_data_direction dir,
 					 unsigned long attrs)
 {
-	dev_warn_ratelimited(dev,
-			     "vfmig_dma_ops: map_phys(0x%llx, %zu) on tracked VF not routed yet (follow-up)\n",
-			     (u64)phys, size);
-	return DMA_MAPPING_ERROR;
+	struct vfmig_dma_ops_priv *priv = vfmig_dma_ops_priv_get(dev);
+	unsigned int off;
+	u64 iova;
+	int err;
+
+	if (unlikely(!priv))
+		return DMA_MAPPING_ERROR;
+
+	if (attrs & DMA_ATTR_MMIO) {
+		dev_warn_ratelimited(dev,
+				     "vfmig_dma_ops: map_phys with DMA_ATTR_MMIO not supported (peer-to-peer dma-buf out of scope)\n");
+		return DMA_MAPPING_ERROR;
+	}
+
+	off = phys & ~PAGE_MASK;
+	err = vfmig_kcoherent_map_phys(priv, phys - off,
+				       PAGE_ALIGN(size + off), GFP_ATOMIC,
+				       &iova);
+	if (err) {
+		dev_warn_ratelimited(dev,
+				     "vfmig_dma_ops: map_phys(0x%llx, %zu) failed: %d\n",
+				     (u64)phys, size, err);
+		return DMA_MAPPING_ERROR;
+	}
+	return iova + off;
 }
 
 static void vfmig_dma_ops_unmap_phys(struct device *dev, dma_addr_t handle,
@@ -211,7 +275,31 @@ static void vfmig_dma_ops_unmap_phys(struct device *dev, dma_addr_t handle,
 				     enum dma_data_direction dir,
 				     unsigned long attrs)
 {
-	/* map_phys never succeeds yet, so there is nothing to unmap. */
+	struct vfmig_dma_ops_priv *priv = vfmig_dma_ops_priv_get(dev);
+	unsigned int off;
+	u64 iova;
+	size_t aligned;
+
+	if (unlikely(!priv))
+		return;
+	if (attrs & DMA_ATTR_MMIO)
+		return;	/* never mapped, see map_phys */
+
+	off     = handle & ~PAGE_MASK;
+	iova    = handle - off;
+	aligned = PAGE_ALIGN(size + off);
+
+	/*
+	 * Range-check against the arena window so a stale handle from
+	 * another path (a kernel slot, transient) can't unmap here.
+	 */
+	if (iova < priv->base || iova + aligned > priv->end) {
+		dev_warn_ratelimited(dev,
+				     "vfmig_dma_ops: unmap_phys: IOVA 0x%llx + 0x%zx outside kcoherent window [0x%llx, 0x%llx); ignoring\n",
+				     iova, aligned, priv->base, priv->end);
+		return;
+	}
+	(void)iommu_unmap(priv->iommu_dom, iova, aligned);
 }
 
 /*
