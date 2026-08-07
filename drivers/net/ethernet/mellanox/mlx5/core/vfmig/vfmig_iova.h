@@ -53,6 +53,7 @@
 #include <linux/bits.h>
 #include <linux/types.h>
 
+struct iommu_domain;
 struct pci_dev;
 struct vfmig_iova_domain;
 
@@ -249,6 +250,19 @@ void vfmig_iova_domain_detach_dev_if_unbound(struct vfmig_iova_domain *dom);
  * unbound. Safe with @dom == NULL.
  */
 void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom);
+
+/*
+ * Expose the per-VF iommu_domain and the kcoherent IOVA sub-window to
+ * the dma_ops shim, which owns the non-migrated kcoherent arena
+ * allocator itself. This is a passive accessor: it returns the domain
+ * layout (@iommu_dom, and the window [*@base, *@base + *@len)), not an
+ * allocation. The window is the bottom VFMIG_IOVA_KCOHERENT_BYTES of
+ * VFMIG_SLOT_USER_PAGE's range and never overlaps a deterministic slot.
+ * Returns 0, or -EINVAL on a bad argument.
+ */
+int  vfmig_iova_kcoherent_window(struct vfmig_iova_domain *dom,
+				 struct iommu_domain **iommu_dom,
+				 u64 *base, u64 *len);
 
 /*
  * Allocate @size bytes of DMA-able memory from @slot's sub-window at the

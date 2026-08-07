@@ -667,6 +667,19 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 	kfree(dom);
 }
 
+int vfmig_iova_kcoherent_window(struct vfmig_iova_domain *dom,
+				struct iommu_domain **iommu_dom,
+				u64 *base, u64 *len)
+{
+	if (!dom || !iommu_dom || !base || !len)
+		return -EINVAL;
+
+	*iommu_dom = dom->iommu_dom;
+	*base = vfmig_iova_slot_base(dom, VFMIG_SLOT_USER_PAGE);
+	*len = VFMIG_IOVA_KCOHERENT_BYTES;
+	return 0;
+}
+
 int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 			  enum vfmig_iova_slot slot, u64 instance_key,
 			  size_t size, gfp_t gfp,
