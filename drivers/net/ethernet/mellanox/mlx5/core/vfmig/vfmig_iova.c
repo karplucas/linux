@@ -165,10 +165,32 @@ vfmig_iova_slot_base(const struct vfmig_iova_domain *dom,
 	return dom->base + (u64)slot * VFMIG_IOVA_SLOT_BYTES;
 }
 
+/*
+ * USER_PAGE's effective starting IOVA after the kcoherent carve. The
+ * bottom VFMIG_IOVA_KCOHERENT_BYTES of slot USER_PAGE's window are
+ * reserved for the (future) non-migrated kcoherent sub-arena, so the
+ * user-MR IOVA range proper begins here. Range checks and cursor
+ * initialization for USER_PAGE MUST use this rather than
+ * vfmig_iova_slot_base(dom, VFMIG_SLOT_USER_PAGE) directly.
+ */
+static inline u64
+vfmig_iova_user_page_start(const struct vfmig_iova_domain *dom)
+{
+	return vfmig_iova_slot_base(dom, VFMIG_SLOT_USER_PAGE) +
+	       VFMIG_IOVA_KCOHERENT_BYTES;
+}
+
+/*
+ * End (exclusive) of @slot's window. Kernel slots are uniform 510-MiB
+ * windows; VFMIG_SLOT_USER_PAGE is expand-to-fill and ends at the
+ * transient arena's base (set by vfmig_iova_domain_create()).
+ */
 static inline u64
 vfmig_iova_slot_end(const struct vfmig_iova_domain *dom,
 		    enum vfmig_iova_slot slot)
 {
+	if (slot == VFMIG_SLOT_USER_PAGE)
+		return dom->transient.base;
 	return dom->base + (u64)(slot + 1) * VFMIG_IOVA_SLOT_BYTES;
 }
 
@@ -187,8 +209,19 @@ vfmig_iova_slot_from_iova(const struct vfmig_iova_domain *dom, u64 iova)
 	if (iova < dom->base || iova >= dom->transient.base)
 		return VFMIG_SLOT_INVALID;
 	idx = (iova - dom->base) / VFMIG_IOVA_SLOT_BYTES;
-	if (idx <= VFMIG_SLOT_INVALID || idx >= VFMIG_SLOT_NR)
+	if (idx <= VFMIG_SLOT_INVALID)
 		return VFMIG_SLOT_INVALID;
+	/*
+	 * Asymmetric layout: everything at or above slot_base(USER_PAGE)
+	 * is either the reserved kcoherent carve (not a deterministic slot
+	 * -> INVALID, so replay can never install there) or the USER_PAGE
+	 * expand-to-fill window.
+	 */
+	if (idx >= VFMIG_SLOT_USER_PAGE) {
+		if (iova < vfmig_iova_user_page_start(dom))
+			return VFMIG_SLOT_INVALID;	/* kcoherent range */
+		return VFMIG_SLOT_USER_PAGE;
+	}
 	return (enum vfmig_iova_slot)idx;
 }
 
@@ -403,7 +436,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 {
 	struct vfmig_iova_domain *dom;
 	struct iommu_domain *idom;
-	u64 base, det_end;
+	u64 base;
 	unsigned int s;
 	int err;
 
@@ -435,6 +468,11 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	for (s = 0; s < VFMIG_IOVA_NR_SLOTS; s++)
 		dom->cursor[s] = vfmig_iova_slot_base(dom,
 						      (enum vfmig_iova_slot)s);
+	/*
+	 * USER_PAGE is expand-to-fill with a kcoherent carve at its base,
+	 * so its cursor starts past the carve, not at slot_base.
+	 */
+	dom->cursor[VFMIG_SLOT_USER_PAGE] = vfmig_iova_user_page_start(dom);
 
 	/*
 	 * Transient arena owns the topmost VFMIG_IOVA_TRANSIENT_BYTES of the
@@ -481,7 +519,6 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	 * so the failure surfaces at "set_tracked enable=1" with a printed
 	 * reason rather than deep inside a later cmd-ring DMA.
 	 */
-	det_end = base + (u64)VFMIG_IOVA_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES;
 	if (dom->base < dom->iommu_dom->geometry.aperture_start ||
 	    dom->transient.end - 1 > dom->iommu_dom->geometry.aperture_end) {
 		dev_warn(&vf_pdev->dev,
@@ -496,9 +533,12 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	dom->vf_pdev = pci_dev_get(vf_pdev);
 
 	dev_info(&vf_pdev->dev,
-		 "vfmig_iova: vf %u domain attached, IOVA window [0x%llx, 0x%llx) (%u slots x 0x%llx) + [0x%llx, 0x%llx) (transient) within IOMMU aperture [0x%llx, 0x%llx]\n",
-		 vf_id, dom->base, det_end,
-		 VFMIG_IOVA_NR_SLOTS, (u64)VFMIG_IOVA_SLOT_BYTES,
+		 "vfmig_iova: vf %u domain attached: kernel slots [0x%llx, 0x%llx) (%u x 0x%llx) + kcoherent carve 0x%llx + USER_PAGE [0x%llx, 0x%llx) + transient [0x%llx, 0x%llx) within IOMMU aperture [0x%llx, 0x%llx]\n",
+		 vf_id, dom->base,
+		 vfmig_iova_slot_base(dom, VFMIG_SLOT_USER_PAGE),
+		 VFMIG_IOVA_KERNEL_NR_SLOTS, (u64)VFMIG_IOVA_SLOT_BYTES,
+		 (u64)VFMIG_IOVA_KCOHERENT_BYTES,
+		 vfmig_iova_user_page_start(dom), dom->transient.base,
 		 dom->transient.base, dom->transient.end,
 		 dom->iommu_dom->geometry.aperture_start,
 		 dom->iommu_dom->geometry.aperture_end);
@@ -766,6 +806,19 @@ int vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 			 dom->vf_id, slot);
 		return -EINVAL;
 	}
+	if (slot == VFMIG_SLOT_USER_PAGE) {
+		/*
+		 * USER_PAGE uses a separate replay path: its wire records
+		 * (added in a later patch) carry identity only, not
+		 * contents, and install as awaiting-bind placeholders. A
+		 * HOST_PAGE record, which does carry contents, must never
+		 * target the USER_PAGE slot.
+		 */
+		dev_warn(&dom->vf_pdev->dev,
+			 "vfmig_iova: vf %u replay_page: USER_PAGE slot is not content-replayable\n",
+			 dom->vf_id);
+		return -EOPNOTSUPP;
+	}
 
 	/*
 	 * Cross-check that the wire-claimed slot agrees with the slot the
@@ -829,6 +882,8 @@ void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 						      (enum vfmig_iova_slot)s);
 		dom->next_auto_key[s] = 0;
 	}
+	/* USER_PAGE cursor floors at user_page_start (past the carve). */
+	dom->cursor[VFMIG_SLOT_USER_PAGE] = vfmig_iova_user_page_start(dom);
 	mutex_unlock(&dom->lock);
 }
 
