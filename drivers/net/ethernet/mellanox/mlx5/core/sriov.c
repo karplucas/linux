@@ -235,17 +235,31 @@ void mlx5_sriov_disable(struct pci_dev *pdev, bool num_vf_change)
 	int num_vfs = pci_num_vf(dev->pdev);
 
 	/*
-	 * Detach + free any per-VF vfmig IOVA domains while the VFs still
-	 * exist as PCI devices. pci_disable_sriov() below removes the VFs;
-	 * the iommu core WARNs (drivers/iommu/iommu.c __iommu_group_free_device)
-	 * if a VF's group is torn down while our unmanaged domain is still
-	 * attached in place of its default DMA domain. A tracked VF is always
-	 * unbound in this milestone and there is no allocator state that must
-	 * outlive pci_disable_sriov(), so a plain detach+free here is enough.
+	 * pci_disable_sriov() below runs the full teardown for every VF
+	 * synchronously: for a driver-bound VF, device_release_driver ->
+	 * mlx5_core remove_one, which frees cmd-ring / EQ / MR DMA through
+	 * vfmig_iova_free_slot() and issues FW teardown commands over the
+	 * VF's own cmd ring. Both dereference the per-VF IOVA domain, so the
+	 * domain MUST outlive pci_disable_sriov(). Drop (free) the domains
+	 * AFTER it returns, by which point every VF is unbound and no
+	 * vfmig_iova_free_slot() caller remains -- dropping first is a
+	 * use-after-free, and yanking the cmd ring's IOVA backing out from
+	 * under a still-bound VF's teardown hangs its FW commands.
+	 *
+	 * Before pci_disable_sriov() we still must detach the iommu_dom from
+	 * any driverless VF that has one attached: such a VF has no
+	 * remove_one() to run mlx5_vfmig_vf_detach_iova_domain(), so without
+	 * a pre-detach the iommu core WARNs when device_del() empties its
+	 * group while our unmanaged domain is still in place of the default.
+	 * The pre-detach is gated on vf_pdev->driver == NULL so it never
+	 * races a bound VF's still-active FW DMA -- bound VFs detach from
+	 * remove_one()'s tail, after mlx5_pci_close() drains the cmd ring +
+	 * EQs. vfmig_iova_domain_detach_dev() sets @dev_detached so the drop
+	 * below skips the redundant detach.
 	 */
-	mlx5_vfmig_pf_drop_iova_domains(dev);
-
+	mlx5_vfmig_pf_detach_unbound_iova_domains(dev);
 	pci_disable_sriov(pdev);
+	mlx5_vfmig_pf_drop_iova_domains(dev);
 	devl_lock(devlink);
 	mlx5_device_disable_sriov(dev, num_vfs, true, num_vf_change);
 	devl_unlock(devlink);

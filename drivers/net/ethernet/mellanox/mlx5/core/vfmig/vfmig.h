@@ -66,6 +66,26 @@ void mlx5_vfmig_pf_drop_vf_uuids(struct mlx5_core_dev *pf_mdev);
 void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev);
 
 /*
+ * Detach (but do not free) the iommu_dom of every driverless per-VF
+ * IOVA domain, called from mlx5_sriov_disable() before
+ * pci_disable_sriov() removes the VFs. Bound VFs detach their own
+ * domain from mlx5_vfmig_vf_detach_iova_domain() in remove_one(); this
+ * covers never-bound tracked VFs so the iommu core doesn't WARN when
+ * their group empties at device_del. The subsequent
+ * mlx5_vfmig_pf_drop_iova_domains() frees the domain structs.
+ */
+void mlx5_vfmig_pf_detach_unbound_iova_domains(struct mlx5_core_dev *pf_mdev);
+
+/*
+ * VF-side teardown hook: detach this VF's per-VF IOVA domain from its
+ * PCI device, called from mlx5_core remove_one() after mlx5_pci_close()
+ * has drained the cmd ring + EQs, so the iommu attachment is gone
+ * before pci_disable_sriov() fires device_del. No-op on PFs and
+ * untracked VFs.
+ */
+void mlx5_vfmig_vf_detach_iova_domain(struct mlx5_core_dev *vf_mdev);
+
+/*
  * Probe-time restore hooks, called from the VF's mlx5_function_enable().
  * mlx5_vfmig_vf_consume_restored() test-and-clears the "restored" latch
  * (returning the staged vhca_id) so the probe can skip INIT_HCA;
@@ -114,6 +134,16 @@ mlx5_vfmig_pf_drop_vf_uuids(struct mlx5_core_dev *pf_mdev)
 
 static inline void
 mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev)
+{
+}
+
+static inline void
+mlx5_vfmig_pf_detach_unbound_iova_domains(struct mlx5_core_dev *pf_mdev)
+{
+}
+
+static inline void
+mlx5_vfmig_vf_detach_iova_domain(struct mlx5_core_dev *vf_mdev)
 {
 }
 

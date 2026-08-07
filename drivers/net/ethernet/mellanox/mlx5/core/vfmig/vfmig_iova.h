@@ -148,6 +148,25 @@ int  vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 			      struct vfmig_iova_domain **out);
 
 /*
+ * Detach @dom's iommu_dom from its VF's PCI device, keeping the domain
+ * struct alive for a later vfmig_iova_domain_destroy(). Must run while
+ * the VF's struct device still exists (before pci_disable_sriov fires
+ * device_del) to avoid the iommu core's empty-group WARN. Idempotent;
+ * safe with @dom == NULL. See the implementation for the teardown
+ * ordering contract.
+ */
+void vfmig_iova_domain_detach_dev(struct vfmig_iova_domain *dom);
+
+/*
+ * Like vfmig_iova_domain_detach_dev(), but only acts when @dom's VF is
+ * not currently driver-bound. Bound VFs detach their own domain from
+ * mlx5_core's remove_one() tail (after the cmd ring + EQs are drained);
+ * this covers tracked VFs that were never bound and thus have no
+ * remove_one() to run that hook. Safe with @dom == NULL.
+ */
+void vfmig_iova_domain_detach_dev_if_unbound(struct vfmig_iova_domain *dom);
+
+/*
  * Detach @dom from its VF, unmap + free every registry page, free the
  * iommu_domain, and drop the pinned VF reference. The VF must be
  * unbound. Safe with @dom == NULL.
