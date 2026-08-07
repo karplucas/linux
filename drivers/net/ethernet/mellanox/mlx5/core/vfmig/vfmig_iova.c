@@ -20,6 +20,7 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 
+#include "vfmig_dma_ops.h"
 #include "vfmig_iova.h"
 
 /*
@@ -532,6 +533,20 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 
 	dom->vf_pdev = pci_dev_get(vf_pdev);
 
+	/*
+	 * Install the per-VF dma_map_ops shim now that the unmanaged
+	 * domain is attached. From here the DMA API on this VF dispatches
+	 * through vfmig_dma_ops instead of the (now-detached) default
+	 * dma-iommu path. Must be undone before iommu_detach_device on
+	 * every teardown path.
+	 */
+	err = vfmig_dma_ops_attach(vf_pdev, dom);
+	if (err) {
+		dev_warn(&vf_pdev->dev,
+			 "vfmig_iova: dma_ops attach failed: %d\n", err);
+		goto err_pci_put;
+	}
+
 	dev_info(&vf_pdev->dev,
 		 "vfmig_iova: vf %u domain attached: kernel slots [0x%llx, 0x%llx) (%u x 0x%llx) + kcoherent carve 0x%llx + USER_PAGE [0x%llx, 0x%llx) + transient [0x%llx, 0x%llx) within IOMMU aperture [0x%llx, 0x%llx]\n",
 		 vf_id, dom->base,
@@ -546,6 +561,9 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	*out = dom;
 	return 0;
 
+err_pci_put:
+	pci_dev_put(dom->vf_pdev);
+	dom->vf_pdev = NULL;
 err_detach:
 	iommu_detach_device(dom->iommu_dom, &vf_pdev->dev);
 err_free_idom:
@@ -586,6 +604,8 @@ void vfmig_iova_domain_detach_dev(struct vfmig_iova_domain *dom)
 	if (!vf_pdev)
 		return;
 
+	/* Uninstall the shim before detaching the domain (reverse of create). */
+	vfmig_dma_ops_detach(vf_pdev);
 	iommu_detach_device(dom->iommu_dom, &vf_pdev->dev);
 	dom->dev_detached = true;
 
@@ -630,6 +650,7 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 		 * detach now.
 		 */
 		if (!dom->dev_detached) {
+			vfmig_dma_ops_detach(vf_pdev);
 			iommu_detach_device(dom->iommu_dom, &vf_pdev->dev);
 			dom->dev_detached = true;
 		}
