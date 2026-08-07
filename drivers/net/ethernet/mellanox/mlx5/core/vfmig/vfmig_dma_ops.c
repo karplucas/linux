@@ -9,11 +9,11 @@
  * -----------------
  * Each tracked VF's struct device is entered into a global xarray keyed
  * by (unsigned long)dev, holding the pre-attach dma_ops / dma_iommu we
- * must restore on detach (plus a back-pointer to the per-VF domain the
- * memory callbacks will chase once they are wired in follow-up patches).
- * The xarray is small (one entry per tracked VF, bounded by the SR-IOV
- * VF count). dev is stable for the (attach, detach) interval -- the
- * caller holds the VF's device_lock and the VF is unbound throughout.
+ * must restore on detach, the per-VF iommu_domain the mappings land in,
+ * and the shim-private kcoherent arena. The xarray is small (one entry
+ * per tracked VF, bounded by the SR-IOV VF count). dev is stable for the
+ * (attach, detach) interval -- the caller holds the VF's device_lock and
+ * the VF is unbound throughout.
  *
  * dev->dma_iommu override
  * -----------------------
@@ -23,36 +23,72 @@
  * (@orig_dma_iommu) and restored on detach so dma-iommu transparently
  * resumes ownership when the VF is untracked.
  *
+ * kcoherent arena
+ * ---------------
+ * The shim owns a private bump allocator carved from the bottom of the
+ * VF's USER_PAGE IOVA range (vfmig_iova_kcoherent_window()). It backs
+ * dma_alloc_coherent() on a tracked VF: kernel-owned, physically
+ * contiguous, IOMMU_CACHE memory whose IOVA is NOT recorded in any SAVE
+ * manifest (the destination re-probes and gets its own). O(1) bump +
+ * one tracking node per outstanding allocation; drained at detach.
+ *
  * Routing (this patch)
  * --------------------
- * This patch installs the interception mechanism only. The memory
- * callbacks (.alloc/.free, .map_phys/.unmap_phys, .map_sg/.unmap_sg)
- * fail cleanly here; their per-VF backing arenas are wired in follow-up
- * patches, each of which turns one stub into a live callback. The
- * trivial callbacks (.sync_*, .dma_supported, .get_required_mask) are
- * final as written.
+ *   - .alloc / .free        -> kcoherent arena (dma_alloc_coherent).
+ *   - .map_phys/.unmap_phys -> streaming maps, deferred: fail cleanly
+ *                              until the map_phys routing lands.
+ *   - .map_sg / .unmap_sg   -> migration-tracked USER_PAGE registry,
+ *                              deferred: fail cleanly until it lands.
+ *   - .sync_* / .dma_supported / .get_required_mask are final.
  */
 
+#include <linux/align.h>
 #include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
+#include <linux/gfp.h>
+#include <linux/iommu.h>
+#include <linux/limits.h>
+#include <linux/list.h>
+#include <linux/mm.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/xarray.h>
 
 #include "vfmig_dma_ops.h"
+#include "vfmig_iova.h"
+
+/*
+ * One outstanding kcoherent allocation. Lives on @priv->pages until
+ * vfmig_dma_ops_free() unlinks it, or vfmig_kcoherent_drain() reclaims
+ * it at detach.
+ */
+struct vfmig_kcoherent_page {
+	struct list_head	node;
+	u64			iova;
+	size_t			len;
+	void			*vaddr;
+};
 
 /*
  * Per-attach saved state, in the xarray keyed by (unsigned long)dev.
- * @dom is the back-pointer the memory callbacks will chase (unused until
- * a follow-up wires them up); @orig_* are the pre-attach values used to
- * undo set_dma_ops + dma_iommu on detach.
+ * @orig_* are the pre-attach values undone on detach; @iommu_dom is the
+ * per-VF domain the callbacks map into; the kcoherent bump arena
+ * (@base/@end/@cursor/@pages/@n_pages) is guarded by @lock.
  */
 struct vfmig_dma_ops_priv {
-	struct vfmig_iova_domain	*dom;
+	struct iommu_domain		*iommu_dom;
 	const struct dma_map_ops	*orig_dma_ops;
 #ifdef CONFIG_IOMMU_DMA
 	bool				 orig_dma_iommu;
 #endif
+
+	spinlock_t			 lock;	/* guards the arena below */
+	u64				 base;
+	u64				 end;
+	u64				 cursor;
+	struct list_head		 pages;
+	unsigned int			 n_pages;
 };
 
 /*
@@ -82,14 +118,82 @@ static inline void vfmig_dma_iommu_write(struct device *dev, bool val)
 
 static DEFINE_XARRAY(vfmig_dma_ops_xa);
 
+static inline struct vfmig_dma_ops_priv *
+vfmig_dma_ops_priv_get(struct device *dev)
+{
+	return xa_load(&vfmig_dma_ops_xa, (unsigned long)dev);
+}
+
+/* -------- kcoherent bump arena (private to the shim) -------------------- */
+
+/* Held @priv->lock. Locate the entry mapped at exactly @iova, or NULL. */
+static struct vfmig_kcoherent_page *
+vfmig_kcoherent_find_locked(struct vfmig_dma_ops_priv *priv, u64 iova)
+{
+	struct vfmig_kcoherent_page *kp;
+
+	list_for_each_entry(kp, &priv->pages, node) {
+		if (kp->iova == iova)
+			return kp;
+	}
+	return NULL;
+}
+
+/*
+ * Reserve @aligned bytes at the cursor. Returns the reserved IOVA, or
+ * U64_MAX on exhaustion so the caller can release its pre-allocated
+ * backing pages without holding the lock to test.
+ */
+static u64 vfmig_kcoherent_reserve(struct vfmig_dma_ops_priv *priv,
+				   size_t aligned)
+{
+	unsigned long flags;
+	u64 iova;
+
+	spin_lock_irqsave(&priv->lock, flags);
+	if (priv->cursor + aligned > priv->end) {
+		spin_unlock_irqrestore(&priv->lock, flags);
+		return U64_MAX;
+	}
+	iova = priv->cursor;
+	priv->cursor += aligned;
+	spin_unlock_irqrestore(&priv->lock, flags);
+	return iova;
+}
+
+/*
+ * Tear down every outstanding kcoherent allocation. Called from detach
+ * with the VF unbound (caller contract) and the domain still attached,
+ * so iommu_unmap is valid and no concurrent traffic is possible; the
+ * lock need not be held. A non-empty list is a driver leak and warns.
+ */
+static void vfmig_kcoherent_drain(struct device *dev,
+				  struct vfmig_dma_ops_priv *priv)
+{
+	struct vfmig_kcoherent_page *kp, *tmp;
+
+	if (priv->n_pages > 0)
+		dev_warn(dev,
+			 "vfmig_dma_ops: %u kcoherent allocations outstanding at detach (driver leak); cleaning up\n",
+			 priv->n_pages);
+
+	list_for_each_entry_safe(kp, tmp, &priv->pages, node) {
+		(void)iommu_unmap(priv->iommu_dom, kp->iova, kp->len);
+		free_pages_exact(kp->vaddr, kp->len);
+		list_del(&kp->node);
+		kfree(kp);
+	}
+	priv->n_pages = 0;
+}
+
 /* -------- dma_map_ops callbacks ----------------------------------------- */
 
 /*
  * dma_map_phys / dma_map_single / dma_map_page land here. On a tracked
- * VF these are mlx5e's streaming RX/TX buffers, which must route to the
- * non-migrated kcoherent sub-arena. That arena is added in a follow-up
- * patch; until then fail cleanly rather than install a mapping the
- * hardware can't see via the (now-detached) default dma-iommu path.
+ * VF these are mlx5e's streaming RX/TX buffers, which route to the
+ * kcoherent arena. That routing lands in a follow-up patch; until then
+ * fail cleanly rather than install a mapping the hardware can't see via
+ * the (now-detached) default dma-iommu path.
  */
 static dma_addr_t vfmig_dma_ops_map_phys(struct device *dev, phys_addr_t phys,
 					 size_t size,
@@ -97,7 +201,7 @@ static dma_addr_t vfmig_dma_ops_map_phys(struct device *dev, phys_addr_t phys,
 					 unsigned long attrs)
 {
 	dev_warn_ratelimited(dev,
-			     "vfmig_dma_ops: map_phys(0x%llx, %zu) on tracked VF not routed yet (kcoherent arena is a follow-up)\n",
+			     "vfmig_dma_ops: map_phys(0x%llx, %zu) on tracked VF not routed yet (follow-up)\n",
 			     (u64)phys, size);
 	return DMA_MAPPING_ERROR;
 }
@@ -185,17 +289,88 @@ static u64 vfmig_dma_ops_get_required_mask(struct device *dev)
 
 /*
  * dma_alloc_coherent lands here for tracked VFs (mlx5e ring / drop_rq /
- * CQ buffer setup). It routes to the non-migrated kcoherent sub-arena,
- * wired in a follow-up patch; until then fail cleanly so the caller sees
- * an allocation failure rather than an unmapped buffer.
+ * CQ buffer setup). Backing pages are kernel-owned, physically
+ * contiguous and mapped into the per-VF domain from the kcoherent
+ * arena; the IOVA is not part of any SAVE manifest. @attrs is ignored:
+ * the arena always returns a kernel-virtual, IOMMU_CACHE region, the
+ * strongest coherent contract, which satisfies every kernel caller seen
+ * so far.
  */
 static void *vfmig_dma_ops_alloc(struct device *dev, size_t size,
 				 dma_addr_t *dma_handle, gfp_t gfp,
 				 unsigned long attrs)
 {
-	dev_warn_ratelimited(dev,
-			     "vfmig_dma_ops: alloc(%zu) on tracked VF not routed yet (kcoherent arena is a follow-up)\n",
-			     size);
+	struct vfmig_dma_ops_priv *priv = vfmig_dma_ops_priv_get(dev);
+	struct vfmig_kcoherent_page *kp;
+	size_t aligned;
+	gfp_t gfp_pages;
+	unsigned long flags;
+	u64 iova;
+	void *vaddr;
+	int err;
+
+	if (unlikely(!priv)) {
+		dev_warn_ratelimited(dev,
+				     "vfmig_dma_ops: alloc(%zu) with no shim state (caller bug)\n",
+				     size);
+		return NULL;
+	}
+	if (!size)
+		return NULL;
+
+	aligned = ALIGN(size, PAGE_SIZE);
+
+	/*
+	 * Sanitize gfp for alloc_pages_exact + iommu_map + page_address:
+	 * no highmem (page_address must be valid), no compound, no
+	 * DMA-zone constraints (the IOMMU provides translation).
+	 * __GFP_ZERO matches dma_alloc_coherent semantics.
+	 */
+	gfp_pages = (gfp & ~(__GFP_HIGHMEM | __GFP_COMP |
+			     __GFP_DMA | __GFP_DMA32)) | __GFP_ZERO;
+
+	/* Backing allocations happen OUTSIDE the cursor spinlock. */
+	kp = kzalloc(sizeof(*kp), gfp_pages);
+	if (!kp)
+		return NULL;
+
+	vaddr = alloc_pages_exact(aligned, gfp_pages);
+	if (!vaddr)
+		goto err_free_kp;
+
+	iova = vfmig_kcoherent_reserve(priv, aligned);
+	if (iova == U64_MAX) {
+		dev_warn_ratelimited(dev,
+				     "vfmig_dma_ops: kcoherent alloc exhausted (asked %zu, end 0x%llx)\n",
+				     aligned, priv->end);
+		goto err_free_pages;
+	}
+
+	err = iommu_map(priv->iommu_dom, iova, virt_to_phys(vaddr), aligned,
+			IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, GFP_ATOMIC);
+	if (err) {
+		dev_warn_ratelimited(dev,
+				     "vfmig_dma_ops: kcoherent iommu_map(0x%llx, %zu) failed: %d\n",
+				     iova, aligned, err);
+		goto err_free_pages;	/* iova leaks; bump-only arena */
+	}
+
+	kp->iova  = iova;
+	kp->len   = aligned;
+	kp->vaddr = vaddr;
+
+	spin_lock_irqsave(&priv->lock, flags);
+	list_add_tail(&kp->node, &priv->pages);
+	priv->n_pages++;
+	spin_unlock_irqrestore(&priv->lock, flags);
+
+	*dma_handle = iova;
+	return vaddr;
+
+err_free_pages:
+	free_pages_exact(vaddr, aligned);
+err_free_kp:
+	kfree(kp);
 	return NULL;
 }
 
@@ -203,7 +378,47 @@ static void vfmig_dma_ops_free(struct device *dev, size_t size,
 			       void *vaddr, dma_addr_t dma_handle,
 			       unsigned long attrs)
 {
-	/* alloc never succeeds yet, so there is nothing to free. */
+	struct vfmig_dma_ops_priv *priv = vfmig_dma_ops_priv_get(dev);
+	struct vfmig_kcoherent_page *kp;
+	struct vfmig_kcoherent_page found;
+	unsigned long flags;
+	size_t aligned;
+
+	if (unlikely(!priv))
+		return;
+
+	aligned = ALIGN(size, PAGE_SIZE);
+
+	spin_lock_irqsave(&priv->lock, flags);
+	kp = vfmig_kcoherent_find_locked(priv, (u64)dma_handle);
+	if (!kp) {
+		spin_unlock_irqrestore(&priv->lock, flags);
+		dev_warn_ratelimited(dev,
+				     "vfmig_dma_ops: free: no kcoherent entry at IOVA 0x%llx (asked %zu); ignoring\n",
+				     (u64)dma_handle, aligned);
+		return;
+	}
+	if (kp->len != aligned)
+		dev_warn_ratelimited(dev,
+				     "vfmig_dma_ops: free size mismatch at IOVA 0x%llx: have %zu, asked %zu; using recorded size\n",
+				     (u64)dma_handle, kp->len, aligned);
+	if (vaddr && vaddr != kp->vaddr)
+		dev_warn_ratelimited(dev,
+				     "vfmig_dma_ops: free vaddr mismatch at IOVA 0x%llx: have %p, asked %p\n",
+				     (u64)dma_handle, kp->vaddr, vaddr);
+
+	/*
+	 * Snapshot + unlink under the spinlock; the iommu_unmap and
+	 * free_pages_exact run outside it so they can sleep freely.
+	 */
+	found = *kp;
+	list_del(&kp->node);
+	priv->n_pages--;
+	spin_unlock_irqrestore(&priv->lock, flags);
+
+	kfree(kp);
+	(void)iommu_unmap(priv->iommu_dom, found.iova, found.len);
+	free_pages_exact(found.vaddr, found.len);
 }
 
 static const struct dma_map_ops vfmig_dma_ops = {
@@ -231,6 +446,7 @@ int vfmig_dma_ops_attach(struct pci_dev *vf_pdev,
 {
 	struct vfmig_dma_ops_priv *priv;
 	struct device *dev;
+	u64 win_len;
 	void *old;
 	int err;
 
@@ -242,11 +458,19 @@ int vfmig_dma_ops_attach(struct pci_dev *vf_pdev,
 	if (!priv)
 		return -ENOMEM;
 
-	priv->dom		= dom;
 #ifdef CONFIG_IOMMU_DMA
 	priv->orig_dma_iommu	= dev_dma_iommu(dev);
 #endif
 	priv->orig_dma_ops	= dev->dma_ops;
+
+	err = vfmig_iova_kcoherent_window(dom, &priv->iommu_dom,
+					  &priv->base, &win_len);
+	if (err)
+		goto err_free;
+	priv->end    = priv->base + win_len;
+	priv->cursor = priv->base;
+	spin_lock_init(&priv->lock);
+	INIT_LIST_HEAD(&priv->pages);
 
 	/*
 	 * Insert into the xarray BEFORE flipping dma_ops / dma_iommu so
@@ -283,8 +507,9 @@ int vfmig_dma_ops_attach(struct pci_dev *vf_pdev,
 	}
 
 	dev_info(dev,
-		 "vfmig_dma_ops: attached on tracked VF (orig_dma_iommu=%d, orig_dma_ops=%pS)\n",
-		 vfmig_dma_iommu_read(dev), priv->orig_dma_ops);
+		 "vfmig_dma_ops: attached on tracked VF (kcoherent [0x%llx, 0x%llx), orig_dma_iommu=%d, orig_dma_ops=%pS)\n",
+		 priv->base, priv->end, vfmig_dma_iommu_read(dev),
+		 priv->orig_dma_ops);
 	return 0;
 
 err_restore:
@@ -325,6 +550,12 @@ void vfmig_dma_ops_detach(struct pci_dev *vf_pdev)
 #ifdef CONFIG_IOMMU_DMA
 	vfmig_dma_iommu_write(dev, priv->orig_dma_iommu);
 #endif
+
+	/*
+	 * Reclaim any outstanding kcoherent mappings while the domain is
+	 * still attached (the caller detaches/frees it after we return).
+	 */
+	vfmig_kcoherent_drain(dev, priv);
 
 	dev_info(dev,
 		 "vfmig_dma_ops: detached (restored dma_iommu=%d, dma_ops=%pS)\n",
