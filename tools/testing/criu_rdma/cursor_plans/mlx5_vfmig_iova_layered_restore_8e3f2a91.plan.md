@@ -67,7 +67,8 @@ The end goal is full RDMA workload checkpoint/restore, but each layer below is i
 | 2 | All MANAGE_PAGES pages preserved at deterministic IOVAs, contents shipped. | Destination `mlx5_function_open` completes without error. |
 | 3 | EQs + UARs preserved; restored-VF probe skips their creation and rehydrates kernel data structures. | Destination `mlx5_load` completes; netdev appears; basic ping works. |
 | Cross-host | Blob from host A restored on host B, post-Layer-3 functionality. | Same as Layer 3 acceptance, but across machines. |
-| 4 | User-resource (CQ/QP/MR) IOVA preservation; CRIU plugin. | rping survives C/R; later, real workload survives C/R across hosts. |
+| 4a | Blanket ib_uobject DMA coverage: one per-VF `dma_map_ops` shim routes every user buffer (MR/CQ/QP/SRQ/DBR) into `VFMIG_SLOT_USER_PAGE`. | `ibv_reg_mr` + pingpong PASS on a bound tracked VF. |
+| 4b | Individual uobject support: per-object `(kind, fw_id)` identity + per-kind kernel restore verbs preserve FW-resource continuity across SAVE/LOAD. | 1-WR RDMA write through a restored MR completes `IBV_WC_SUCCESS`. |
 
 Layer ordering is not negotiable: each layer's success criterion presupposes the prior layer working, and each layer's code touches a strict superset of the prior layer's hooks.
 
@@ -335,9 +336,37 @@ The complexity is that EQNs, UAR indices, MSI-X vector mappings, and IRQ handler
 
 After Layer 3, take the blob produced on host A and restore it on host B. We expect failures from things we haven't been thinking about on a single host: FW microversion differences, BAR layout differences, MSI-X vector counts. This is the trigger to provision a sister host.
 
-## Layer 4: user resources + CRIU
+## Layer 4: user resources (ib_uobject) + CRIU
 
-Out of scope for now. Tracked for visibility.
+Two sub-phases, hard-ordered, mirroring the kernel-DMA work: land the
+*mechanism* that covers every user buffer first, then add per-object
+*identity* on top. Detailed design lives in `design/user_mr_dma.md` and
+`design/uobject_restore.md`; summarized here for the layer map.
+
+### Layer 4a -- blanket ib_uobject DMA coverage
+
+Every user-side RDMA buffer (MR via `ib_umem_get`; CQ/QP/SRQ work-queue
+buffers; doorbell records) funnels through `dma_map_sgtable` /
+`dma_map_phys` on the VF's PCI device. A single per-VF `dma_map_ops`
+shim (`vfmig_dma_ops`) intercepts *all* of them at once and routes each
+into the deterministic `VFMIG_SLOT_USER_PAGE` window -- type-agnostic,
+one hook, uniform coverage of every umem/devx call site. This restores
+the source-side data path on a tracked VF and is the natural first cut:
+it has a live caller the instant any uobject is created, so it lands as
+working code, not scaffolding.
+
+### Layer 4b -- individual uobject support (identity + restore verbs)
+
+Blanket mapping makes DMA work but assigns each buffer an auto-numbered
+IOVA that is not stable across SAVE/LOAD. Carrying a restored process's
+FW resources (rkey/lkey/cqn/qpn continuity) needs per-object identity:
+tag registry entries with `(kind, fw_id)` at create time, ship
+identity-only `HOST_USER_PAGE` records, and add per-kind kernel restore
+verbs -- `mlx5_ib_restore_mr` first, then `_cq` / `_qp` / `_srq` -- that
+pin the restored user pages and bind them at the source IOVAs. This is
+the shift from "one generic mechanism" to "each object type on its own
+terms," and is correspondingly harder, so it is sequenced strictly after
+4a proves the data path.
 
 ## Parallel track: rxe / soft-RoCE
 
@@ -358,7 +387,9 @@ This plan is *complete* when, on a single host:
 3. The Layer 3 milestone passes (`mlx5_load` completes, netdev usable).
 4. The cross-host milestone passes (Layer 3 functionality across two hosts).
 
-Layer 4 is tracked separately and will get its own plan when we get there.
+Layer 4 (4a blanket ib_uobject DMA coverage, 4b individual uobject
+support) is tracked separately; its detailed design already lives in
+`design/user_mr_dma.md` and `design/uobject_restore.md`.
 
 ## Immediate scope
 
