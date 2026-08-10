@@ -48,6 +48,7 @@ struct mlx5_ib_user_db_page {
 int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context, unsigned long virt,
 			struct mlx5_db *db)
 {
+	struct mlx5_ib_dev *dev = to_mdev(context->ibucontext.device);
 	struct mlx5_ib_user_db_page *page;
 	int err = 0;
 
@@ -77,6 +78,31 @@ int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context, unsigned long virt,
 	page->mm = current->mm;
 
 	list_add(&page->list, &context->db_page_list);
+
+	/*
+	 * Source-side vfmig retag (mirrors create_real_mr). Only the miss
+	 * branch retags: the ib_umem_get above is the sole path that hands a
+	 * fresh PAGE_SIZE umem to vfmig_dma_ops.map_sg, planting the
+	 * KIND_NONE registry entry; the 'found' branch just refcounts an
+	 * already-retagged page. The key's fw_id is the page-aligned user VA
+	 * (mlx5_ib_db_map_user's own dedup key), not a FW id -- doorbell
+	 * pages have no FW identity. Non-fatal on error: the CQ/QP/SRQ
+	 * create that triggered this mapping continues; the doorbell page is
+	 * usable, just not CRIU-restorable.
+	 */
+	if (dev->mdev->cmd.vfmig_iova_dom) {
+		struct sg_table *sgt = &page->umem->sgt_append.sgt;
+		dma_addr_t iova_base = sg_dma_address(sgt->sgl) & PAGE_MASK;
+		int retag_err;
+
+		retag_err = mlx5_vfmig_retag_user_dbr(dev->mdev,
+						      page->user_virt,
+						      iova_base, PAGE_SIZE);
+		if (retag_err)
+			mlx5_ib_warn(dev,
+				     "vfmig: source-side retag for DBR page failed: user_virt=0x%lx iova_base=0x%llx err=%d -- DBR page usable but not CRIU-restorable\n",
+				     page->user_virt, (u64)iova_base, retag_err);
+	}
 
 found:
 	db->dma = sg_dma_address(page->umem->sgt_append.sgt.sgl) +
