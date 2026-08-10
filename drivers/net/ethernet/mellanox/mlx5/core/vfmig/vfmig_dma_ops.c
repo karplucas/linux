@@ -73,10 +73,13 @@ struct vfmig_kcoherent_page {
 /*
  * Per-attach saved state, in the xarray keyed by (unsigned long)dev.
  * @orig_* are the pre-attach values undone on detach; @iommu_dom is the
- * per-VF domain the callbacks map into; the kcoherent bump arena
- * (@base/@end/@cursor/@pages/@n_pages) is guarded by @lock.
+ * per-VF domain the callbacks map into; @dom is the owning vfmig IOVA
+ * domain, used by .map_sg to route umem pages into the USER_PAGE slot;
+ * the kcoherent bump arena (@base/@end/@cursor/@pages/@n_pages) is
+ * guarded by @lock.
  */
 struct vfmig_dma_ops_priv {
+	struct vfmig_iova_domain	*dom;
 	struct iommu_domain		*iommu_dom;
 	const struct dma_map_ops	*orig_dma_ops;
 #ifdef CONFIG_IOMMU_DMA
@@ -546,6 +549,7 @@ int vfmig_dma_ops_attach(struct pci_dev *vf_pdev,
 	if (!priv)
 		return -ENOMEM;
 
+	priv->dom		= dom;
 #ifdef CONFIG_IOMMU_DMA
 	priv->orig_dma_iommu	= dev_dma_iommu(dev);
 #endif
