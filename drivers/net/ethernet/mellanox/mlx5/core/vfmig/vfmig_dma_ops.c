@@ -127,6 +127,15 @@ vfmig_dma_ops_priv_get(struct device *dev)
 	return xa_load(&vfmig_dma_ops_xa, (unsigned long)dev);
 }
 
+/* The vfmig IOVA domain backing @dev's shim, or NULL if not attached. */
+static inline struct vfmig_iova_domain *
+vfmig_dma_ops_dom_for(struct device *dev)
+{
+	struct vfmig_dma_ops_priv *priv = vfmig_dma_ops_priv_get(dev);
+
+	return priv ? priv->dom : NULL;
+}
+
 /* -------- kcoherent bump arena (private to the shim) -------------------- */
 
 /* Held @priv->lock. Locate the entry mapped at exactly @iova, or NULL. */
@@ -307,28 +316,99 @@ static void vfmig_dma_ops_unmap_phys(struct device *dev, dma_addr_t handle,
 
 /*
  * dma_map_sg / dma_map_sgtable land here for tracked VFs -- the
- * ib_umem_get user-MR path. These mappings must round-trip through
- * SAVE/LOAD with stable IOVAs (the migration-tracked USER_PAGE
- * registry), added in a follow-up patch. Until then fail cleanly with
- * -EIO rather than mis-routing umem pages. Note the DMA core calls
- * ops->map_sg without a NULL guard once use_dma_iommu(dev) is false, so
- * this callback must exist even while it only fails.
+ * ib_umem_get user-MR / CQ / QP / SRQ path. Each inbound @sg segment is
+ * a contiguous run of umem-pinned pages; we allocate one IOVA range per
+ * segment from the VFMIG_SLOT_USER_PAGE window via
+ * vfmig_iova_user_page_map_phys(), which iommu_maps the segment's phys
+ * and records an external registry entry. The registry tracking is what
+ * lets a later patch snapshot these mappings into the SAVE blob and
+ * replay them at stable IOVAs on the destination.
+ *
+ * dma_map_sgtable contract: return @nents on success (we do not coalesce
+ * physically-contiguous segments at this stage), a negative errno on
+ * failure. On partial failure, unwind the segments mapped so far. The
+ * DMA core calls ops->map_sg without a NULL guard once use_dma_iommu()
+ * is false, so this callback must exist.
  */
 static int vfmig_dma_ops_map_sg(struct device *dev, struct scatterlist *sg,
 				int nents, enum dma_data_direction dir,
 				unsigned long attrs)
 {
+	struct vfmig_iova_domain *dom = vfmig_dma_ops_dom_for(dev);
+	struct scatterlist *s;
+	int i, mapped = 0;
+	int err;
+
+	if (unlikely(!dom))
+		return -EIO;
+
+	for_each_sg(sg, s, nents, i) {
+		phys_addr_t phys = sg_phys(s);
+		unsigned int off = s->offset & ~PAGE_MASK;
+		unsigned int len = s->length;
+		dma_addr_t iova;
+
+		/*
+		 * ib_umem_get hands us page-aligned segments; round @phys
+		 * down and @len up so a caller supplying a mid-page offset
+		 * still gets a well-defined mapping. The returned
+		 * dma_address carries the original byte offset back.
+		 */
+		err = vfmig_iova_user_page_map_phys(dom, phys & PAGE_MASK,
+						    PAGE_ALIGN(len + off),
+						    GFP_ATOMIC, &iova);
+		if (err)
+			goto err_undo;
+
+		sg_dma_address(s) = iova + off;
+		sg_dma_len(s)	  = len;
+		mapped++;
+	}
+
+	return nents;
+
+err_undo:
+	for_each_sg(sg, s, mapped, i) {
+		dma_addr_t iova = sg_dma_address(s);
+		unsigned int off = iova & ~PAGE_MASK;
+		unsigned int len = sg_dma_len(s);
+
+		(void)vfmig_iova_user_page_unmap_phys(dom, iova - off,
+						      PAGE_ALIGN(len + off));
+		sg_dma_address(s) = 0;
+		sg_dma_len(s)	  = 0;
+	}
 	dev_warn_ratelimited(dev,
-			     "vfmig_dma_ops: map_sg on tracked VF not routed yet (user-MR USER_PAGE registry is a follow-up); failing %d segments\n",
-			     nents);
-	return -EIO;
+			     "vfmig_dma_ops: map_sg failed at entry %d/%d: %d\n",
+			     mapped, nents, err);
+	return err;
 }
 
 static void vfmig_dma_ops_unmap_sg(struct device *dev, struct scatterlist *sg,
 				   int nents, enum dma_data_direction dir,
 				   unsigned long attrs)
 {
-	/* map_sg never succeeds yet, so there is nothing to unmap. */
+	struct vfmig_iova_domain *dom = vfmig_dma_ops_dom_for(dev);
+	struct scatterlist *s;
+	int i;
+
+	if (unlikely(!dom))
+		return;
+
+	for_each_sg(sg, s, nents, i) {
+		dma_addr_t iova = sg_dma_address(s);
+		unsigned int len = sg_dma_len(s);
+		unsigned int off;
+
+		if (!iova && !len)
+			continue;	/* never mapped (partial map_sg) */
+
+		off = iova & ~PAGE_MASK;
+		(void)vfmig_iova_user_page_unmap_phys(dom, iova - off,
+						      PAGE_ALIGN(len + off));
+		sg_dma_address(s) = 0;
+		sg_dma_len(s)	  = 0;
+	}
 }
 
 /*
