@@ -1482,6 +1482,9 @@ int mlx5_ib_query_port(struct ib_device *ibdev, u32 port,
 		       struct ib_port_attr *props);
 void mlx5_ib_populate_pas(struct ib_umem *umem, size_t page_size, __be64 *pas,
 			  u64 access_flags);
+struct ib_umem *mlx5_ib_umem_restore_mr(struct mlx5_ib_dev *dev,
+					u32 mkey_index, unsigned long addr,
+					size_t size, int access);
 int mlx5_ib_get_cqe_size(struct ib_cq *ibcq);
 int mlx5_mkey_cache_init(struct mlx5_ib_dev *dev);
 void mlx5_mkey_cache_cleanup(struct mlx5_ib_dev *dev);
