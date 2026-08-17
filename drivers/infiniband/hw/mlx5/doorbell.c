@@ -129,3 +129,21 @@ void mlx5_ib_db_unmap_user(struct mlx5_ib_ucontext *context, struct mlx5_db *db)
 
 	mutex_unlock(&context->db_page_mutex);
 }
+
+/*
+ * Read-only accessor for the page-aligned source userspace VA of the
+ * doorbell-page user_page that backs @db. Returns 0 for kernel-mode db
+ * slots (the db->u.pgdir branch -- no user_page). Used by
+ * MLX5_IB_METHOD_VFMIG_QUERY_CQ (and future per-uobject QUERY verbs) to
+ * round-trip the source VA into struct mlx5_ib_restore_*_req.db_addr
+ * without exposing struct mlx5_ib_user_db_page across translation units.
+ *
+ * No locking: db->u.user_page is set once at uobject create / restore
+ * time and cleared in mlx5_ib_db_unmap_user only after the parent
+ * uobject's destroy verb has serialised against other users; callers
+ * reach @db through a UVERBS_ACCESS_READ-pinned uobject.
+ */
+u64 mlx5_ib_db_user_virt(const struct mlx5_db *db)
+{
+	return db->u.user_page ? (u64)db->u.user_page->user_virt : 0;
+}
