@@ -606,6 +606,49 @@ static int rxe_qp_restore_resources(struct rxe_qp *qp,
 	return 0;
 }
 
+static int rxe_validate_restore_resources(const struct rxe_restore_qp_req *req,
+					  const struct resp_res *resources)
+{
+	u32 count = req->max_dest_rd_atomic;
+	u32 i;
+
+	if (!count)
+		return (req->res_head || req->res_tail ||
+			req->res_image_bytes) ? -EINVAL : 0;
+	if (!resources || req->res_head >= count || req->res_tail >= count)
+		return -EINVAL;
+
+	for (i = 0; i < count; i++) {
+		const struct resp_res *res = &resources[i];
+
+		if (!res->type)
+			continue;
+		switch (res->type) {
+		case RXE_READ_MASK:
+		case RXE_ATOMIC_MASK:
+		case RXE_ATOMIC_WRITE_MASK:
+		case RXE_FLUSH_MASK:
+			break;
+		default:
+			return -EINVAL;
+		}
+
+		if (res->replay != 0 && res->replay != 1)
+			return -EINVAL;
+		if (res->first_psn > BTH_PSN_MASK ||
+		    res->last_psn > BTH_PSN_MASK ||
+		    res->cur_psn > BTH_PSN_MASK ||
+		    res->state < rdatm_res_state_next ||
+		    res->state > rdatm_res_state_replay)
+			return -EINVAL;
+		if (res->type == RXE_READ_MASK &&
+		    res->read.resid > res->read.length)
+			return -EINVAL;
+	}
+
+	return 0;
+}
+
 int rxe_qp_stage_restore(struct rxe_qp *qp,
 			 const struct rxe_restore_qp_req *req,
 			 enum ib_qp_state state, const void *res_image)
@@ -616,6 +659,8 @@ int rxe_qp_stage_restore(struct rxe_qp *qp,
 	if (qp->restore_state || qp->restore_finalized)
 		return -EALREADY;
 	if (bytes && !res_image)
+		return -EINVAL;
+	if (rxe_validate_restore_resources(req, res_image))
 		return -EINVAL;
 
 	restore = kvzalloc(struct_size(restore, resources, bytes), GFP_KERNEL);
