@@ -25,8 +25,8 @@
  *   QUERY_QP  dump-side counterpart to UVERBS_METHOD_RESTORE_QP: pack the
  *             full rxe wire state (AV, PSNs, transport attrs,
  *             ring mmap offsets) into a payload byte-equal to
- *             struct rxe_restore_qp_req so the destination can restore
- *             the QP single-shot, plus the QP's userspace handle (the
+ *             struct rxe_restore_qp_req so the destination can stage and
+ *             finalize the QP, plus the QP's userspace handle (the
  *             async-event cookie, not standard-queryable). cap / qp_type
  *             / qp_state are intentionally NOT emitted -- CRIU sources
  *             those from the standard IB_USER_VERBS_CMD_QUERY_QP verb and
