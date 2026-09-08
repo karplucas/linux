@@ -176,7 +176,18 @@ static int rxe_finalize_context_cqs(struct rxe_dev *rxe,
 				err = -EINVAL;
 			} else {
 				spin_lock_irqsave(&cq->cq_lock, flags);
-				err = rxe_queue_sync_for_restore(cq->queue);
+				if (cq->restore_finalized) {
+					err = 0;
+				} else if (!cq->restore_pending) {
+					err = -EINVAL;
+				} else {
+					err = rxe_queue_sync_for_restore(cq->queue);
+					if (!err) {
+						cq->notify = cq->restore_notify;
+						cq->restore_pending = false;
+						cq->restore_finalized = true;
+					}
+				}
 				spin_unlock_irqrestore(&cq->cq_lock, flags);
 			}
 		}
@@ -384,6 +395,9 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
 
 	blob.vm_pgoff = cq->queue->ip->info.offset;
 	blob.cqe      = ibcq->cqe;
+	spin_lock_irq(&cq->cq_lock);
+	blob.notify = cq->notify;
+	spin_unlock_irq(&cq->cq_lock);
 
 	return uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_CQ_RESP_BLOB,
 			      &blob, sizeof(blob));

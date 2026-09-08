@@ -243,13 +243,15 @@ struct rxe_resize_cq_resp {
  * this struct, in the natural calling convention). The struct is
  * sized > 8 so the dispatcher takes the pointer path and
  * copy_from_user reads the real userspace buffer. All fields other than
- * @vm_pgoff must be zero.
+ * @vm_pgoff and @notify are meaningful. @notify contains the CQ arm state.
+ * All other fields must be zero.
  */
 struct rxe_restore_cq_req {
 	__aligned_u64 vm_pgoff;
 	__u32 producer;
 	__u32 consumer;
 	__u32 cqe_image_bytes;
+	__u32 notify;
 	__u32 reserved;
 };
 
@@ -259,8 +261,8 @@ struct rxe_restore_cq_req {
  * The dump-side counterpart to struct rxe_restore_cq_req: @vm_pgoff is
  * the CQ ring's mmap byte offset (cq->queue->ip->info.offset) that the
  * dumper replays into RESTORE_CQ, and @cqe is the user-visible entry
- * count. The remaining fields are zero. Queue contents and cursors are read
- * from the mapping by CRIU and synchronized with FINALIZE_CONTEXT.
+ * count. @notify contains the CQ arm state. Queue contents and cursors are
+ * read from the mapping by CRIU and synchronized with FINALIZE_CONTEXT.
  */
 struct rxe_query_cq_resp {
 	__aligned_u64 vm_pgoff;
@@ -268,7 +270,8 @@ struct rxe_query_cq_resp {
 	__u32 producer;
 	__u32 consumer;
 	__u32 cqe_image_bytes;
-	__u32 reserved[2];
+	__u32 notify;
+	__u32 reserved;
 };
 
 struct rxe_create_qp_resp {
