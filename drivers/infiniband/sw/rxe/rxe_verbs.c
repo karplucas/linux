@@ -669,29 +669,33 @@ err_out:
  * FINALIZE_CONTEXT. The restored QP is installed datapath-frozen so replay
  * cannot start before that operation completes.
  */
-static int rxe_restore_qp_resources(struct rxe_qp *qp,
-				    const struct rxe_restore_qp_req *req,
-				    struct ib_udata *udata)
+static int rxe_stage_qp_restore(struct rxe_qp *qp,
+				const struct rxe_restore_qp_req *req,
+				enum ib_qp_state qp_state,
+				struct ib_udata *udata)
 {
 	const size_t hdr = sizeof(*req);
 	size_t bytes;
-	void *buf;
+	const void *resources = NULL;
+	void *buf = NULL;
 	int err;
 
 	bytes = (size_t)req->max_dest_rd_atomic * sizeof(struct resp_res);
-	if (!bytes || bytes != req->res_image_bytes ||
-	    udata->inlen != hdr + bytes)
+	if (bytes != req->res_image_bytes || udata->inlen != hdr + bytes)
 		return -EINVAL;
 
-	buf = kvmalloc(udata->inlen, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
+	if (bytes) {
+		buf = kvmalloc(udata->inlen, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
 
-	err = ib_copy_from_udata(buf, udata, udata->inlen);
-	if (err)
-		goto out;
+		err = ib_copy_from_udata(buf, udata, udata->inlen);
+		if (err)
+			goto out;
+		resources = buf + hdr;
+	}
 
-	err = rxe_qp_restore_resources(qp, req, buf + hdr);
+	err = rxe_qp_stage_restore(qp, req, qp_state, resources);
 out:
 	kvfree(buf);
 	return err;
@@ -768,6 +772,12 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 		rxe_dbg_dev(rxe, "restore qp req qpn must be non-zero\n");
 		goto err_out;
 	}
+	if (req.max_rd_atomic > rxe->attr.max_qp_rd_atom ||
+	    req.max_dest_rd_atomic > rxe->attr.max_qp_rd_atom) {
+		err = -EINVAL;
+		rxe_dbg_dev(rxe, "restore qp RDMA atomic depth is too large\n");
+		goto err_out;
+	}
 
 	/*
 	 * Build init attrs from the generic method args + the dispatcher's
@@ -814,22 +824,6 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 		goto err_cleanup;
 	}
 
-	err = rxe_qp_restore_wire_state(qp, &req, qp_state);
-	if (err) {
-		rxe_dbg_qp(qp, "restore qp wire state failed, err = %d\n", err);
-		goto err_cleanup;
-	}
-
-	/* A UHW tail contains only the responder resource image. */
-	if (udata->inlen > sizeof(req)) {
-		err = rxe_restore_qp_resources(qp, &req, udata);
-		if (err) {
-			rxe_dbg_qp(qp, "restore qp resources failed, err = %d\n",
-				   err);
-			goto err_cleanup;
-		}
-	}
-
 	/*
 	 * Install the QP datapath-frozen, before rxe_finalize() makes it
 	 * reachable to rxe_rcv(). Neither the requester nor the responder
@@ -844,6 +838,13 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	 * replay is driven from rxe_qp_resume() at thaw instead.
 	 */
 	rxe_qp_pause(qp);
+
+	err = rxe_stage_qp_restore(qp, &req, qp_state, udata);
+	if (err) {
+		rxe_dbg_qp(qp, "restore qp state staging failed, err = %d\n",
+			   err);
+		goto err_cleanup;
+	}
 
 	rxe_finalize(qp);
 	return 0;

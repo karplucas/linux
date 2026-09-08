@@ -102,6 +102,7 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_CONTEXT)(
 	unsigned long index = 0;
 	struct rxe_pool *pool;
 	struct rxe_dev *rxe;
+	int ret = 0;
 	u8 freeze;
 	int err;
 
@@ -136,6 +137,9 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_CONTEXT)(
 		if (qp->is_user && ib_qp_ucontext(&qp->ibqp) == ucontext) {
 			if (freeze)
 				rxe_qp_pause(qp);
+			else if (to_ruc(ucontext)->restore_mode &&
+				 !qp->restore_finalized)
+				ret = -EAGAIN;
 			else
 				rxe_qp_resume(qp);
 		}
@@ -145,7 +149,7 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_CONTEXT)(
 	}
 	rcu_read_unlock();
 
-	return 0;
+	return ret;
 }
 
 static int rxe_finalize_context_cqs(struct rxe_dev *rxe,
@@ -220,6 +224,8 @@ static int rxe_finalize_context_qps(struct rxe_dev *rxe,
 			err = rxe_queue_sync_for_restore(qp->sq.queue);
 		if (!err && qp->rq.queue && !qp->srq)
 			err = rxe_queue_sync_for_restore(qp->rq.queue);
+		if (!err)
+			err = rxe_qp_finalize_restore(qp);
 
 next:
 		rxe_put(qp);

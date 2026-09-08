@@ -306,6 +306,8 @@ struct rxe_qp {
 	 * task reservation (num_sched > num_done).
 	 */
 	bool			dp_frozen;
+	struct rxe_qp_restore_state *restore_state;
+	bool			restore_finalized;
 
 	struct execute_work	cleanup_work;
 };
