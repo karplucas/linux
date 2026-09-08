@@ -756,7 +756,8 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 		rxe_dbg_dev(rxe, "bad restore qp req, err = %d\n", err);
 		goto err_out;
 	}
-	if (req.reserved || req.reserved2) {
+	if (req.reserved || memchr_inv(req.reserved2, 0,
+				       sizeof(req.reserved2))) {
 		err = -EINVAL;
 		rxe_dbg_dev(rxe, "restore qp req reserved must be 0\n");
 		goto err_out;
@@ -776,6 +777,13 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	    req.max_dest_rd_atomic > rxe->attr.max_qp_rd_atom) {
 		err = -EINVAL;
 		rxe_dbg_dev(rxe, "restore qp RDMA atomic depth is too large\n");
+		goto err_out;
+	}
+	if (req.retry_cnt_left > 7 || req.rnr_retry_left > 7 ||
+	    (req.retry_cnt != 7 && req.retry_cnt_left > req.retry_cnt) ||
+	    (req.rnr_retry != 7 && req.rnr_retry_left > req.rnr_retry)) {
+		err = -EINVAL;
+		rxe_dbg_dev(rxe, "restore qp retry budget is invalid\n");
 		goto err_out;
 	}
 

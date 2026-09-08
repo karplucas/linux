@@ -522,9 +522,9 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
 	qp->mtu			 = ib_mtu_enum_to_int(req->path_mtu);
 
 	qp->attr.retry_cnt	 = req->retry_cnt;
-	qp->comp.retry_cnt	 = req->retry_cnt;
+	qp->comp.retry_cnt	 = req->retry_cnt_left;
 	qp->attr.rnr_retry	 = req->rnr_retry;
-	qp->comp.rnr_retry	 = req->rnr_retry;
+	qp->comp.rnr_retry	 = req->rnr_retry_left;
 	qp->attr.min_rnr_timer	 = req->min_rnr_timer;
 
 	qp->attr.timeout	 = req->timeout;
