@@ -712,8 +712,20 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	struct rxe_create_qp_resp __user *uresp = NULL;
 	struct rxe_restore_qp_req req = {};
 	struct ib_qp_init_attr init = {};
+	struct ib_ucontext *ucontext;
 	int err, cleanup_err;
 	size_t n;
+
+	ucontext = ib_qp_ucontext(ibqp);
+	if (!ucontext) {
+		err = -EINVAL;
+		goto err_out;
+	}
+	if (READ_ONCE(to_ruc(ucontext)->restore_finalized)) {
+		err = -EBUSY;
+		rxe_dbg_dev(rxe, "restore context is already finalized\n");
+		goto err_out;
+	}
 
 	if (ibqp->qp_type != IB_QPT_RC) {
 		err = -EOPNOTSUPP;
@@ -1430,8 +1442,20 @@ static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 	struct rxe_cq *cq = to_rcq(ibcq);
 	struct rxe_create_cq_resp __user *uresp = NULL;
 	struct rxe_restore_cq_req req = {};
+	struct ib_ucontext *ucontext;
 	u64 forced_vm_pgoff = 0;
 	int err, cleanup_err;
+
+	ucontext = ib_cq_ucontext(ibcq);
+	if (!ucontext) {
+		err = -EINVAL;
+		goto err_out;
+	}
+	if (READ_ONCE(to_ruc(ucontext)->restore_finalized)) {
+		err = -EBUSY;
+		rxe_dbg_dev(rxe, "restore context is already finalized\n");
+		goto err_out;
+	}
 
 	if (udata) {
 		if (udata->outlen < sizeof(*uresp)) {

@@ -45,6 +45,7 @@ static int rxe_migrate_chk_qp_type(const struct ib_qp *ibqp)
 static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_DATAPATH)(
 	struct uverbs_attr_bundle *attrs)
 {
+	struct ib_ucontext *ucontext;
 	struct ib_qp *ibqp;
 	struct rxe_qp *qp;
 	u8 freeze;
@@ -63,6 +64,10 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_DATAPATH)(
 			       RXE_IB_ATTR_FREEZE_DATAPATH_FREEZE);
 	if (err)
 		return err;
+	ucontext = ib_qp_ucontext(ibqp);
+	if (!freeze && ucontext && to_ruc(ucontext)->restore_mode &&
+	    !READ_ONCE(to_ruc(ucontext)->restore_finalized))
+		return -EAGAIN;
 
 	qp = to_rqp(ibqp);
 
@@ -108,6 +113,9 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_CONTEXT)(
 			       RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE);
 	if (err)
 		return err;
+	if (!freeze && to_ruc(ucontext)->restore_mode &&
+	    !READ_ONCE(to_ruc(ucontext)->restore_finalized))
+		return -EAGAIN;
 
 	rxe = to_rdev(ucontext->device);
 	pool = &rxe->qp_pool;
@@ -254,13 +262,20 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_FINALIZE_CONTEXT)(struct uverbs_attr_bun
 		return PTR_ERR(ucontext);
 	if (!to_ruc(ucontext)->restore_mode)
 		return -EACCES;
+	if (READ_ONCE(to_ruc(ucontext)->restore_finalized))
+		return 0;
 
 	rxe = to_rdev(ucontext->device);
 	err = rxe_finalize_context_cqs(rxe, ucontext);
 	if (err)
 		return err;
 
-	return rxe_finalize_context_qps(rxe, ucontext);
+	err = rxe_finalize_context_qps(rxe, ucontext);
+	if (err)
+		return err;
+
+	WRITE_ONCE(to_ruc(ucontext)->restore_finalized, true);
+	return 0;
 }
 
 /*

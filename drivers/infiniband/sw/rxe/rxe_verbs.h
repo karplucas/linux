@@ -44,6 +44,7 @@ struct rxe_ucontext {
 	 * include/rdma/ib_verbs.h:ib_device_ops.ucontext_is_restore_mode.
 	 */
 	bool restore_mode;
+	bool restore_finalized;
 };
 
 struct rxe_pd {
