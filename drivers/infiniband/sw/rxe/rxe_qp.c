@@ -13,6 +13,12 @@
 #include "rxe.h"
 #include "rxe_loc.h"
 #include "rxe_queue.h"
+
+struct rxe_qp_restore_state {
+	struct rxe_restore_qp_req req;
+	enum ib_qp_state qp_state;
+	u8 resources[];
+};
 #include "rxe_task.h"
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
@@ -581,9 +587,9 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
 	return 0;
 }
 
-int rxe_qp_restore_resources(struct rxe_qp *qp,
-			     const struct rxe_restore_qp_req *req,
-			     const void *res_image)
+static int rxe_qp_restore_resources(struct rxe_qp *qp,
+				    const struct rxe_restore_qp_req *req,
+				    const void *res_image)
 {
 	if (res_image) {
 		size_t want = (size_t)qp->attr.max_dest_rd_atomic *
@@ -597,6 +603,59 @@ int rxe_qp_restore_resources(struct rxe_qp *qp,
 		qp->resp.res_tail = req->res_tail;
 	}
 
+	return 0;
+}
+
+int rxe_qp_stage_restore(struct rxe_qp *qp,
+			 const struct rxe_restore_qp_req *req,
+			 enum ib_qp_state state, const void *res_image)
+{
+	struct rxe_qp_restore_state *restore;
+	size_t bytes = req->res_image_bytes;
+
+	if (qp->restore_state || qp->restore_finalized)
+		return -EALREADY;
+	if (bytes && !res_image)
+		return -EINVAL;
+
+	restore = kvzalloc(struct_size(restore, resources, bytes), GFP_KERNEL);
+	if (!restore)
+		return -ENOMEM;
+
+	restore->req = *req;
+	restore->qp_state = state;
+	if (bytes)
+		memcpy(restore->resources, res_image, bytes);
+	qp->restore_state = restore;
+
+	return 0;
+}
+
+int rxe_qp_finalize_restore(struct rxe_qp *qp)
+{
+	struct rxe_qp_restore_state *restore = qp->restore_state;
+	int err;
+
+	if (qp->restore_finalized)
+		return 0;
+	if (!restore)
+		return -EINVAL;
+
+	err = rxe_qp_restore_wire_state(qp, &restore->req,
+					restore->qp_state);
+	if (err)
+		return err;
+
+	if (restore->req.res_image_bytes) {
+		err = rxe_qp_restore_resources(qp, &restore->req,
+					       restore->resources);
+		if (err)
+			return err;
+	}
+
+	kvfree(restore);
+	qp->restore_state = NULL;
+	qp->restore_finalized = true;
 	return 0;
 }
 
@@ -1138,6 +1197,9 @@ static void rxe_qp_do_cleanup(struct work_struct *work)
 {
 	struct rxe_qp *qp = container_of(work, typeof(*qp), cleanup_work.work);
 	unsigned long flags;
+
+	kvfree(qp->restore_state);
+	qp->restore_state = NULL;
 
 	spin_lock_irqsave(&qp->state_lock, flags);
 	qp->valid = 0;
