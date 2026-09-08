@@ -23,15 +23,15 @@
  *             pool filtered by owning ucontext.
  *
  *   QUERY_QP  dump-side counterpart to UVERBS_METHOD_RESTORE_QP: pack the
- *             full rxe wire state (AV, PSNs, cursors, transport attrs,
+ *             full rxe wire state (AV, PSNs, transport attrs,
  *             ring mmap offsets) into a payload byte-equal to
  *             struct rxe_restore_qp_req so the destination can restore
  *             the QP single-shot, plus the QP's userspace handle (the
  *             async-event cookie, not standard-queryable). cap / qp_type
  *             / qp_state are intentionally NOT emitted -- CRIU sources
  *             those from the standard IB_USER_VERBS_CMD_QUERY_QP verb and
- *             NLDEV. The in-flight SQ/RQ/responder ring images are a
- *             later slice; this method emits only the drained subset.
+ *             NLDEV. SQ and RQ contents are restored from their shared
+ *             mappings, not through this method.
  *
  *   QUERY_CQ  dump-side counterpart to UVERBS_METHOD_RESTORE_CQ: return a
  *             CQ's ring mmap offset + entry count so the dumper sources
@@ -96,20 +96,8 @@ enum rxe_ib_query_qp_attrs {
 	 * is not standard-queryable.
 	 */
 	RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
-	/*
-	 * In-flight SQ ring image (optional): the live [consumer, producer)
-	 * subspan, round-tripped opaquely into the RESTORE_QP UHW_IN tail.
-	 * Byte length is reported in rxe_restore_qp_req::sq_image_bytes;
-	 * absent/zero-length for a drained QP. Attr ids +4/+5 (RQ / responder
-	 * resources) are added by the following commits.
-	 */
+	/* Reserved compatibility attributes. RXE no longer emits queue data. */
 	RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
-	/*
-	 * In-flight RQ ring image (optional): the live [consumer, producer)
-	 * subspan, sized by rxe_restore_qp_req::rq_image_bytes. Absent for a
-	 * drained or SRQ-fed QP. Attr id +5 (responder resources) is added by
-	 * the following commit.
-	 */
 	RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE,
 	/*
 	 * In-flight responder-resources image (optional): the RC responder's
@@ -124,13 +112,7 @@ enum rxe_ib_query_qp_attrs {
 enum rxe_ib_query_cq_attrs {
 	RXE_IB_ATTR_QUERY_CQ_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
 	RXE_IB_ATTR_QUERY_CQ_RESP_BLOB,
-	/*
-	 * In-flight CQE ring image (optional): a variable-length raw byte
-	 * region appended on QUERY_CQ. Length is reported in
-	 * rxe_query_cq_resp::cqe_image_bytes. Declared now so the ABI is
-	 * stable, but left unfilled (zero-length) until the in-flight CQ
-	 * slice; a drained CQ carries no unreaped completions.
-	 */
+	/* Reserved compatibility attribute. RXE no longer emits queue data. */
 	RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE,
 };
 
