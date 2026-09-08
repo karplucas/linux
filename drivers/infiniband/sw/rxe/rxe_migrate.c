@@ -25,20 +25,15 @@
 #include <rdma/uverbs_named_ioctl.h>
 
 /*
- * Only connected/datagram transports carry the wire state QUERY_QP
- * emits. GSI/SMI and other special QP types are out of scope for CRIU
- * migration.
+ * RXE freeze drops packets that race with the context gate. Only RC has
+ * retransmission and duplicate suppression to recover them safely.
  */
 static int rxe_migrate_chk_qp_type(const struct ib_qp *ibqp)
 {
-	switch (ibqp->qp_type) {
-	case IB_QPT_RC:
-	case IB_QPT_UC:
-	case IB_QPT_UD:
+	if (ibqp->qp_type == IB_QPT_RC)
 		return 0;
-	default:
-		return -EOPNOTSUPP;
-	}
+
+	return -EOPNOTSUPP;
 }
 
 /*
