@@ -289,11 +289,12 @@ struct rxe_create_qp_resp {
  * rxe has no firmware. Every byte of wire-relevant QP state that the
  * destination cannot re-derive from the generic RESTORE_QP method attrs
  * (cap / type / state / create_flags / pd / cqs) must travel in this
- * blob and be stamped directly by rxe_restore_qp. This is the rxe
+ * blob and be staged by rxe_restore_qp. FINALIZE_CONTEXT applies it after
+ * queue mappings are restored. This is the rxe
  * mirror of "mlx5 sources it from FW": same logical QP state, different
- * backing store per driver. The restore verb is single-shot -- it lands
- * the QP directly at its captured final state with no kernel-side
- * ib_modify_qp chain and no userspace modify replay.
+ * backing store per driver. Finalization lands the QP directly at its
+ * captured state with no kernel-side ib_modify_qp chain and no userspace
+ * modify replay.
  *
  * Fields fall into three groups.
  *

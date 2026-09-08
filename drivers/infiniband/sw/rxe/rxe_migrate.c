@@ -2,10 +2,10 @@
 /*
  * Copyright (c) 2026 rxe CRIU migration. All rights reserved.
  *
- * Driver-private RXE_IB_OBJECT_MIGRATE uverbs object: the rxe arm of the
- * CRIU dump-side choreography. The generic restore path lives in the
- * UVERBS_OBJECT_RESTORE family; this object carries the dump-side queries
- * whose payloads are rxe-private.
+ * Driver-private RXE_IB_OBJECT_MIGRATE uverbs object: the RXE arm of the
+ * CRIU checkpoint and restore choreography. Generic object creation lives
+ * in UVERBS_OBJECT_RESTORE; this object carries RXE-private queries,
+ * datapath gating, and late context finalization.
  *
  * The object carries FREEZE_DATAPATH and FREEZE_CONTEXT plus the
  * dump-side query verbs QUERY_QP and QUERY_CQ, the counterparts to
