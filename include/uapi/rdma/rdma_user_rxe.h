@@ -349,6 +349,8 @@ struct rxe_create_qp_resp {
  *   @res_head / @res_tail  RC responder-resources ring cursors.
  *   @res_image_bytes  byte length of the responder-resources array appended
  *       to this request. Zero means that the image is absent.
+ *   @retry_cnt_left / @rnr_retry_left  live remaining retry budgets. These
+ *       are separate from the configured @retry_cnt and @rnr_retry values.
  *
  * Size note: well over the 8-byte inline-attr threshold (see
  * rxe_restore_cq_req), so the uverbs dispatcher always takes the
@@ -395,7 +397,9 @@ struct rxe_restore_qp_req {
 	__u32		sq_image_bytes;		/* must be zero */
 	__u32		rq_image_bytes;		/* must be zero */
 	__u32		res_image_bytes;	/* responder-resources byte count */
-	__aligned_u64	reserved2;
+	__u8		retry_cnt_left;
+	__u8		rnr_retry_left;
+	__u8		reserved2[6];
 };
 
 struct rxe_create_srq_resp {

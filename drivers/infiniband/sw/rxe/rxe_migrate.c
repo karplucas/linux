@@ -333,6 +333,8 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	blob.path_mtu		= qp->attr.path_mtu;
 	blob.retry_cnt		= qp->attr.retry_cnt;
 	blob.rnr_retry		= qp->attr.rnr_retry;
+	blob.retry_cnt_left	= qp->comp.retry_cnt;
+	blob.rnr_retry_left	= qp->comp.rnr_retry;
 	blob.min_rnr_timer	= qp->attr.min_rnr_timer;
 	blob.timeout		= qp->attr.timeout;
 	blob.port_num		= qp->attr.port_num;
