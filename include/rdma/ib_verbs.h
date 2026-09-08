@@ -4268,6 +4268,15 @@ u64 ib_qp_user_handle(const struct ib_qp *qp);
 struct ib_ucontext *ib_qp_ucontext(const struct ib_qp *qp);
 
 /**
+ * ib_cq_ucontext - Returns the ucontext that owns a user-mode CQ, or
+ * NULL for a kernel-mode CQ.
+ *
+ * Driver-side context operations use this accessor because
+ * `struct ib_cq.uobject` is private to the RDMA core.
+ */
+struct ib_ucontext *ib_cq_ucontext(const struct ib_cq *cq);
+
+/**
  * ib_destroy_qp - Destroys the specified QP.
  * @qp: The QP to destroy.
  * @udata: Valid udata or NULL for kernel objects
