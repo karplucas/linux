@@ -2149,6 +2149,20 @@ struct ib_ucontext *ib_qp_ucontext(const struct ib_qp *qp)
 }
 EXPORT_SYMBOL(ib_qp_ucontext);
 
+/**
+ * ib_cq_ucontext - Return the ucontext that owns a user-mode CQ
+ * @cq: CQ to inspect
+ *
+ * Return: The owning ucontext, or NULL for a kernel-mode CQ.
+ */
+struct ib_ucontext *ib_cq_ucontext(const struct ib_cq *cq)
+{
+	if (!cq->uobject)
+		return NULL;
+	return cq->uobject->uevent.uobject.context;
+}
+EXPORT_SYMBOL(ib_cq_ucontext);
+
 int ib_close_qp(struct ib_qp *qp)
 {
 	struct ib_qp *real_qp;
