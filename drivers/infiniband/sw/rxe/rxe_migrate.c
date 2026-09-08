@@ -148,6 +148,109 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_CONTEXT)(
 	return 0;
 }
 
+static int rxe_finalize_context_cqs(struct rxe_dev *rxe,
+				    struct ib_ucontext *ucontext)
+{
+	struct rxe_pool *pool = &rxe->cq_pool;
+	struct rxe_pool_elem *elem;
+	unsigned long index = 0;
+	int err = 0;
+
+	rcu_read_lock();
+	for (elem = xa_find(&pool->xa, &index, ULONG_MAX, XA_PRESENT);
+	     elem;
+	     elem = xa_find_after(&pool->xa, &index, ULONG_MAX, XA_PRESENT)) {
+		struct rxe_cq *cq = elem->obj;
+		unsigned long flags;
+
+		if (!kref_get_unless_zero(&elem->ref_cnt))
+			continue;
+		rcu_read_unlock();
+
+		if (cq->is_user && ib_cq_ucontext(&cq->ibcq) == ucontext) {
+			if (!cq->queue) {
+				err = -EINVAL;
+			} else {
+				spin_lock_irqsave(&cq->cq_lock, flags);
+				err = rxe_queue_sync_for_restore(cq->queue);
+				spin_unlock_irqrestore(&cq->cq_lock, flags);
+			}
+		}
+
+		rxe_put(cq);
+		if (err)
+			return err;
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
+
+	return 0;
+}
+
+static int rxe_finalize_context_qps(struct rxe_dev *rxe,
+				    struct ib_ucontext *ucontext)
+{
+	struct rxe_pool *pool = &rxe->qp_pool;
+	struct rxe_pool_elem *elem;
+	unsigned long index = 0;
+	int err = 0;
+
+	rcu_read_lock();
+	for (elem = xa_find(&pool->xa, &index, ULONG_MAX, XA_PRESENT);
+	     elem;
+	     elem = xa_find_after(&pool->xa, &index, ULONG_MAX, XA_PRESENT)) {
+		struct rxe_qp *qp = elem->obj;
+		unsigned long flags;
+
+		if (!kref_get_unless_zero(&elem->ref_cnt))
+			continue;
+		rcu_read_unlock();
+
+		if (!qp->is_user || ib_qp_ucontext(&qp->ibqp) != ucontext)
+			goto next;
+
+		spin_lock_irqsave(&qp->state_lock, flags);
+		if (!qp->dp_frozen)
+			err = -EINVAL;
+		spin_unlock_irqrestore(&qp->state_lock, flags);
+		if (err)
+			goto next;
+
+		if (qp->sq.queue)
+			err = rxe_queue_sync_for_restore(qp->sq.queue);
+		if (!err && qp->rq.queue && !qp->srq)
+			err = rxe_queue_sync_for_restore(qp->rq.queue);
+
+next:
+		rxe_put(qp);
+		if (err)
+			return err;
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
+
+	return 0;
+}
+
+static int UVERBS_HANDLER(RXE_IB_METHOD_FINALIZE_CONTEXT)(struct uverbs_attr_bundle *attrs)
+{
+	struct ib_ucontext *ucontext = ib_uverbs_get_ucontext(attrs);
+	struct rxe_dev *rxe;
+	int err;
+
+	if (IS_ERR(ucontext))
+		return PTR_ERR(ucontext);
+	if (!to_ruc(ucontext)->restore_mode)
+		return -EACCES;
+
+	rxe = to_rdev(ucontext->device);
+	err = rxe_finalize_context_cqs(rxe, ucontext);
+	if (err)
+		return err;
+
+	return rxe_finalize_context_qps(rxe, ucontext);
+}
+
 /*
  * Emit one optional ring image attr, shipping only the in-flight
  * [consumer, producer) subspan rather than the whole ring. @producer /
@@ -412,6 +515,8 @@ DECLARE_UVERBS_NAMED_METHOD(
 			   UVERBS_ATTR_TYPE(u8),
 			   UA_MANDATORY));
 
+DECLARE_UVERBS_NAMED_METHOD(RXE_IB_METHOD_FINALIZE_CONTEXT);
+
 DECLARE_UVERBS_NAMED_METHOD(
 	RXE_IB_METHOD_QUERY_QP,
 	UVERBS_ATTR_IDR(RXE_IB_ATTR_QUERY_QP_HANDLE,
@@ -452,7 +557,8 @@ DECLARE_UVERBS_GLOBAL_METHODS(
 	&UVERBS_METHOD(RXE_IB_METHOD_FREEZE_DATAPATH),
 	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_QP),
 	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_CQ),
-	&UVERBS_METHOD(RXE_IB_METHOD_FREEZE_CONTEXT));
+	&UVERBS_METHOD(RXE_IB_METHOD_FREEZE_CONTEXT),
+	&UVERBS_METHOD(RXE_IB_METHOD_FINALIZE_CONTEXT));
 
 const struct uapi_definition rxe_migrate_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(RXE_IB_OBJECT_MIGRATE),
