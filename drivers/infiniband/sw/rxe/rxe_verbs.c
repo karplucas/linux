@@ -715,6 +715,12 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	int err, cleanup_err;
 	size_t n;
 
+	if (ibqp->qp_type != IB_QPT_RC) {
+		err = -EOPNOTSUPP;
+		rxe_dbg_dev(rxe, "restore supports RC QPs only\n");
+		goto err_out;
+	}
+
 	/* rxe has no create_flags support (matches rxe_create_qp). */
 	if (create_flags) {
 		err = -EOPNOTSUPP;
