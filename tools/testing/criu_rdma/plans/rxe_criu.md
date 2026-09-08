@@ -256,6 +256,10 @@ per-object control operations.
 CRIU currently treats RXE queues as plugin-owned device mappings and saves
 their metadata, not their contents.
 
+Queue pages are restored only to the same RXE kernel implementation. Their
+mapped layout is not a cross-kernel conversion format; geometry and mapping
+identity are validated to reject corrupt or mismatched queues.
+
 The plugin could identify a queue mapping by uverbs file, offset, length, and
 owning uobject. CRIU would copy only those verified mappings. This is what
 earlier drafts called "explicit opt-in"; arbitrary device mappings cannot be
