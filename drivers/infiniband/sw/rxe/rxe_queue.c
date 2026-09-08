@@ -208,3 +208,34 @@ void rxe_queue_cleanup(struct rxe_queue *q)
 
 	kfree(q);
 }
+
+int rxe_queue_sync_for_restore(struct rxe_queue *queue)
+{
+	struct rxe_queue_buf *buf = queue->buf;
+	u32 consumer;
+	u32 producer;
+
+	if (READ_ONCE(buf->log2_elem_size) != queue->log2_elem_size ||
+	    READ_ONCE(buf->index_mask) != queue->index_mask)
+		return -EINVAL;
+
+	/* Order later queue entry reads after the restored shared indices. */
+	producer = smp_load_acquire(&buf->producer_index);
+	/* See the producer index ordering above. */
+	consumer = smp_load_acquire(&buf->consumer_index);
+	if (producer > queue->index_mask || consumer > queue->index_mask)
+		return -EINVAL;
+
+	switch (queue->type) {
+	case QUEUE_TYPE_FROM_CLIENT:
+		queue->index = consumer;
+		break;
+	case QUEUE_TYPE_TO_CLIENT:
+		queue->index = producer;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}

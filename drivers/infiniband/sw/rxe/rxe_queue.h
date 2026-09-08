@@ -93,6 +93,8 @@ int rxe_queue_resize(struct rxe_queue *q, unsigned int *num_elem_p,
 
 void rxe_queue_cleanup(struct rxe_queue *queue);
 
+int rxe_queue_sync_for_restore(struct rxe_queue *queue);
+
 static inline u32 queue_next_index(struct rxe_queue *q, int index)
 {
 	return (index + 1) & q->index_mask;
