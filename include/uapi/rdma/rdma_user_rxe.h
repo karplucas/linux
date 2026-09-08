@@ -230,24 +230,10 @@ struct rxe_resize_cq_resp {
  * rxe_create_cq_resp::mi.offset returned via UHW_OUT equals
  * @vm_pgoff.
  *
- * In-flight CQ ring round-trip (mirrors rxe_restore_qp_req + SQ image).
- * A CQ ring is a shared cdev-file VMA that CRIU does not snapshot, so the
- * unreaped CQEs and the producer/consumer cursors present at checkpoint
- * are otherwise lost (post-restore ibv_poll_cq returns nothing and a
- * polling client live-locks). The dumper sources these from QUERY_CQ and
- * replays them here:
- *   @producer / @consumer  the source ring cursors. The user CQ ring is
- *       QUEUE_TYPE_TO_CLIENT, so the producer is kernel-owned (q->index,
- *       mirrored to buf->producer_index) and the consumer is client-owned
- *       (buf->consumer_index) -- the opposite ownership to the SQ/RQ. The
- *       destination seeds them via rxe_cq_seed_ring() (NOT rxe_qp_seed_ring,
- *       which seeds q->index from the consumer and would make the next
- *       rxe_cq_post clobber slot 0).
- *   @cqe_image_bytes  byte length of the in-flight [consumer, producer)
- *       CQE image appended to the UHW_IN tail after this fixed struct,
- *       exactly like rxe_restore_qp_req + SQ image. Zero => empty-CQ fast
- *       path (no blit). The destination validates it against the
- *       freshly-created ring geometry (-EINVAL on mismatch).
+ * CRIU restores CQ contents and cursors through the mapped queue pages.
+ * @producer, @consumer, and @cqe_image_bytes are retained for source
+ * compatibility and must be zero. FINALIZE_CONTEXT validates the restored
+ * queue header and imports the kernel-owned producer index.
  *
  * Size note: must stay strictly larger than sizeof(__u64) (== 8B).
  * The uverbs ioctl bundle treats UHW_IN attrs with len <= 8 as
@@ -256,8 +242,8 @@ struct rxe_resize_cq_resp {
  * happened to put in struct ib_uverbs_attr::data (a pointer to
  * this struct, in the natural calling convention). The struct is
  * sized > 8 so the dispatcher takes the pointer path and
- * copy_from_user reads the real userspace buffer. @reserved must be
- * 0 and backs forward-compat fields.
+ * copy_from_user reads the real userspace buffer. All fields other than
+ * @vm_pgoff must be zero.
  */
 struct rxe_restore_cq_req {
 	__aligned_u64 vm_pgoff;
@@ -273,14 +259,8 @@ struct rxe_restore_cq_req {
  * The dump-side counterpart to struct rxe_restore_cq_req: @vm_pgoff is
  * the CQ ring's mmap byte offset (cq->queue->ip->info.offset) that the
  * dumper replays into RESTORE_CQ, and @cqe is the user-visible entry
- * count. @producer / @consumer are the live ring cursors
- * (QUEUE_TYPE_TO_CLIENT: producer == q->index, consumer ==
- * buf->consumer_index), replayed into rxe_restore_cq_req so the restored
- * ring's unreaped completions are visible to ibv_poll_cq.
- * @cqe_image_bytes is the byte length of the in-flight [consumer,
- * producer) CQE image emitted in the optional
- * RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE attr (0 for a drained CQ).
- * @reserved must be 0 and is available for future fields.
+ * count. The remaining fields are zero. Queue contents and cursors are read
+ * from the mapping by CRIU and synchronized with FINALIZE_CONTEXT.
  */
 struct rxe_query_cq_resp {
 	__aligned_u64 vm_pgoff;
@@ -347,38 +327,25 @@ struct rxe_create_qp_resp {
  *       because the generic RESTORE_QP method exposes only
  *       create_flags, not the legacy sq_sig_all bit.
  *
- * Internal cursors ib_modify_qp cannot express -- the precise reason a
+ * Internal protocol state ib_modify_qp cannot express -- the precise reason a
  * create+modify replay cannot faithfully restore an in-flight QP:
  *   @req_psn   next PSN the requester will send (qp->req.psn).
  *   @comp_psn  next PSN the completer expects ACKed (qp->comp.psn).
  *   @resp_psn  next request PSN the responder expects (qp->resp.psn).
  *   @resp_msn  responder message sequence number (qp->resp.msn).
- *   @req_wqe_index  requester's SQ consumer cursor (qp->req.wqe_index).
+ *   @req_wqe_index  requester's current WQE position (qp->req.wqe_index).
  *   @ssn  send sequence number (qp->ssn).
  *
- * In-flight (non-drained) datapath state. A QP frozen (not drained) at
- * the snapshot point may have posted-but-unsent / sent-but-unacked SQ
- * work, pre-posted RQ buffers, and RC responder replay resources. The
- * fixed header carries the cursors + responder scalars; the
- * variable-length ring/resource byte images travel out-of-band (QUERY_QP
- * image attrs; RESTORE_QP UHW_IN tail) and are located by the
- * @*_image_bytes counts. All-zero here (and zero-length images) means a
- * drained/idle QP -- the cursor-only restore path. QUERY_QP leaves this
- * whole group zero until the in-flight QP slice lands; a drained QP
- * needs only the groups above.
- *   @sq_producer / @sq_consumer  SQ ring shared-page indices. Together
- *       with @req_wqe_index they bracket the three SQ regions
- *       (unsent / unacked / retired); restore rewinds the requester to
- *       @sq_consumer and replays [@sq_consumer, @sq_producer).
- *   @rq_producer / @rq_consumer  RQ ring indices (pre-posted recv WQEs).
+ * In-flight responder state. SQ and RQ entries and their cursors are copied
+ * as mapped memory by CRIU, then synchronized with FINALIZE_CONTEXT.
+ * @sq_producer, @sq_consumer, @rq_producer, @rq_consumer,
+ * @sq_image_bytes, and @rq_image_bytes are retained for source compatibility
+ * and must be zero.
  *   @resp_ack_psn / @resp_opcode / @resp_status / @resp_aeth_syndrome
  *       responder scalars not already covered by @resp_psn / @resp_msn.
  *   @res_head / @res_tail  RC responder-resources ring cursors.
- *   @sq_image_bytes / @rq_image_bytes / @res_image_bytes  byte lengths of
- *       the SQ slot region, RQ slot region, and responder-resources array
- *       images. Zero => that image is absent (drained ring / UD-UC with no
- *       responder array / SRQ-backed RQ, out of scope). The destination
- *       validates each against the freshly-created ring/array geometry.
+ *   @res_image_bytes  byte length of the responder-resources array appended
+ *       to this request. Zero means that the image is absent.
  *
  * Size note: well over the 8-byte inline-attr threshold (see
  * rxe_restore_cq_req), so the uverbs dispatcher always takes the
@@ -413,17 +380,17 @@ struct rxe_restore_qp_req {
 	__u8		sq_sig_all;
 	__u8		resp_aeth_syndrome;	/* qp->resp.aeth_syndrome */
 	__u16		reserved;
-	__u32		sq_producer;		/* SQ buf->producer_index */
-	__u32		sq_consumer;		/* SQ buf->consumer_index */
-	__u32		rq_producer;		/* RQ buf->producer_index */
-	__u32		rq_consumer;		/* RQ buf->consumer_index */
+	__u32		sq_producer;		/* must be zero */
+	__u32		sq_consumer;		/* must be zero */
+	__u32		rq_producer;		/* must be zero */
+	__u32		rq_consumer;		/* must be zero */
 	__u32		resp_ack_psn;		/* qp->resp.ack_psn */
 	__s32		resp_opcode;		/* qp->resp.opcode (-1 idle) */
 	__u32		resp_status;		/* qp->resp.status (ib_wc_status) */
 	__u32		res_head;		/* qp->resp.res_head */
 	__u32		res_tail;		/* qp->resp.res_tail */
-	__u32		sq_image_bytes;		/* SQ slot region byte count */
-	__u32		rq_image_bytes;		/* RQ slot region byte count */
+	__u32		sq_image_bytes;		/* must be zero */
+	__u32		rq_image_bytes;		/* must be zero */
 	__u32		res_image_bytes;	/* responder-resources byte count */
 	__aligned_u64	reserved2;
 };

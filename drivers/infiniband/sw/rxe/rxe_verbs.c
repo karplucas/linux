@@ -664,27 +664,23 @@ err_out:
  * directly at its captured final state via rxe_qp_restore_wire_state
  * with no ib_modify_qp chain.
  *
- * A drained source ships the fixed rxe_restore_qp_req header alone and
- * takes the cursor-only fast path. A non-drained source appends its live
- * SQ/RQ ring subspans and responder-resources array in the UHW_IN tail
- * (located by the header's {sq,rq,res}_image_bytes); rxe_restore_qp_inflight
- * slices and applies them. The restored QP is installed datapath-frozen
- * so the replay does not fire until the orchestrator thaws the ucontext.
+ * The responder-resources array follows the fixed request in UHW_IN. SQ and
+ * RQ contents remain in their mapped pages and are synchronized by
+ * FINALIZE_CONTEXT. The restored QP is installed datapath-frozen so replay
+ * cannot start before that operation completes.
  */
-static int rxe_restore_qp_inflight(struct rxe_qp *qp,
-				   const struct rxe_restore_qp_req *req,
-				   struct ib_udata *udata)
+static int rxe_restore_qp_resources(struct rxe_qp *qp,
+				    const struct rxe_restore_qp_req *req,
+				    struct ib_udata *udata)
 {
-	const void *sq_image = NULL, *rq_image = NULL, *res_image = NULL;
 	const size_t hdr = sizeof(*req);
-	size_t tail, off;
+	size_t bytes;
 	void *buf;
 	int err;
 
-	tail = (size_t)req->sq_image_bytes + req->rq_image_bytes +
-	       req->res_image_bytes;
-	/* Caller only invokes this for a tail; a header-sized inlen is drained. */
-	if (tail == 0 || udata->inlen != hdr + tail)
+	bytes = (size_t)req->max_dest_rd_atomic * sizeof(struct resp_res);
+	if (!bytes || bytes != req->res_image_bytes ||
+	    udata->inlen != hdr + bytes)
 		return -EINVAL;
 
 	buf = kvmalloc(udata->inlen, GFP_KERNEL);
@@ -695,19 +691,7 @@ static int rxe_restore_qp_inflight(struct rxe_qp *qp,
 	if (err)
 		goto out;
 
-	off = hdr;
-	if (req->sq_image_bytes) {
-		sq_image = buf + off;
-		off += req->sq_image_bytes;
-	}
-	if (req->rq_image_bytes) {
-		rq_image = buf + off;
-		off += req->rq_image_bytes;
-	}
-	if (req->res_image_bytes)
-		res_image = buf + off;
-
-	err = rxe_qp_restore_inflight(qp, req, sq_image, rq_image, res_image);
+	err = rxe_qp_restore_resources(qp, req, buf + hdr);
 out:
 	kvfree(buf);
 	return err;
@@ -773,6 +757,12 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 		rxe_dbg_dev(rxe, "restore qp req reserved must be 0\n");
 		goto err_out;
 	}
+	if (req.sq_producer || req.sq_consumer || req.rq_producer ||
+	    req.rq_consumer || req.sq_image_bytes || req.rq_image_bytes) {
+		err = -EOPNOTSUPP;
+		rxe_dbg_dev(rxe, "restore qp queue images are unsupported\n");
+		goto err_out;
+	}
 	if (req.qpn == 0) {
 		err = -EINVAL;
 		rxe_dbg_dev(rxe, "restore qp req qpn must be non-zero\n");
@@ -830,15 +820,11 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 		goto err_cleanup;
 	}
 
-	/*
-	 * A UHW tail beyond the fixed header carries the source's in-flight
-	 * SQ/RQ ring images + responder resources; apply them over the rings
-	 * rxe_qp_from_init just built. Drained restores skip this.
-	 */
+	/* A UHW tail contains only the responder resource image. */
 	if (udata->inlen > sizeof(req)) {
-		err = rxe_restore_qp_inflight(qp, &req, udata);
+		err = rxe_restore_qp_resources(qp, &req, udata);
 		if (err) {
-			rxe_dbg_qp(qp, "restore qp inflight failed, err = %d\n",
+			rxe_dbg_qp(qp, "restore qp resources failed, err = %d\n",
 				   err);
 			goto err_cleanup;
 		}
@@ -1420,44 +1406,6 @@ err_out:
  * non-zero attr->flags (no rxe-side support for IB_UVERBS_CQ_FLAGS_*)
  * the same as rxe_create_cq.
  */
-/*
- * CRIU in-flight CQ restore: scatter the captured in-flight CQE image (the
- * [consumer, producer) subspan QUERY_CQ emitted, in logical order) back
- * into the freshly-created ring, landing each entry at its source slot so
- * the resumed client's cached consumer index still points at the right
- * CQEs. A CQ has a single ring so there is one image. The image geometry
- * must match what rxe_cq_from_init just built (validated by
- * queue_inflight_restore against the cursors); a mismatch is rejected
- * rather than silently corrupting the ring. The caller seeds the cursors
- * (rxe_cq_seed_ring) once this returns -- the producer/consumer live in the
- * ring header, disjoint from buf->data, so order does not matter.
- */
-static int rxe_restore_cq_inflight(struct rxe_cq *cq,
-				   const struct rxe_restore_cq_req *req,
-				   struct ib_udata *udata)
-{
-	const size_t hdr = sizeof(*req);
-	void *buf;
-	int err;
-
-	if (udata->inlen != hdr + req->cqe_image_bytes)
-		return -EINVAL;
-
-	buf = kvmalloc(udata->inlen, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	err = ib_copy_from_udata(buf, udata, udata->inlen);
-	if (err)
-		goto out;
-
-	err = queue_inflight_restore(cq->queue, req->producer, req->consumer,
-				     buf + hdr, req->cqe_image_bytes);
-out:
-	kvfree(buf);
-	return err;
-}
-
 static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 			  const struct ib_cq_init_attr *attr,
 			  struct ib_udata *udata)
@@ -1518,6 +1466,12 @@ static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 					    "restore cq req reserved must be 0\n");
 				goto err_out;
 			}
+			if (req.producer || req.consumer || req.cqe_image_bytes) {
+				err = -EOPNOTSUPP;
+				rxe_dbg_dev(rxe,
+					    "restore cq queue images are unsupported\n");
+				goto err_out;
+			}
 			forced_vm_pgoff = req.vm_pgoff;
 		} else if (udata->inlen != 0) {
 			err = -EINVAL;
@@ -1550,48 +1504,9 @@ static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 		goto err_cleanup;
 	}
 
-	/*
-	 * CRIU: round-trip the in-flight CQE ring. The CQ ring is a shared cdev
-	 * VMA that CRIU does not snapshot (it is remapped, not written back),
-	 * so unreaped CQEs and the cursors are shipped through
-	 * QUERY_CQ/RESTORE_CQ instead (mirrors the QP SQ/RQ image path). The
-	 * cursors are validated and seeded unconditionally (cheap, and correct
-	 * for a wrapped-but-empty ring); the ring image, when present
-	 * (cqe_image_bytes > 0 and an UHW_IN tail), is blitted first. The user
-	 * CQ ring is QUEUE_TYPE_TO_CLIENT so the seed goes through
-	 * rxe_cq_seed_ring (kernel-owned producer), NOT rxe_qp_seed_ring -- see
-	 * the helper for why reuse would clobber slot 0.
-	 */
-	if (req.producer > cq->queue->index_mask ||
-	    req.consumer > cq->queue->index_mask) {
-		err = -EINVAL;
-		rxe_dbg_cq(cq, "restore cq: cursor out of range (prod=%u cons=%u mask=%u)\n",
-			   req.producer, req.consumer, cq->queue->index_mask);
-		goto err_cleanup;
-	}
-
-	if (req.cqe_image_bytes) {
-		err = rxe_restore_cq_inflight(cq, &req, udata);
-		if (err) {
-			rxe_dbg_cq(cq, "restore cq image failed, err = %d\n", err);
-			goto err_cleanup;
-		}
-	}
-
-	rxe_cq_seed_ring(cq->queue, req.producer, req.consumer);
-
-	/*
-	 * Cold-path, dynamic-debug gated: log the geometry, whether a source
-	 * pgoff was plumbed (0 => the mmap cannot alias the source page) and
-	 * the seeded cursors (read in the ring's own TO_CLIENT direction).
->>>>>>> e5eeca7a5610 (RDMA/rxe: seed the in-flight CQ ring on RESTORE_CQ)
-	 */
 	rxe_dbg_cq(cq,
-		   "restore cq: cqe=%d forced_vm_pgoff=0x%llx image_bytes=%u q(prod=%u cons=%u)\n",
-		   attr->cqe, (unsigned long long)forced_vm_pgoff,
-		   req.cqe_image_bytes,
-		   queue_get_producer(cq->queue, cq->queue->type),
-		   queue_get_consumer(cq->queue, cq->queue->type));
+		   "restore cq: cqe=%d forced_vm_pgoff=0x%llx\n",
+		   attr->cqe, (unsigned long long)forced_vm_pgoff);
 
 	return 0;
 

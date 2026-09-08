@@ -478,22 +478,6 @@ err1:
 }
 
 /*
- * Seed a freshly-created ring's cursors to the source-side indices. For
- * the SQ/RQ (QUEUE_TYPE_FROM_CLIENT) the client owns @producer and rxe
- * owns @consumer (mirrored into the shared page and rxe's private copy).
- * Indices are masked to slot width to match the wire bookkeeping.
- */
-static void rxe_qp_seed_ring(struct rxe_queue *q, u32 producer, u32 consumer)
-{
-	producer &= q->index_mask;
-	consumer &= q->index_mask;
-
-	q->buf->producer_index = producer;
-	q->buf->consumer_index = consumer;
-	q->index = consumer;
-}
-
-/*
  * CRIU restore: stamp a freshly-created QP with the captured wire
  * state from the rxe_restore_qp_req UHW and land it directly at its
  * final IBTA state. No ib_modify_qp chain runs -- this is the
@@ -577,7 +561,7 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
 	 * last ack/nak emitted), so they are independent of whether the
 	 * local SQ was in-flight: a drained / pure-responder QP still needs
 	 * them. Restore unconditionally here rather than in
-	 * rxe_qp_restore_inflight() (which only runs when an SQ/RQ/res image
+	 * rxe_qp_restore_resources() (which only runs when a resource image
 	 * tail is present). Without resp.opcode in particular, a peer
 	 * replaying a multi-packet RDMA WRITE/SEND hits check_op_seq() with
 	 * resp.opcode == OPCODE_NONE -> RESPST_ERR_MISSING_OPCODE_FIRST ->
@@ -589,23 +573,6 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
 	qp->resp.status		 = req->resp_status;
 	qp->resp.aeth_syndrome	 = req->resp_aeth_syndrome;
 
-	/*
-	 * Seed the freshly-created ring cursors to the source base so the
-	 * shared-page producer/consumer that userspace reads agree with
-	 * qp->req.wqe_index. Without this the ring is left at 0/0 while
-	 * wqe_index sits at the source base: the first post-restore
-	 * post_send lands at slot 0, but the requester computes
-	 * wqe_index == producer and skips the WQE forever (no packet,
-	 * post_send hangs). For a drained QP the source cursors equal the
-	 * wqe_index base, so producer/consumer/wqe_index stay coherent.
-	 */
-	if (qp->sq.queue)
-		rxe_qp_seed_ring(qp->sq.queue, req->sq_producer,
-				 req->sq_consumer);
-	if (qp->rq.queue && !qp->srq)
-		rxe_qp_seed_ring(qp->rq.queue, req->rq_producer,
-				 req->rq_consumer);
-
 	spin_lock_irqsave(&qp->state_lock, flags);
 	qp->attr.qp_state	 = state;
 	qp->attr.cur_qp_state	 = state;
@@ -614,53 +581,10 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
 	return 0;
 }
 
-/*
- * Apply a non-drained QP's captured in-flight datapath onto the freshly
- * created rings, after rxe_qp_restore_wire_state() has stamped the
- * PSNs/AV/attrs. Each image is the [consumer, producer) subspan QUERY_QP
- * emitted; queue_inflight_restore() scatters it back to the same absolute
- * slots (validating the geometry against the cursors, -EINVAL on
- * mismatch) so the resumed client's cached indices still point at the
- * right WQEs. A drained QP has no image tail and never reaches here.
- */
-int rxe_qp_restore_inflight(struct rxe_qp *qp,
-			    const struct rxe_restore_qp_req *req,
-			    const void *sq_image, const void *rq_image,
-			    const void *res_image)
+int rxe_qp_restore_resources(struct rxe_qp *qp,
+			     const struct rxe_restore_qp_req *req,
+			     const void *res_image)
 {
-	int err;
-
-	if (sq_image) {
-		if (!qp->sq.queue)
-			return -EINVAL;
-		err = queue_inflight_restore(qp->sq.queue, req->sq_producer,
-					     req->sq_consumer, sq_image,
-					     req->sq_image_bytes);
-		if (err)
-			return err;
-		rxe_qp_seed_ring(qp->sq.queue, req->sq_producer,
-				 req->sq_consumer);
-		/*
-		 * Rewind the requester to the unacked tail so it replays the
-		 * whole [consumer, producer) window; the peer drops duplicate
-		 * PSNs. rxe_qp_resume() arms the retry that resets each
-		 * blitted WQE's DMA cursor before the send_task runs.
-		 */
-		qp->req.wqe_index = req->sq_consumer & qp->sq.queue->index_mask;
-	}
-
-	if (rq_image) {
-		if (!qp->rq.queue || qp->srq)
-			return -EINVAL;
-		err = queue_inflight_restore(qp->rq.queue, req->rq_producer,
-					     req->rq_consumer, rq_image,
-					     req->rq_image_bytes);
-		if (err)
-			return err;
-		rxe_qp_seed_ring(qp->rq.queue, req->rq_producer,
-				 req->rq_consumer);
-	}
-
 	if (res_image) {
 		size_t want = (size_t)qp->attr.max_dest_rd_atomic *
 			      sizeof(struct resp_res);
