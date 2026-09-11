@@ -19,6 +19,7 @@ rdma_rxe-y := \
 	rxe_opcode.o \
 	rxe_mmap.o \
 	rxe_migrate.o \
+	rxe_vhca.o \
 	rxe_icrc.o \
 	rxe_mcast.o \
 	rxe_task.o \
