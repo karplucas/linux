@@ -5,6 +5,7 @@
 #include <linux/overflow.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
+#include <linux/xarray.h>
 
 #include "rxe.h"
 #include "rxe_vhca.h"
@@ -659,6 +660,11 @@ int rxe_vhca_validate_contexts(const void *data, size_t length)
 	struct rxe_vhca_context_header context;
 	struct rxe_vhca_record record;
 	struct rxe_vhca_reader reader;
+	DEFINE_XARRAY(context_ids);
+	DEFINE_XARRAY(cq_ids);
+	DEFINE_XARRAY(qp_ids);
+	unsigned long *resource_slots = NULL;
+	u32 resource_slot_count = 0;
 	u32 context_count = 0;
 	u32 cq_count = 0;
 	u32 qp_count = 0;
@@ -673,9 +679,28 @@ int rxe_vhca_validate_contexts(const void *data, size_t length)
 		u32 ufile_id;
 
 		if (record.type == RXE_VHCA_RECORD_RESP_RESOURCE) {
+			struct rxe_vhca_resp_resource image_resource;
+			struct resp_res resource;
+			u32 slots;
+			u32 slot;
+
 			if (!resource_count || record.flags ||
-			    record.length != sizeof(struct rxe_vhca_resp_resource))
-				return -EBADMSG;
+			    record.length != sizeof(image_resource)) {
+				err = -EBADMSG;
+				goto out;
+			}
+			memcpy(&image_resource, record.payload,
+			       sizeof(image_resource));
+			slot = le32_to_cpu(image_resource.slot);
+			if (slot >= resource_slot_count ||
+			    test_and_set_bit(slot, resource_slots)) {
+				err = -EBADMSG;
+				goto out;
+			}
+			slots = resource_slot_count;
+			err = rxe_vhca_decode_resp_resource(&image_resource, slots, &resource);
+			if (err)
+				goto out;
 			resource_count--;
 			continue;
 		}
@@ -684,19 +709,33 @@ int rxe_vhca_validate_contexts(const void *data, size_t length)
 
 			if (cq_count || !qp_count || resource_count || record.flags ||
 			    record.length != sizeof(qp))
-				return -EBADMSG;
+				goto bad_image;
 			memcpy(&qp, record.payload, sizeof(qp));
+			err = xa_insert(&qp_ids,
+					le32_to_cpu(qp.header.uobject_handle),
+					XA_ZERO_ENTRY, GFP_KERNEL);
+			if (err) {
+				err = err == -EBUSY ? -EBADMSG : err;
+				goto out;
+			}
 			if (qp.state.retrans_pending > 1 || qp.state.rnr_pending > 1 ||
 			    (!qp.state.retrans_pending &&
 			     le64_to_cpu(qp.state.retrans_remaining_ns)) ||
 			    (!qp.state.rnr_pending &&
 			     le64_to_cpu(qp.state.rnr_remaining_ns)))
-				return -EBADMSG;
+				goto bad_image;
 			resource_count =
 				le32_to_cpu(qp.header.resp_resource_count);
+			resource_slot_count = resource_count;
+			bitmap_free(resource_slots);
+			resource_slots = bitmap_zalloc(resource_slot_count, GFP_KERNEL);
+			if (resource_slot_count && !resource_slots) {
+				err = -ENOMEM;
+				goto out;
+			}
 			if (resource_count !=
 			    le32_to_cpu(qp.state.max_dest_rd_atomic))
-				return -EBADMSG;
+				goto bad_image;
 			qp_count--;
 			continue;
 		}
@@ -705,29 +744,52 @@ int rxe_vhca_validate_contexts(const void *data, size_t length)
 
 			if (!cq_count || record.flags ||
 			    record.length != sizeof(cq))
-				return -EBADMSG;
+				goto bad_image;
 			memcpy(&cq, record.payload, sizeof(cq));
+			err = xa_insert(&cq_ids, le32_to_cpu(cq.uobject_handle),
+					XA_ZERO_ENTRY, GFP_KERNEL);
+			if (err) {
+				err = err == -EBUSY ? -EBADMSG : err;
+				goto out;
+			}
 			if (le32_to_cpu(cq.notify) & ~IB_CQ_SOLICITED_MASK)
-				return -EBADMSG;
+				goto bad_image;
 			cq_count--;
 			continue;
 		}
 		if (record.type != RXE_VHCA_RECORD_CONTEXT || record.flags ||
 		    record.length != sizeof(context) || cq_count || qp_count ||
 		    resource_count)
-			return -EBADMSG;
+			goto bad_image;
 		memcpy(&context, record.payload, sizeof(context));
 		ufile_id = le32_to_cpu(context.ufile_id);
 		if (!ufile_id || le32_to_cpu(context.reserved))
-			return -EBADMSG;
+			goto bad_image;
+		err = xa_insert(&context_ids, ufile_id, XA_ZERO_ENTRY,
+				GFP_KERNEL);
+		if (err) {
+			err = err == -EBUSY ? -EBADMSG : err;
+			goto out;
+		}
+		xa_destroy(&cq_ids);
+		xa_destroy(&qp_ids);
 		cq_count = le32_to_cpu(context.cq_count);
 		qp_count = le32_to_cpu(context.qp_count);
 		context_count++;
 	}
 	if (err)
-		return err;
+		goto out;
 	if (cq_count || qp_count || resource_count)
-		return -EBADMSG;
+		goto bad_image;
+	err = context_count ? 0 : -ENODATA;
+	goto out;
 
-	return context_count ? 0 : -ENODATA;
+bad_image:
+	err = -EBADMSG;
+out:
+	bitmap_free(resource_slots);
+	xa_destroy(&qp_ids);
+	xa_destroy(&cq_ids);
+	xa_destroy(&context_ids);
+	return err;
 }

@@ -155,6 +155,106 @@ static void rxe_vhca_qp_lookup_test(struct kunit *test)
 	kfree(resources);
 }
 
+static void rxe_vhca_duplicate_context_test(struct kunit *test)
+{
+	struct rxe_vhca_context_header context = {
+		.ufile_id = cpu_to_le32(7),
+	};
+	struct rxe_vhca_writer writer;
+	u8 image[128];
+
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_writer_init(&writer, image, sizeof(image)), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_CONTEXT, 0,
+					      &context, sizeof(context)), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_CONTEXT, 0,
+					      &context, sizeof(context)), 0);
+	KUNIT_EXPECT_EQ(test,
+			rxe_vhca_validate_contexts(image, writer.length), -EBADMSG);
+}
+
+static void rxe_vhca_duplicate_cq_test(struct kunit *test)
+{
+	struct rxe_vhca_context_header context = {
+		.ufile_id = cpu_to_le32(7),
+		.cq_count = cpu_to_le32(2),
+	};
+	struct rxe_vhca_cq cq = {
+		.uobject_handle = cpu_to_le32(11),
+	};
+	struct rxe_vhca_writer writer;
+	u8 image[160];
+
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_writer_init(&writer, image, sizeof(image)), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_CONTEXT, 0,
+					      &context, sizeof(context)), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_CQ, 0,
+					      &cq, sizeof(cq)), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_CQ, 0,
+					      &cq, sizeof(cq)), 0);
+	KUNIT_EXPECT_EQ(test,
+			rxe_vhca_validate_contexts(image, writer.length), -EBADMSG);
+}
+
+static void rxe_vhca_incorrect_count_test(struct kunit *test)
+{
+	struct rxe_vhca_context_header context = {
+		.ufile_id = cpu_to_le32(7),
+		.cq_count = cpu_to_le32(1),
+	};
+	struct rxe_vhca_writer writer;
+	u8 image[64];
+
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_writer_init(&writer, image, sizeof(image)), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_CONTEXT, 0,
+					      &context, sizeof(context)), 0);
+	KUNIT_EXPECT_EQ(test,
+			rxe_vhca_validate_contexts(image, writer.length), -EBADMSG);
+}
+
+static void rxe_vhca_duplicate_resource_slot_test(struct kunit *test)
+{
+	struct rxe_vhca_context_header context = {
+		.ufile_id = cpu_to_le32(7),
+		.qp_count = cpu_to_le32(1),
+	};
+	struct rxe_vhca_qp qp = {
+		.header.uobject_handle = cpu_to_le32(13),
+		.header.resp_resource_count = cpu_to_le32(2),
+		.state.max_dest_rd_atomic = cpu_to_le32(2),
+	};
+	struct rxe_vhca_resp_resource resource = {};
+	struct rxe_vhca_writer writer;
+	u8 image[640];
+
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_writer_init(&writer, image, sizeof(image)), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_CONTEXT, 0,
+					      &context, sizeof(context)), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_QP, 0,
+					      &qp, sizeof(qp)), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_write_record(&writer,
+					      RXE_VHCA_RECORD_RESP_RESOURCE, 0,
+					      &resource, sizeof(resource)), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_write_record(&writer,
+					      RXE_VHCA_RECORD_RESP_RESOURCE, 0,
+					      &resource, sizeof(resource)), 0);
+	KUNIT_EXPECT_EQ(test,
+			rxe_vhca_validate_contexts(image, writer.length), -EBADMSG);
+}
+
 static void rxe_vhca_resp_resource_roundtrip_test(struct kunit *test)
 {
 	static const int types[] = {
@@ -234,6 +334,10 @@ static struct kunit_case rxe_vhca_test_cases[] = {
 	KUNIT_CASE(rxe_vhca_record_length_test),
 	KUNIT_CASE(rxe_vhca_cq_lookup_test),
 	KUNIT_CASE(rxe_vhca_qp_lookup_test),
+	KUNIT_CASE(rxe_vhca_duplicate_context_test),
+	KUNIT_CASE(rxe_vhca_duplicate_cq_test),
+	KUNIT_CASE(rxe_vhca_incorrect_count_test),
+	KUNIT_CASE(rxe_vhca_duplicate_resource_slot_test),
 	KUNIT_CASE(rxe_vhca_resp_resource_roundtrip_test),
 	KUNIT_CASE(rxe_vhca_resp_resource_validation_test),
 	{}
