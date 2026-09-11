@@ -228,6 +228,13 @@ static int rxe_alloc_ucontext(struct ib_ucontext *ibuc, struct ib_udata *udata)
 	struct rxe_alloc_ucontext_req req = {};
 	int err;
 
+	mutex_lock(&rxe->vhca_lock);
+	if (rxe->vhca_source_suspended) {
+		mutex_unlock(&rxe->vhca_lock);
+		return -EBUSY;
+	}
+	mutex_unlock(&rxe->vhca_lock);
+
 	/*
 	 * Older librxe userspace passes inlen=0 (no req) and gets default
 	 * behaviour. Newer userspace may opt into CRIU-restore mode via

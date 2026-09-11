@@ -444,6 +444,8 @@ UVERBS_HANDLER(RXE_IB_METHOD_CREATE_SAVE_FD)(struct uverbs_attr_bundle *attrs)
 		return -ENODEV;
 
 	uobject = uverbs_attr_get_uobject(attrs, handle_attr);
+	if (!READ_ONCE(to_rdev(ibdev)->vhca_source_suspended))
+		return -EAGAIN;
 	stream = container_of(uobject, struct rxe_vhca_stream, uobject);
 	err = rxe_vhca_build_context_image(to_rdev(ibdev), &stream->data,
 					   &stream->length);
@@ -739,6 +741,81 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_CONTEXT)(
 	return ret;
 }
 
+static int UVERBS_HANDLER(RXE_IB_METHOD_SUSPEND_VHCA)(struct uverbs_attr_bundle *attrs)
+{
+	struct rxe_pool_elem *elem;
+	struct ib_device *ibdev;
+	unsigned long index = 0;
+	struct rxe_dev *rxe;
+	u8 suspend;
+	int err;
+
+	err = uverbs_copy_from(&suspend, attrs,
+			       RXE_IB_ATTR_SUSPEND_VHCA);
+	if (err)
+		return err;
+	ibdev = uverbs_attr_get_ibdev(attrs);
+	if (!ibdev)
+		return -ENODEV;
+	rxe = to_rdev(ibdev);
+
+	mutex_lock(&rxe->vhca_lock);
+	if (suspend) {
+		rcu_read_lock();
+		for (elem = xa_find(&rxe->uc_pool.xa, &index, ULONG_MAX,
+				    XA_PRESENT); elem;
+		     elem = xa_find_after(&rxe->uc_pool.xa, &index, ULONG_MAX,
+					  XA_PRESENT)) {
+			struct rxe_ucontext *uc = elem->obj;
+
+			if (!uc->migration_registered || uc->restore_mode) {
+				rcu_read_unlock();
+				mutex_unlock(&rxe->vhca_lock);
+				return -EBUSY;
+			}
+		}
+		rcu_read_unlock();
+		if (rxe->vhca_source_suspended) {
+			mutex_unlock(&rxe->vhca_lock);
+			return -EALREADY;
+		}
+		rxe->vhca_source_suspended = true;
+	} else if (!rxe->vhca_source_suspended) {
+		mutex_unlock(&rxe->vhca_lock);
+		return -EINVAL;
+	}
+	mutex_unlock(&rxe->vhca_lock);
+
+	index = 0;
+	rcu_read_lock();
+	for (elem = xa_find(&rxe->qp_pool.xa, &index, ULONG_MAX, XA_PRESENT);
+	     elem;
+	     elem = xa_find_after(&rxe->qp_pool.xa, &index, ULONG_MAX,
+				  XA_PRESENT)) {
+		struct rxe_qp *qp = elem->obj;
+
+		if (!kref_get_unless_zero(&elem->ref_cnt))
+			continue;
+		rcu_read_unlock();
+		if (qp->is_user) {
+			if (suspend)
+				rxe_qp_pause(qp);
+			else
+				rxe_qp_resume(qp);
+		}
+		rxe_put(qp);
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
+
+	if (!suspend) {
+		mutex_lock(&rxe->vhca_lock);
+		rxe->vhca_source_suspended = false;
+		mutex_unlock(&rxe->vhca_lock);
+	}
+	return 0;
+}
+
 static int rxe_resume_vhca_cqs(struct rxe_dev *rxe)
 {
 	struct rxe_pool *pool = &rxe->cq_pool;
@@ -1025,6 +1102,11 @@ DECLARE_UVERBS_NAMED_METHOD(
 
 DECLARE_UVERBS_NAMED_METHOD(RXE_IB_METHOD_RESUME_VHCA);
 
+DECLARE_UVERBS_NAMED_METHOD(RXE_IB_METHOD_SUSPEND_VHCA,
+			    UVERBS_ATTR_PTR_IN(RXE_IB_ATTR_SUSPEND_VHCA,
+					       UVERBS_ATTR_TYPE(u8),
+					       UA_MANDATORY));
+
 DECLARE_UVERBS_NAMED_METHOD(
 	RXE_IB_METHOD_REGISTER_CONTEXT,
 	UVERBS_ATTR_PTR_IN(RXE_IB_ATTR_REGISTER_CONTEXT_UFILE_ID,
@@ -1090,7 +1172,8 @@ DECLARE_UVERBS_GLOBAL_METHODS(
 	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_CQ),
 	&UVERBS_METHOD(RXE_IB_METHOD_FREEZE_CONTEXT),
 	&UVERBS_METHOD(RXE_IB_METHOD_RESUME_VHCA),
-	&UVERBS_METHOD(RXE_IB_METHOD_REGISTER_CONTEXT));
+	&UVERBS_METHOD(RXE_IB_METHOD_REGISTER_CONTEXT),
+	&UVERBS_METHOD(RXE_IB_METHOD_SUSPEND_VHCA));
 
 DECLARE_UVERBS_NAMED_OBJECT(RXE_IB_OBJECT_VHCA_STREAM,
 			   UVERBS_TYPE_ALLOC_FD(
