@@ -242,7 +242,10 @@ static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t
 				cpu_to_le32(qp->migration_uobject_handle);
 			image_qp.header.resp_resource_count =
 				cpu_to_le32(qp->attr.max_dest_rd_atomic);
-			image_qp.state = qp->migration_state;
+			err = rxe_vhca_encode_qp_state(&image_qp.state,
+						       &qp->migration_state);
+			if (err)
+				goto out_free_rcu;
 			err = rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_QP, 0,
 						    &image_qp,
 						    sizeof(image_qp));

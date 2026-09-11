@@ -119,9 +119,8 @@ static void rxe_vhca_qp_lookup_test(struct kunit *test)
 	struct rxe_vhca_qp qp = {
 		.header.uobject_handle = cpu_to_le32(13),
 		.header.resp_resource_count = cpu_to_le32(1),
-		.state.qpn = 19,
-		.state.max_dest_rd_atomic = 1,
-		.state.res_image_bytes = sizeof(struct resp_res),
+		.state.qpn = cpu_to_le32(19),
+		.state.max_dest_rd_atomic = cpu_to_le32(1),
 	};
 	struct rxe_vhca_resp_resource resource = {};
 	struct rxe_restore_qp_req state = {};
