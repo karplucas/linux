@@ -76,8 +76,10 @@ struct rxe_cq {
 	spinlock_t		cq_lock;
 	u8			notify;
 	u8			restore_notify;
+	u32			migration_uobject_handle;
 	bool			restore_pending;
 	bool			restore_finalized;
+	bool			migration_captured;
 	bool			is_user;
 	atomic_t		num_wq;
 };
