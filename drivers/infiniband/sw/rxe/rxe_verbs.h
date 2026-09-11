@@ -483,6 +483,7 @@ struct rxe_dev {
 	struct mutex		vhca_lock; /* protects staged image state */
 	void			*vhca_image;
 	size_t			vhca_image_length;
+	struct xarray		vhca_contexts;
 
 	atomic64_t		stats_counters[RXE_NUM_OF_COUNTERS];
 

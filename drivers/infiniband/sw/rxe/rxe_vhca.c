@@ -15,6 +15,10 @@ static_assert(sizeof(struct rxe_vhca_record_header) == 16);
 static_assert(sizeof(struct rxe_vhca_cq) == 8);
 static_assert(sizeof(struct rxe_vhca_resp_resource) == 64);
 
+struct rxe_vhca_staged_context {
+	bool bound;
+};
+
 static int rxe_vhca_encode_ip(struct rxe_vhca_ip_address *image,
 			      const void *address)
 {
@@ -489,6 +493,78 @@ bool rxe_vhca_has_context(const void *data, size_t length, u32 ufile_id)
 	}
 
 	return false;
+}
+
+void rxe_vhca_clear_contexts(struct rxe_dev *rxe)
+{
+	struct rxe_vhca_staged_context *context;
+	unsigned long index;
+
+	xa_for_each(&rxe->vhca_contexts, index, context)
+		kfree(context);
+	xa_destroy(&rxe->vhca_contexts);
+	xa_init(&rxe->vhca_contexts);
+}
+
+int rxe_vhca_index_contexts(struct rxe_dev *rxe)
+{
+	struct rxe_vhca_context_header header;
+	struct rxe_vhca_record record;
+	struct rxe_vhca_reader reader;
+	int err;
+
+	err = rxe_vhca_reader_init(&reader, rxe->vhca_image,
+				   rxe->vhca_image_length);
+	if (err)
+		return err;
+
+	while ((err = rxe_vhca_read_record(&reader, &record)) > 0) {
+		struct rxe_vhca_staged_context *context;
+		u32 ufile_id;
+
+		if (record.type != RXE_VHCA_RECORD_CONTEXT)
+			continue;
+		memcpy(&header, record.payload, sizeof(header));
+		ufile_id = le32_to_cpu(header.ufile_id);
+		context = kzalloc_obj(*context);
+		if (!context) {
+			err = -ENOMEM;
+			break;
+		}
+		err = xa_insert(&rxe->vhca_contexts, ufile_id, context,
+				GFP_KERNEL);
+		if (err) {
+			kfree(context);
+			break;
+		}
+	}
+	if (err < 0)
+		rxe_vhca_clear_contexts(rxe);
+
+	return err < 0 ? err : 0;
+}
+
+int rxe_vhca_bind_context(struct rxe_dev *rxe, u32 ufile_id)
+{
+	struct rxe_vhca_staged_context *context;
+
+	context = xa_load(&rxe->vhca_contexts, ufile_id);
+	if (!context)
+		return -ENOENT;
+	if (context->bound)
+		return -EALREADY;
+
+	context->bound = true;
+	return 0;
+}
+
+void rxe_vhca_unbind_context(struct rxe_dev *rxe, u32 ufile_id)
+{
+	struct rxe_vhca_staged_context *context;
+
+	context = xa_load(&rxe->vhca_contexts, ufile_id);
+	if (context)
+		context->bound = false;
 }
 
 int rxe_vhca_find_cq(void *data, size_t length, u32 ufile_id,
