@@ -7,6 +7,7 @@
 #include <rdma/rdma_user_rxe.h>
 
 #define RXE_VHCA_IMAGE_MAGIC	0x56455852
+#define RXE_VHCA_RECORD_F_CONSUMED BIT(0)
 
 enum rxe_vhca_record_type {
 	RXE_VHCA_RECORD_CONTEXT = 1,
@@ -128,11 +129,12 @@ int rxe_vhca_read_record(struct rxe_vhca_reader *reader,
 			 struct rxe_vhca_record *record);
 int rxe_vhca_validate_contexts(const void *data, size_t length);
 bool rxe_vhca_has_context(const void *data, size_t length, u32 ufile_id);
-int rxe_vhca_find_cq(const void *data, size_t length, u32 ufile_id,
+int rxe_vhca_find_cq(void *data, size_t length, u32 ufile_id,
 		     u32 uobject_handle, struct rxe_vhca_cq *cq);
-int rxe_vhca_find_qp(const void *data, size_t length, u32 ufile_id,
+int rxe_vhca_find_qp(void *data, size_t length, u32 ufile_id,
 		     u32 uobject_handle, struct rxe_restore_qp_req *state,
 		     struct resp_res **resources);
+bool rxe_vhca_all_objects_consumed(const void *data, size_t length);
 int rxe_vhca_encode_resp_resource(struct rxe_vhca_resp_resource *record,
 				  u32 slot, const struct resp_res *resource);
 int rxe_vhca_decode_resp_resource(const struct rxe_vhca_resp_resource *record,

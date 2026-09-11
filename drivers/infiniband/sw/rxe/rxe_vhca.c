@@ -317,7 +317,7 @@ bool rxe_vhca_has_context(const void *data, size_t length, u32 ufile_id)
 	return false;
 }
 
-int rxe_vhca_find_cq(const void *data, size_t length, u32 ufile_id,
+int rxe_vhca_find_cq(void *data, size_t length, u32 ufile_id,
 		     u32 uobject_handle, struct rxe_vhca_cq *cq)
 {
 	struct rxe_vhca_context_header context;
@@ -345,14 +345,21 @@ int rxe_vhca_find_cq(const void *data, size_t length, u32 ufile_id,
 			continue;
 		remaining--;
 		memcpy(cq, record.payload, sizeof(*cq));
-		if (match && le32_to_cpu(cq->uobject_handle) == uobject_handle)
+		if (match && le32_to_cpu(cq->uobject_handle) == uobject_handle) {
+			struct rxe_vhca_record_header *header;
+
+			header = (void *)(record.payload - sizeof(*header));
+			if (le32_to_cpu(header->flags) & RXE_VHCA_RECORD_F_CONSUMED)
+				return -EALREADY;
+			header->flags = cpu_to_le32(RXE_VHCA_RECORD_F_CONSUMED);
 			return 0;
+		}
 	}
 
 	return err ?: -ENOENT;
 }
 
-int rxe_vhca_find_qp(const void *data, size_t length, u32 ufile_id,
+int rxe_vhca_find_qp(void *data, size_t length, u32 ufile_id,
 		     u32 uobject_handle, struct rxe_restore_qp_req *state,
 		     struct resp_res **resources)
 {
@@ -369,6 +376,7 @@ int rxe_vhca_find_qp(const void *data, size_t length, u32 ufile_id,
 		return err;
 
 	while ((err = rxe_vhca_read_record(&reader, &record)) > 0) {
+		struct rxe_vhca_record_header *qp_record_header;
 		struct rxe_vhca_qp qp;
 		u32 count, i;
 
@@ -389,6 +397,8 @@ int rxe_vhca_find_qp(const void *data, size_t length, u32 ufile_id,
 		    record.length != sizeof(qp))
 			return -EBADMSG;
 		qps--;
+		qp_record_header = (void *)(record.payload -
+					   sizeof(*qp_record_header));
 		memcpy(&qp, record.payload, sizeof(qp));
 		count = le32_to_cpu(qp.header.resp_resource_count);
 		if (match && le32_to_cpu(qp.header.uobject_handle) ==
@@ -425,6 +435,13 @@ int rxe_vhca_find_qp(const void *data, size_t length, u32 ufile_id,
 		if (match && le32_to_cpu(qp.header.uobject_handle) ==
 		    uobject_handle) {
 			memcpy(state, &qp.state, sizeof(*state));
+			if (le32_to_cpu(qp_record_header->flags) &
+			    RXE_VHCA_RECORD_F_CONSUMED) {
+				err = -EALREADY;
+				goto err_free;
+			}
+			qp_record_header->flags =
+				cpu_to_le32(RXE_VHCA_RECORD_F_CONSUMED);
 			return 0;
 		}
 	}
@@ -435,6 +452,24 @@ err_free:
 	kfree(*resources);
 	*resources = NULL;
 	return err;
+}
+
+bool rxe_vhca_all_objects_consumed(const void *data, size_t length)
+{
+	struct rxe_vhca_record record;
+	struct rxe_vhca_reader reader;
+	int err;
+
+	if (rxe_vhca_reader_init(&reader, data, length))
+		return false;
+	while ((err = rxe_vhca_read_record(&reader, &record)) > 0) {
+		if ((record.type == RXE_VHCA_RECORD_CQ ||
+		     record.type == RXE_VHCA_RECORD_QP) &&
+		    !(record.flags & RXE_VHCA_RECORD_F_CONSUMED))
+			return false;
+	}
+
+	return err == 0;
 }
 
 int rxe_vhca_validate_contexts(const void *data, size_t length)
