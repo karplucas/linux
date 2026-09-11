@@ -10,6 +10,7 @@
 #include "rxe_loc.h"
 #include "rxe_net.h"
 #include "rxe_ns.h"
+#include "rxe_vhca.h"
 
 MODULE_AUTHOR("Bob Pearson, Frank Zago, John Groves, Kamal Heib");
 MODULE_DESCRIPTION("Soft RDMA transport");
@@ -35,6 +36,7 @@ void rxe_dealloc(struct ib_device *ib_dev)
 
 	mutex_destroy(&rxe->usdev_lock);
 	mutex_destroy(&rxe->vhca_lock);
+	rxe_vhca_clear_contexts(rxe);
 	kvfree(rxe->vhca_image);
 }
 
@@ -178,6 +180,7 @@ static void rxe_init(struct rxe_dev *rxe, struct net_device *ndev)
 	rxe_init_ports(rxe, ndev);
 	rxe_init_pools(rxe);
 	mutex_init(&rxe->vhca_lock);
+	xa_init(&rxe->vhca_contexts);
 
 	/* init pending mmap list */
 	spin_lock_init(&rxe->mmap_offset_lock);

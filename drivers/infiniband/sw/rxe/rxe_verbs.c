@@ -247,12 +247,10 @@ static int rxe_alloc_ucontext(struct ib_ucontext *ibuc, struct ib_udata *udata)
 			return -EINVAL;
 		if (req.flags & RXE_ALLOC_UCTX_RESTORE_MODE) {
 			mutex_lock(&rxe->vhca_lock);
-			if (!rxe->vhca_image ||
-			    !rxe_vhca_has_context(rxe->vhca_image,
-						  rxe->vhca_image_length,
-						  req.ufile_id)) {
+			err = rxe_vhca_bind_context(rxe, req.ufile_id);
+			if (err) {
 				mutex_unlock(&rxe->vhca_lock);
-				return -ENOENT;
+				return err;
 			}
 			mutex_unlock(&rxe->vhca_lock);
 			uc->restore_mode = true;
@@ -261,8 +259,14 @@ static int rxe_alloc_ucontext(struct ib_ucontext *ibuc, struct ib_udata *udata)
 	}
 
 	err = rxe_add_to_pool(&rxe->uc_pool, uc);
-	if (err)
+	if (err) {
+		if (uc->restore_mode) {
+			mutex_lock(&rxe->vhca_lock);
+			rxe_vhca_unbind_context(rxe, uc->migration_ufile_id);
+			mutex_unlock(&rxe->vhca_lock);
+		}
 		rxe_err_dev(rxe, "unable to create uc\n");
+	}
 
 	return err;
 }

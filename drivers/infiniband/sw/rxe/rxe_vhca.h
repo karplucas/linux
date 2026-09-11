@@ -188,6 +188,7 @@ struct rxe_vhca_record {
 };
 
 struct resp_res;
+struct rxe_dev;
 
 int rxe_vhca_writer_init(struct rxe_vhca_writer *writer, void *data,
 			 size_t capacity);
@@ -199,6 +200,10 @@ int rxe_vhca_read_record(struct rxe_vhca_reader *reader,
 			 struct rxe_vhca_record *record);
 int rxe_vhca_validate_contexts(const void *data, size_t length);
 bool rxe_vhca_has_context(const void *data, size_t length, u32 ufile_id);
+int rxe_vhca_index_contexts(struct rxe_dev *rxe);
+void rxe_vhca_clear_contexts(struct rxe_dev *rxe);
+int rxe_vhca_bind_context(struct rxe_dev *rxe, u32 ufile_id);
+void rxe_vhca_unbind_context(struct rxe_dev *rxe, u32 ufile_id);
 int rxe_vhca_find_cq(void *data, size_t length, u32 ufile_id,
 		     u32 uobject_handle, struct rxe_vhca_cq *cq);
 int rxe_vhca_find_qp(void *data, size_t length, u32 ufile_id,
