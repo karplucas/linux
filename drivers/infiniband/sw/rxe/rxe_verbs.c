@@ -1454,6 +1454,8 @@ static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 	struct rxe_cq *cq = to_rcq(ibcq);
 	struct rxe_create_cq_resp __user *uresp = NULL;
 	struct rxe_restore_cq_req req = {};
+	struct rxe_vhca_cq image_cq;
+	struct rxe_ucontext *uc;
 	struct ib_ucontext *ucontext;
 	u64 forced_vm_pgoff = 0;
 	int err, cleanup_err;
@@ -1463,6 +1465,7 @@ static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 		err = -EINVAL;
 		goto err_out;
 	}
+	uc = to_ruc(ucontext);
 	if (READ_ONCE(to_ruc(ucontext)->restore_finalized)) {
 		err = -EBUSY;
 		rxe_dbg_dev(rxe, "restore context is already finalized\n");
@@ -1547,6 +1550,17 @@ static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 
 	if (attr->cqe > rxe->attr.max_cqe)
 		return -EINVAL;
+
+	mutex_lock(&rxe->vhca_lock);
+	err = rxe_vhca_find_cq(rxe->vhca_image, rxe->vhca_image_length,
+			       uc->migration_ufile_id, target_handle,
+			       &image_cq);
+	mutex_unlock(&rxe->vhca_lock);
+	if (err) {
+		rxe_dbg_dev(rxe, "missing vHCA CQ record, err = %d\n", err);
+		goto err_out;
+	}
+	req.notify = le32_to_cpu(image_cq.notify);
 
 	err = rxe_add_to_pool(&rxe->cq_pool, cq);
 	if (err) {

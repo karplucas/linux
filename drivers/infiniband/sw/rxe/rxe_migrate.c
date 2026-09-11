@@ -50,7 +50,9 @@ static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t
 	struct rxe_pool_elem *elem;
 	unsigned long index = 0;
 	size_t image_length;
+	size_t cq_image_length;
 	u32 context_count = 0;
+	u32 cq_count = 0;
 	void *image;
 	int err;
 
@@ -66,6 +68,26 @@ static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t
 			err = -EINVAL;
 			goto out_rcu;
 		}
+		{
+			struct rxe_pool_elem *cq_elem;
+			unsigned long cq_index = 0;
+
+			for (cq_elem = xa_find(&rxe->cq_pool.xa, &cq_index,
+					       ULONG_MAX, XA_PRESENT);
+			     cq_elem;
+			     cq_elem = xa_find_after(&rxe->cq_pool.xa, &cq_index,
+						     ULONG_MAX, XA_PRESENT)) {
+				struct rxe_cq *cq = cq_elem->obj;
+
+				if (ib_cq_ucontext(&cq->ibcq) != &uc->ibuc)
+					continue;
+				if (!cq->migration_captured) {
+					err = -EINVAL;
+					goto out_rcu;
+				}
+				cq_count++;
+			}
+		}
 		context_count++;
 	}
 	rcu_read_unlock();
@@ -74,12 +96,17 @@ static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t
 		err = -ENODATA;
 		goto out_unlock;
 	}
-	if (check_mul_overflow((size_t)context_count,
+	if (check_mul_overflow((size_t)cq_count,
+			       sizeof(struct rxe_vhca_record_header) +
+			       sizeof(struct rxe_vhca_cq),
+			       &cq_image_length) ||
+	    check_mul_overflow((size_t)context_count,
 			       sizeof(struct rxe_vhca_record_header) +
 			       sizeof(context), &image_length) ||
 	    check_add_overflow(image_length,
 			       sizeof(struct rxe_vhca_image_header),
-			       &image_length)) {
+			       &image_length) ||
+	    check_add_overflow(image_length, cq_image_length, &image_length)) {
 		err = -EOVERFLOW;
 		goto out_unlock;
 	}
@@ -100,12 +127,52 @@ static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t
 	     elem = xa_find_after(&rxe->uc_pool.xa, &index, ULONG_MAX,
 				  XA_PRESENT)) {
 		struct rxe_ucontext *uc = elem->obj;
+		struct rxe_pool_elem *cq_elem;
+		unsigned long cq_index = 0;
+		u32 uc_cq_count = 0;
+
+		for (cq_elem = xa_find(&rxe->cq_pool.xa, &cq_index, ULONG_MAX,
+				       XA_PRESENT);
+		     cq_elem;
+		     cq_elem = xa_find_after(&rxe->cq_pool.xa, &cq_index,
+					     ULONG_MAX, XA_PRESENT)) {
+			struct rxe_cq *cq = cq_elem->obj;
+
+			if (ib_cq_ucontext(&cq->ibcq) == &uc->ibuc &&
+			    cq->migration_captured)
+				uc_cq_count++;
+		}
 
 		context.ufile_id = cpu_to_le32(uc->migration_ufile_id);
+		context.cq_count = cpu_to_le32(uc_cq_count);
 		err = rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_CONTEXT, 0,
 					    &context, sizeof(context));
 		if (err)
 			goto out_free_rcu;
+
+		cq_index = 0;
+		for (cq_elem = xa_find(&rxe->cq_pool.xa, &cq_index, ULONG_MAX,
+				       XA_PRESENT);
+		     cq_elem;
+		     cq_elem = xa_find_after(&rxe->cq_pool.xa, &cq_index,
+					     ULONG_MAX, XA_PRESENT)) {
+			struct rxe_vhca_cq image_cq = {};
+			struct rxe_cq *cq = cq_elem->obj;
+
+			if (ib_cq_ucontext(&cq->ibcq) != &uc->ibuc ||
+			    !cq->migration_captured)
+				continue;
+			image_cq.uobject_handle =
+				cpu_to_le32(cq->migration_uobject_handle);
+			spin_lock_irq(&cq->cq_lock);
+			image_cq.notify = cpu_to_le32(cq->notify);
+			spin_unlock_irq(&cq->cq_lock);
+			err = rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_CQ,
+						    0, &image_cq,
+						    sizeof(image_cq));
+			if (err)
+				goto out_free_rcu;
+		}
 	}
 	rcu_read_unlock();
 
@@ -788,14 +855,17 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
 	struct uverbs_attr_bundle *attrs)
 {
 	struct rxe_query_cq_resp blob = {};
+	struct ib_uobject *uobject;
 	struct rxe_cq *cq;
 	struct ib_cq *ibcq;
+	int err;
 
 	ibcq = uverbs_attr_get_obj(attrs, RXE_IB_ATTR_QUERY_CQ_HANDLE);
 	if (IS_ERR(ibcq))
 		return PTR_ERR(ibcq);
 
 	cq = to_rcq(ibcq);
+	uobject = uverbs_attr_get_uobject(attrs, RXE_IB_ATTR_QUERY_CQ_HANDLE);
 
 	/* Kernel-mode CQs have no user mmap ring to identify. */
 	if (!cq->is_user || !cq->queue || !cq->queue->ip)
@@ -806,9 +876,14 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
 	spin_lock_irq(&cq->cq_lock);
 	blob.notify = cq->notify;
 	spin_unlock_irq(&cq->cq_lock);
+	err = uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_CQ_RESP_BLOB,
+			     &blob, sizeof(blob));
+	if (err)
+		return err;
 
-	return uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_CQ_RESP_BLOB,
-			      &blob, sizeof(blob));
+	cq->migration_uobject_handle = uobject->id;
+	cq->migration_captured = true;
+	return 0;
 }
 
 DECLARE_UVERBS_NAMED_METHOD(

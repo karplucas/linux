@@ -31,6 +31,11 @@ struct rxe_vhca_context_header {
 	__le32 reserved;
 };
 
+struct rxe_vhca_cq {
+	__le32 uobject_handle;
+	__le32 notify;
+};
+
 struct rxe_vhca_qp_header {
 	__le32 uobject_handle;
 	__le32 resp_resource_count;
@@ -116,6 +121,8 @@ int rxe_vhca_read_record(struct rxe_vhca_reader *reader,
 			 struct rxe_vhca_record *record);
 int rxe_vhca_validate_contexts(const void *data, size_t length);
 bool rxe_vhca_has_context(const void *data, size_t length, u32 ufile_id);
+int rxe_vhca_find_cq(const void *data, size_t length, u32 ufile_id,
+		     u32 uobject_handle, struct rxe_vhca_cq *cq);
 int rxe_vhca_encode_resp_resource(struct rxe_vhca_resp_resource *record,
 				  u32 slot, const struct resp_res *resource);
 int rxe_vhca_decode_resp_resource(const struct rxe_vhca_resp_resource *record,
