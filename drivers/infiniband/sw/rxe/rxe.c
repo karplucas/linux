@@ -186,6 +186,7 @@ static void rxe_init(struct rxe_dev *rxe, struct net_device *ndev)
 	spin_lock_init(&rxe->mmap_offset_lock);
 	spin_lock_init(&rxe->pending_lock);
 	INIT_LIST_HEAD(&rxe->pending_mmaps);
+	INIT_LIST_HEAD(&rxe->mmap_infos);
 
 	/* init multicast support */
 	spin_lock_init(&rxe->mcg_lock);

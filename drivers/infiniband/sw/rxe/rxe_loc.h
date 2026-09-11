@@ -41,6 +41,7 @@ void rxe_cleanup_mcg(struct kref *kref);
 /* rxe_mmap.c */
 struct rxe_mmap_info {
 	struct list_head	pending_mmaps;
+	struct list_head	mmap_infos;
 	struct ib_ucontext	*context;
 	struct kref		ref;
 	void			*obj;
