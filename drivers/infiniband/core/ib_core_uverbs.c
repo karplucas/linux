@@ -416,6 +416,18 @@ static struct ib_device *rdma_udata_to_dev(struct ib_udata *udata)
 				&bundle->ufile->device->disassociate_srcu);
 }
 
+struct ib_device *uverbs_attr_get_ibdev(const struct uverbs_attr_bundle *attrs)
+{
+	lockdep_assert_held(&attrs->ufile->device->disassociate_srcu);
+
+	if (attrs->context)
+		return attrs->context->device;
+
+	return srcu_dereference(attrs->ufile->device->ib_dev,
+				&attrs->ufile->device->disassociate_srcu);
+}
+EXPORT_SYMBOL(uverbs_attr_get_ibdev);
+
 typedef int (*uverbs_api_ioctl_handler_fn)(struct uverbs_attr_bundle *attrs);
 static uverbs_api_ioctl_handler_fn uverbs_get_handler_fn(struct ib_udata *udata)
 {

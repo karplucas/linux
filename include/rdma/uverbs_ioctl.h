@@ -663,6 +663,8 @@ struct uverbs_attr_bundle {
 	struct uverbs_attr attrs[];
 };
 
+struct ib_device *uverbs_attr_get_ibdev(const struct uverbs_attr_bundle *attrs);
+
 static inline bool uverbs_attr_is_valid(const struct uverbs_attr_bundle *attrs_bundle,
 					unsigned int idx)
 {
