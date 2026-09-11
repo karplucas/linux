@@ -262,15 +262,16 @@ struct rxe_restore_cq_req {
  * The dump-side counterpart to struct rxe_restore_cq_req: @vm_pgoff is
  * the CQ ring's mmap byte offset (cq->queue->ip->info.offset) that the
  * dumper replays into RESTORE_CQ, and @cqe is the user-visible entry
- * count. @notify contains the CQ arm state. Queue contents and cursors are
- * read from the mapping by CRIU and synchronized with RESUME_VHCA.
+ * count. @queue_size is the complete mapped allocation length. @notify
+ * contains the CQ arm state. Queue contents and cursors are read from the
+ * mapping by CRIU and synchronized with RESUME_VHCA.
  */
 struct rxe_query_cq_resp {
 	__aligned_u64 vm_pgoff;
 	__u32 cqe;
 	__u32 producer;
 	__u32 consumer;
-	__u32 cqe_image_bytes;
+	__u32 queue_size;
 	__u32 notify;
 	__u32 reserved;
 };
@@ -344,8 +345,9 @@ struct rxe_create_qp_resp {
  * In-flight responder state. SQ and RQ entries and their cursors are copied
  * as mapped memory by CRIU, then synchronized with RESUME_VHCA.
  * @sq_producer, @sq_consumer, @rq_producer, @rq_consumer,
- * @sq_image_bytes, and @rq_image_bytes are retained for source compatibility
- * and must be zero.
+ * @sq_queue_size and @rq_queue_size report the complete mapped allocation
+ * lengths on query and must be zero on restore. The queue cursors must also
+ * be zero on restore.
  *   @resp_ack_psn / @resp_opcode / @resp_status / @resp_aeth_syndrome
  *       responder scalars not already covered by @resp_psn / @resp_msn.
  *   @res_head / @res_tail  RC responder-resources ring cursors.
@@ -396,8 +398,8 @@ struct rxe_restore_qp_req {
 	__u32		resp_status;		/* qp->resp.status (ib_wc_status) */
 	__u32		res_head;		/* qp->resp.res_head */
 	__u32		res_tail;		/* qp->resp.res_tail */
-	__u32		sq_image_bytes;		/* must be zero */
-	__u32		rq_image_bytes;		/* must be zero */
+	__u32		sq_queue_size;		/* query output; restore must be zero */
+	__u32		rq_queue_size;		/* query output; restore must be zero */
 	__u32		res_image_bytes;	/* responder-resources byte count */
 	__u8		retry_cnt_left;
 	__u8		rnr_retry_left;
