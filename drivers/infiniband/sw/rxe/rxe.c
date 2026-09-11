@@ -34,6 +34,8 @@ void rxe_dealloc(struct ib_device *ib_dev)
 	WARN_ON(!RB_EMPTY_ROOT(&rxe->mcg_tree));
 
 	mutex_destroy(&rxe->usdev_lock);
+	mutex_destroy(&rxe->vhca_lock);
+	kvfree(rxe->vhca_image);
 }
 
 static const struct ib_device_ops rxe_ib_dev_odp_ops = {
@@ -175,6 +177,7 @@ static void rxe_init(struct rxe_dev *rxe, struct net_device *ndev)
 
 	rxe_init_ports(rxe, ndev);
 	rxe_init_pools(rxe);
+	mutex_init(&rxe->vhca_lock);
 
 	/* init pending mmap list */
 	spin_lock_init(&rxe->mmap_offset_lock);

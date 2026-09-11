@@ -469,6 +469,10 @@ struct rxe_dev {
 	spinlock_t		mmap_offset_lock; /* guard mmap_offset */
 	u64			mmap_offset;
 
+	struct mutex		vhca_lock; /* protects staged image state */
+	void			*vhca_image;
+	size_t			vhca_image_length;
+
 	atomic64_t		stats_counters[RXE_NUM_OF_COUNTERS];
 
 	struct rxe_port		port;

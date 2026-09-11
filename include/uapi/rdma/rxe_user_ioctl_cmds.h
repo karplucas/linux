@@ -47,6 +47,20 @@
  *             queue indices, apply staged private state, and resume every
  *             restored context on the RXE device. Valid only on a
  *             restore-mode ucontext.
+ *
+ * RXE_IB_OBJECT_VHCA_STREAM provides the device image transport:
+ *
+ *   CREATE_SAVE_FD  return a read-only view of an immutable RXE image;
+ *
+ *   CREATE_LOAD_FD  allocate a writable image of the supplied byte length;
+ *
+ *   LOAD_VHCA  validate a complete load fd and attach its image to the
+ *             destination RXE device. The device remains stopped until
+ *             RESUME_VHCA.
+ *
+ * The stream methods may run before GET_CONTEXT. This preserves the ordering
+ * in which device state is loaded before application ucontexts and uobjects
+ * are replayed.
  */
 #ifndef RXE_USER_IOCTL_CMDS_H
 #define RXE_USER_IOCTL_CMDS_H
@@ -56,6 +70,7 @@
 
 enum rxe_ib_objects {
 	RXE_IB_OBJECT_MIGRATE = (1U << UVERBS_ID_NS_SHIFT),
+	RXE_IB_OBJECT_VHCA_STREAM = (1U << UVERBS_ID_NS_SHIFT) + 1,
 };
 
 enum rxe_ib_migrate_methods {
@@ -65,6 +80,25 @@ enum rxe_ib_migrate_methods {
 	RXE_IB_METHOD_QUERY_CQ = (1U << UVERBS_ID_NS_SHIFT) + 2,
 	RXE_IB_METHOD_FREEZE_CONTEXT = (1U << UVERBS_ID_NS_SHIFT) + 3,
 	RXE_IB_METHOD_RESUME_VHCA = (1U << UVERBS_ID_NS_SHIFT) + 4,
+};
+
+enum rxe_ib_vhca_stream_methods {
+	RXE_IB_METHOD_CREATE_SAVE_FD = (1U << UVERBS_ID_NS_SHIFT),
+	RXE_IB_METHOD_CREATE_LOAD_FD = (1U << UVERBS_ID_NS_SHIFT) + 1,
+	RXE_IB_METHOD_LOAD_VHCA = (1U << UVERBS_ID_NS_SHIFT) + 2,
+};
+
+enum rxe_ib_create_save_fd_attrs {
+	RXE_IB_ATTR_CREATE_SAVE_FD_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+};
+
+enum rxe_ib_create_load_fd_attrs {
+	RXE_IB_ATTR_CREATE_LOAD_FD_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+	RXE_IB_ATTR_CREATE_LOAD_FD_LENGTH,
+};
+
+enum rxe_ib_load_vhca_attrs {
+	RXE_IB_ATTR_LOAD_VHCA_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
 };
 
 enum rxe_ib_freeze_datapath_attrs {
