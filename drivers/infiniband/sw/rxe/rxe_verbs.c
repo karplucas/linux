@@ -11,6 +11,7 @@
 #include "rxe.h"
 #include "rxe_queue.h"
 #include "rxe_hw_counters.h"
+#include "rxe_vhca.h"
 
 /* Driver-private RXE_IB_OBJECT_MIGRATE uverbs object (rxe_migrate.c). */
 extern const struct uapi_definition rxe_migrate_defs[];
@@ -244,8 +245,19 @@ static int rxe_alloc_ucontext(struct ib_ucontext *ibuc, struct ib_udata *udata)
 			return -EOPNOTSUPP;
 		if (req.reserved)
 			return -EINVAL;
-		if (req.flags & RXE_ALLOC_UCTX_RESTORE_MODE)
+		if (req.flags & RXE_ALLOC_UCTX_RESTORE_MODE) {
+			mutex_lock(&rxe->vhca_lock);
+			if (!rxe->vhca_image ||
+			    !rxe_vhca_has_context(rxe->vhca_image,
+						  rxe->vhca_image_length,
+						  req.ufile_id)) {
+				mutex_unlock(&rxe->vhca_lock);
+				return -ENOENT;
+			}
+			mutex_unlock(&rxe->vhca_lock);
 			uc->restore_mode = true;
+			uc->migration_ufile_id = req.ufile_id;
+		}
 	}
 
 	err = rxe_add_to_pool(&rxe->uc_pool, uc);

@@ -45,6 +45,8 @@ struct rxe_ucontext {
 	 */
 	bool restore_mode;
 	bool restore_finalized;
+	bool migration_registered;
+	u32 migration_ufile_id;
 };
 
 struct rxe_pd {
