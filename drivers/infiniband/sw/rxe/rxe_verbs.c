@@ -773,7 +773,7 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 		goto err_out;
 	}
 	if (req.sq_producer || req.sq_consumer || req.rq_producer ||
-	    req.rq_consumer || req.sq_image_bytes || req.rq_image_bytes) {
+	    req.rq_consumer || req.sq_queue_size || req.rq_queue_size) {
 		err = -EOPNOTSUPP;
 		rxe_dbg_dev(rxe, "restore qp queue images are unsupported\n");
 		goto err_out;

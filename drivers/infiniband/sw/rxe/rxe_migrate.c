@@ -52,6 +52,9 @@ static void rxe_snapshot_qp(struct rxe_qp *qp,
 		state->sq_vm_pgoff = qp->sq.queue->ip->info.offset;
 	if (qp->rq.queue && qp->rq.queue->ip)
 		state->rq_vm_pgoff = qp->rq.queue->ip->info.offset;
+	state->sq_queue_size = qp->sq.queue->buf_size;
+	if (qp->rq.queue)
+		state->rq_queue_size = qp->rq.queue->buf_size;
 	memcpy(&state->av, &qp->pri_av, sizeof(state->av));
 	state->dest_qp_num = qp->attr.dest_qp_num;
 	state->qkey = qp->attr.qkey;
@@ -589,6 +592,12 @@ UVERBS_HANDLER(RXE_IB_METHOD_LOAD_VHCA)(struct uverbs_attr_bundle *attrs)
 
 	rxe->vhca_image = stream->data;
 	rxe->vhca_image_length = stream->length;
+	err = rxe_vhca_index_contexts(rxe);
+	if (err) {
+		rxe->vhca_image = NULL;
+		rxe->vhca_image_length = 0;
+		goto out_vhca;
+	}
 	stream->data = NULL;
 	stream->committed = true;
 	err = 0;
@@ -905,6 +914,7 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_RESUME_VHCA)(struct uverbs_attr_bundle *
 	rxe_resume_vhca_datapath(rxe);
 
 	mutex_lock(&rxe->vhca_lock);
+	rxe_vhca_clear_contexts(rxe);
 	kvfree(rxe->vhca_image);
 	rxe->vhca_image = NULL;
 	rxe->vhca_image_length = 0;
@@ -983,6 +993,7 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
 
 	blob.vm_pgoff = cq->queue->ip->info.offset;
 	blob.cqe      = ibcq->cqe;
+	blob.queue_size = cq->queue->buf_size;
 	spin_lock_irq(&cq->cq_lock);
 	blob.notify = cq->notify;
 	spin_unlock_irq(&cq->cq_lock);
