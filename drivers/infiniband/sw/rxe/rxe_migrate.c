@@ -817,6 +817,13 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_RESUME_VHCA)(struct uverbs_attr_bundle *
 		return -EACCES;
 
 	rxe = to_rdev(ucontext->device);
+	mutex_lock(&rxe->vhca_lock);
+	if (!rxe_vhca_all_objects_consumed(rxe->vhca_image,
+					   rxe->vhca_image_length)) {
+		mutex_unlock(&rxe->vhca_lock);
+		return -ENODATA;
+	}
+	mutex_unlock(&rxe->vhca_lock);
 	err = rxe_resume_vhca_cqs(rxe);
 	if (err)
 		return err;
