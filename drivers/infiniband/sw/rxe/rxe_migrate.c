@@ -196,6 +196,66 @@ UVERBS_HANDLER(RXE_IB_METHOD_CREATE_LOAD_FD)(struct uverbs_attr_bundle *attrs)
 	return 0;
 }
 
+static int
+UVERBS_HANDLER(RXE_IB_METHOD_LOAD_VHCA)(struct uverbs_attr_bundle *attrs)
+{
+	const u16 handle_attr = RXE_IB_ATTR_LOAD_VHCA_HANDLE;
+	struct rxe_vhca_stream *stream;
+	struct rxe_vhca_record record;
+	struct rxe_vhca_reader reader;
+	struct ib_uobject *uobject;
+	struct ib_device *ibdev;
+	struct rxe_dev *rxe;
+	int err;
+
+	ibdev = uverbs_attr_get_ibdev(attrs);
+	if (!ibdev)
+		return -ENODEV;
+	rxe = to_rdev(ibdev);
+	uobject = uverbs_attr_get_uobject(attrs, handle_attr);
+	stream = container_of(uobject, struct rxe_vhca_stream, uobject);
+
+	mutex_lock(&stream->lock);
+	if (stream->mode != RXE_VHCA_STREAM_LOAD || stream->rxe != rxe) {
+		err = -EXDEV;
+		goto out_stream;
+	}
+	if (stream->committed) {
+		err = -EALREADY;
+		goto out_stream;
+	}
+	if (stream->written != stream->length) {
+		err = -ENODATA;
+		goto out_stream;
+	}
+
+	err = rxe_vhca_reader_init(&reader, stream->data, stream->length);
+	if (err)
+		goto out_stream;
+	do {
+		err = rxe_vhca_read_record(&reader, &record);
+	} while (err > 0);
+	if (err)
+		goto out_stream;
+
+	mutex_lock(&rxe->vhca_lock);
+	if (rxe->vhca_image || !xa_empty(&rxe->uc_pool.xa)) {
+		err = -EBUSY;
+		goto out_vhca;
+	}
+
+	rxe->vhca_image = stream->data;
+	rxe->vhca_image_length = stream->length;
+	stream->data = NULL;
+	stream->committed = true;
+	err = 0;
+out_vhca:
+	mutex_unlock(&rxe->vhca_lock);
+out_stream:
+	mutex_unlock(&stream->lock);
+	return err;
+}
+
 /*
  * RXE freeze drops packets that race with the context gate. Only RC has
  * retransmission and duplicate suppression to recover them safely.
@@ -662,6 +722,11 @@ DECLARE_UVERBS_NAMED_METHOD(RXE_IB_METHOD_CREATE_LOAD_FD,
 				    RXE_IB_ATTR_CREATE_LOAD_FD_LENGTH,
 				    UVERBS_ATTR_TYPE(u64), UA_MANDATORY));
 
+DECLARE_UVERBS_NAMED_METHOD(RXE_IB_METHOD_LOAD_VHCA,
+			    UVERBS_ATTR_FD(RXE_IB_ATTR_LOAD_VHCA_HANDLE,
+				   RXE_IB_OBJECT_VHCA_STREAM,
+				   UVERBS_ACCESS_READ, UA_MANDATORY));
+
 DECLARE_UVERBS_NAMED_METHOD(
 	RXE_IB_METHOD_QUERY_QP,
 	UVERBS_ATTR_IDR(RXE_IB_ATTR_QUERY_QP_HANDLE,
@@ -712,7 +777,8 @@ DECLARE_UVERBS_NAMED_OBJECT(RXE_IB_OBJECT_VHCA_STREAM,
 				   &rxe_vhca_stream_fops, "[rxe-vhca]",
 			   O_RDWR),
 			   &UVERBS_METHOD(RXE_IB_METHOD_CREATE_SAVE_FD),
-			   &UVERBS_METHOD(RXE_IB_METHOD_CREATE_LOAD_FD));
+			   &UVERBS_METHOD(RXE_IB_METHOD_CREATE_LOAD_FD),
+			   &UVERBS_METHOD(RXE_IB_METHOD_LOAD_VHCA));
 
 const struct uapi_definition rxe_migrate_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(RXE_IB_OBJECT_MIGRATE),
