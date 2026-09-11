@@ -43,6 +43,50 @@ struct rxe_vhca_stream {
 	bool committed;
 };
 
+static void rxe_snapshot_qp(struct rxe_qp *qp,
+			    struct rxe_restore_qp_req *state)
+{
+	memset(state, 0, sizeof(*state));
+	state->qpn = qp->ibqp.qp_num;
+	if (qp->sq.queue->ip)
+		state->sq_vm_pgoff = qp->sq.queue->ip->info.offset;
+	if (qp->rq.queue && qp->rq.queue->ip)
+		state->rq_vm_pgoff = qp->rq.queue->ip->info.offset;
+	memcpy(&state->av, &qp->pri_av, sizeof(state->av));
+	state->dest_qp_num = qp->attr.dest_qp_num;
+	state->qkey = qp->attr.qkey;
+	state->sq_psn = qp->attr.sq_psn;
+	state->rq_psn = qp->attr.rq_psn;
+	state->qp_access_flags = qp->attr.qp_access_flags;
+	state->max_rd_atomic = qp->attr.max_rd_atomic;
+	state->max_dest_rd_atomic = qp->attr.max_dest_rd_atomic;
+	state->pkey_index = qp->attr.pkey_index;
+	state->path_mtu = qp->attr.path_mtu;
+	state->retry_cnt = qp->attr.retry_cnt;
+	state->rnr_retry = qp->attr.rnr_retry;
+	state->retry_cnt_left = qp->comp.retry_cnt;
+	state->rnr_retry_left = qp->comp.rnr_retry;
+	state->min_rnr_timer = qp->attr.min_rnr_timer;
+	state->timeout = qp->attr.timeout;
+	state->port_num = qp->attr.port_num;
+	state->sq_sig_all = qp->sq_sig_type == IB_SIGNAL_ALL_WR;
+	state->req_psn = qp->req.psn;
+	state->comp_psn = qp->comp.psn;
+	state->resp_psn = qp->resp.psn;
+	state->resp_msn = qp->resp.msn;
+	state->req_wqe_index = qp->req.wqe_index;
+	state->ssn = atomic_read(&qp->ssn);
+	state->resp_ack_psn = qp->resp.ack_psn;
+	state->resp_opcode = qp->resp.opcode;
+	state->resp_status = qp->resp.status;
+	state->resp_aeth_syndrome = qp->resp.aeth_syndrome;
+	state->res_head = qp->resp.res_head;
+	state->res_tail = qp->resp.res_tail;
+	if (qp->resp.resources && qp->attr.max_dest_rd_atomic)
+		state->res_image_bytes = qp->attr.max_dest_rd_atomic *
+					 sizeof(struct resp_res);
+}
+
 static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t *length)
 {
 	struct rxe_vhca_context_header context = {};
@@ -242,6 +286,7 @@ static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t
 				cpu_to_le32(qp->migration_uobject_handle);
 			image_qp.header.resp_resource_count =
 				cpu_to_le32(qp->attr.max_dest_rd_atomic);
+			rxe_snapshot_qp(qp, &qp->migration_state);
 			err = rxe_vhca_encode_qp_state(&image_qp.state,
 						       &qp->migration_state);
 			if (err)
@@ -892,50 +937,7 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	if (!qp->is_user || !qp->sq.queue)
 		return -ENXIO;
 
-	/* Identity + ring mmap offsets. */
-	blob.qpn = ibqp->qp_num;
-	if (qp->sq.queue->ip)
-		blob.sq_vm_pgoff = qp->sq.queue->ip->info.offset;
-	if (qp->rq.queue && qp->rq.queue->ip)
-		blob.rq_vm_pgoff = qp->rq.queue->ip->info.offset;
-
-	/* ib_qp_attr-class wire state. */
-	memcpy(&blob.av, &qp->pri_av, sizeof(blob.av));
-	blob.dest_qp_num	= qp->attr.dest_qp_num;
-	blob.qkey		= qp->attr.qkey;
-	blob.sq_psn		= qp->attr.sq_psn;
-	blob.rq_psn		= qp->attr.rq_psn;
-	blob.qp_access_flags	= qp->attr.qp_access_flags;
-	blob.max_rd_atomic	= qp->attr.max_rd_atomic;
-	blob.max_dest_rd_atomic = qp->attr.max_dest_rd_atomic;
-	blob.pkey_index		= qp->attr.pkey_index;
-	blob.path_mtu		= qp->attr.path_mtu;
-	blob.retry_cnt		= qp->attr.retry_cnt;
-	blob.rnr_retry		= qp->attr.rnr_retry;
-	blob.retry_cnt_left	= qp->comp.retry_cnt;
-	blob.rnr_retry_left	= qp->comp.rnr_retry;
-	blob.min_rnr_timer	= qp->attr.min_rnr_timer;
-	blob.timeout		= qp->attr.timeout;
-	blob.port_num		= qp->attr.port_num;
-	blob.sq_sig_all		= (qp->sq_sig_type == IB_SIGNAL_ALL_WR) ? 1 : 0;
-
-	/* Live protocol state ib_modify_qp cannot express. */
-	blob.req_psn		= qp->req.psn;
-	blob.comp_psn		= qp->comp.psn;
-	blob.resp_psn		= qp->resp.psn;
-	blob.resp_msn		= qp->resp.msn;
-	blob.req_wqe_index	= qp->req.wqe_index;
-	blob.ssn		= atomic_read(&qp->ssn);
-
-	blob.resp_ack_psn	= qp->resp.ack_psn;
-	blob.resp_opcode	= qp->resp.opcode;
-	blob.resp_status	= qp->resp.status;
-	blob.resp_aeth_syndrome	= qp->resp.aeth_syndrome;
-	blob.res_head		= qp->resp.res_head;
-	blob.res_tail		= qp->resp.res_tail;
-	if (qp->resp.resources && qp->attr.max_dest_rd_atomic)
-		blob.res_image_bytes = qp->attr.max_dest_rd_atomic *
-				       sizeof(struct resp_res);
+	rxe_snapshot_qp(qp, &blob);
 
 	err = uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_QP_RESP_BLOB,
 			     &blob, sizeof(blob));
