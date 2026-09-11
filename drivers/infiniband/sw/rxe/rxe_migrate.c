@@ -835,29 +835,13 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_RESUME_VHCA)(struct uverbs_attr_bundle *
 	/* Do not make any restored context runnable until all are ready. */
 	rxe_resume_vhca_contexts(rxe);
 	rxe_resume_vhca_datapath(rxe);
+
+	mutex_lock(&rxe->vhca_lock);
+	kvfree(rxe->vhca_image);
+	rxe->vhca_image = NULL;
+	rxe->vhca_image_length = 0;
+	mutex_unlock(&rxe->vhca_lock);
 	return 0;
-}
-
-/*
- * Emit one optional fixed-length image attr verbatim (no ring cursors).
- * Used for the responder-resources array, which is a plain
- * max_dest_rd_atomic-entry table, not a producer/consumer ring.
- */
-static int rxe_query_emit_image(struct uverbs_attr_bundle *attrs, u16 attr_id,
-				const void *data, u32 len)
-{
-	int user_len;
-
-	if (!uverbs_attr_is_valid(attrs, attr_id) || len == 0)
-		return 0;
-
-	user_len = uverbs_attr_get_len(attrs, attr_id);
-	if (user_len < 0)
-		return 0;
-	if ((u32)user_len < len)
-		return -ENOSPC;
-
-	return uverbs_copy_to(attrs, attr_id, data, len);
 }
 
 static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
@@ -943,11 +927,6 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	user_handle = ib_qp_user_handle(ibqp);
 	err = uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
 			     &user_handle, sizeof(user_handle));
-	if (err)
-		return err;
-
-	err = rxe_query_emit_image(attrs, RXE_IB_ATTR_QUERY_QP_RESP_RES,
-				   qp->resp.resources, blob.res_image_bytes);
 	if (err)
 		return err;
 
