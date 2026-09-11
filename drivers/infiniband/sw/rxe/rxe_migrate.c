@@ -20,9 +20,181 @@
 
 #include "rxe.h"
 #include "rxe_queue.h"
+#include "rxe_vhca.h"
 
 #define UVERBS_MODULE_NAME rdma_rxe
 #include <rdma/uverbs_named_ioctl.h>
+
+#define RXE_VHCA_MAX_IMAGE_LENGTH	SZ_1G
+
+enum rxe_vhca_stream_mode {
+	RXE_VHCA_STREAM_SAVE,
+	RXE_VHCA_STREAM_LOAD,
+};
+
+struct rxe_vhca_stream {
+	struct ib_uobject uobject;
+	struct mutex lock; /* protects stream state and contents */
+	struct rxe_dev *rxe;
+	void *data;
+	size_t length;
+	size_t written;
+	enum rxe_vhca_stream_mode mode;
+	bool committed;
+};
+
+static ssize_t rxe_vhca_stream_read(struct file *file, char __user *buffer,
+				    size_t length, loff_t *offset)
+{
+	struct ib_uobject *uobject = file->private_data;
+	struct rxe_vhca_stream *stream;
+
+	if (!uobject)
+		return -EBADF;
+
+	stream = container_of(uobject, struct rxe_vhca_stream, uobject);
+	if (stream->mode != RXE_VHCA_STREAM_SAVE)
+		return -EBADF;
+
+	return simple_read_from_buffer(buffer, length, offset, stream->data,
+				       stream->length);
+}
+
+static ssize_t rxe_vhca_stream_write(struct file *file,
+				     const char __user *buffer, size_t length,
+				     loff_t *offset)
+{
+	struct ib_uobject *uobject = file->private_data;
+	struct rxe_vhca_stream *stream;
+	ssize_t ret;
+
+	if (!uobject)
+		return -EBADF;
+
+	stream = container_of(uobject, struct rxe_vhca_stream, uobject);
+	if (stream->mode != RXE_VHCA_STREAM_LOAD)
+		return -EBADF;
+
+	mutex_lock(&stream->lock);
+	if (stream->committed) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (*offset != stream->written) {
+		ret = -ESPIPE;
+		goto out;
+	}
+	if (length > stream->length - stream->written) {
+		ret = -EFBIG;
+		goto out;
+	}
+	if (copy_from_user((u8 *)stream->data + stream->written, buffer,
+			   length)) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+	stream->written += length;
+	*offset += length;
+	ret = length;
+out:
+	mutex_unlock(&stream->lock);
+	return ret;
+}
+
+static const struct file_operations rxe_vhca_stream_fops = {
+	.owner = THIS_MODULE,
+	.read = rxe_vhca_stream_read,
+	.write = rxe_vhca_stream_write,
+	.llseek = noop_llseek,
+	.release = uverbs_uobject_fd_release,
+};
+
+static void rxe_vhca_stream_destroy(struct ib_uobject *uobject,
+				    enum rdma_remove_reason why)
+{
+	struct rxe_vhca_stream *stream =
+		container_of(uobject, struct rxe_vhca_stream, uobject);
+
+	kvfree(stream->data);
+	mutex_destroy(&stream->lock);
+}
+
+static int
+UVERBS_HANDLER(RXE_IB_METHOD_CREATE_SAVE_FD)(struct uverbs_attr_bundle *attrs)
+{
+	struct ib_uobject *uobject;
+	struct rxe_vhca_stream *stream =
+		NULL;
+	struct rxe_vhca_writer writer;
+	struct ib_device *ibdev;
+	const u16 handle_attr = RXE_IB_ATTR_CREATE_SAVE_FD_HANDLE;
+	int err;
+
+	ibdev = uverbs_attr_get_ibdev(attrs);
+	if (!ibdev)
+		return -ENODEV;
+
+	uobject = uverbs_attr_get_uobject(attrs, handle_attr);
+	stream = container_of(uobject, struct rxe_vhca_stream, uobject);
+	stream->data = kvmalloc_obj(struct rxe_vhca_image_header, GFP_KERNEL);
+	if (!stream->data)
+		return -ENOMEM;
+
+	err = rxe_vhca_writer_init(&writer, stream->data,
+				   sizeof(struct rxe_vhca_image_header));
+	if (err) {
+		kvfree(stream->data);
+		stream->data = NULL;
+		return err;
+	}
+
+	mutex_init(&stream->lock);
+	stream->rxe = to_rdev(ibdev);
+	stream->length = writer.length;
+	stream->mode = RXE_VHCA_STREAM_SAVE;
+	uverbs_finalize_uobj_create(attrs, RXE_IB_ATTR_CREATE_SAVE_FD_HANDLE);
+
+	return 0;
+}
+
+static int
+UVERBS_HANDLER(RXE_IB_METHOD_CREATE_LOAD_FD)(struct uverbs_attr_bundle *attrs)
+{
+	struct ib_uobject *uobject;
+	struct rxe_vhca_stream *stream =
+		NULL;
+	struct ib_device *ibdev;
+	const u16 handle_attr = RXE_IB_ATTR_CREATE_LOAD_FD_HANDLE;
+	u64 length;
+	int err;
+
+	err = uverbs_copy_from(&length, attrs,
+			       RXE_IB_ATTR_CREATE_LOAD_FD_LENGTH);
+	if (err)
+		return err;
+	if (length < sizeof(struct rxe_vhca_image_header) ||
+	    length > RXE_VHCA_MAX_IMAGE_LENGTH || length > SIZE_MAX)
+		return -EINVAL;
+
+	ibdev = uverbs_attr_get_ibdev(attrs);
+	if (!ibdev)
+		return -ENODEV;
+
+	uobject = uverbs_attr_get_uobject(attrs, handle_attr);
+	stream = container_of(uobject, struct rxe_vhca_stream, uobject);
+	stream->data = kvzalloc(length, GFP_KERNEL);
+	if (!stream->data)
+		return -ENOMEM;
+
+	mutex_init(&stream->lock);
+	stream->rxe = to_rdev(ibdev);
+	stream->length = length;
+	stream->mode = RXE_VHCA_STREAM_LOAD;
+	uverbs_finalize_uobj_create(attrs, RXE_IB_ATTR_CREATE_LOAD_FD_HANDLE);
+
+	return 0;
+}
 
 /*
  * RXE freeze drops packets that race with the context gate. Only RC has
@@ -477,6 +649,19 @@ DECLARE_UVERBS_NAMED_METHOD(
 
 DECLARE_UVERBS_NAMED_METHOD(RXE_IB_METHOD_RESUME_VHCA);
 
+DECLARE_UVERBS_NAMED_METHOD(RXE_IB_METHOD_CREATE_SAVE_FD,
+			    UVERBS_ATTR_FD(RXE_IB_ATTR_CREATE_SAVE_FD_HANDLE,
+				   RXE_IB_OBJECT_VHCA_STREAM,
+				   UVERBS_ACCESS_NEW, UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(RXE_IB_METHOD_CREATE_LOAD_FD,
+			    UVERBS_ATTR_FD(RXE_IB_ATTR_CREATE_LOAD_FD_HANDLE,
+				   RXE_IB_OBJECT_VHCA_STREAM,
+				   UVERBS_ACCESS_NEW, UA_MANDATORY),
+			    UVERBS_ATTR_PTR_IN(
+				    RXE_IB_ATTR_CREATE_LOAD_FD_LENGTH,
+				    UVERBS_ATTR_TYPE(u64), UA_MANDATORY));
+
 DECLARE_UVERBS_NAMED_METHOD(
 	RXE_IB_METHOD_QUERY_QP,
 	UVERBS_ATTR_IDR(RXE_IB_ATTR_QUERY_QP_HANDLE,
@@ -520,7 +705,17 @@ DECLARE_UVERBS_GLOBAL_METHODS(
 	&UVERBS_METHOD(RXE_IB_METHOD_FREEZE_CONTEXT),
 	&UVERBS_METHOD(RXE_IB_METHOD_RESUME_VHCA));
 
+DECLARE_UVERBS_NAMED_OBJECT(RXE_IB_OBJECT_VHCA_STREAM,
+			   UVERBS_TYPE_ALLOC_FD(
+				   sizeof(struct rxe_vhca_stream),
+				   rxe_vhca_stream_destroy,
+				   &rxe_vhca_stream_fops, "[rxe-vhca]",
+			   O_RDWR),
+			   &UVERBS_METHOD(RXE_IB_METHOD_CREATE_SAVE_FD),
+			   &UVERBS_METHOD(RXE_IB_METHOD_CREATE_LOAD_FD));
+
 const struct uapi_definition rxe_migrate_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(RXE_IB_OBJECT_MIGRATE),
+	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(RXE_IB_OBJECT_VHCA_STREAM),
 	{},
 };
