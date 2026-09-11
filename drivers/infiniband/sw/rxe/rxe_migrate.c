@@ -51,6 +51,7 @@ static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t
 	unsigned long index = 0;
 	size_t image_length;
 	size_t cq_image_length;
+	size_t qp_image_length = 0;
 	u32 context_count = 0;
 	u32 cq_count = 0;
 	void *image;
@@ -88,6 +89,40 @@ static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t
 				cq_count++;
 			}
 		}
+		{
+			struct rxe_pool_elem *qp_elem;
+			unsigned long qp_index = 0;
+
+			for (qp_elem = xa_find(&rxe->qp_pool.xa, &qp_index,
+					       ULONG_MAX, XA_PRESENT);
+			     qp_elem;
+			     qp_elem = xa_find_after(&rxe->qp_pool.xa, &qp_index,
+						     ULONG_MAX, XA_PRESENT)) {
+				struct rxe_qp *qp = qp_elem->obj;
+				size_t resource_length;
+				size_t qp_length;
+
+				if (ib_qp_ucontext(&qp->ibqp) != &uc->ibuc)
+					continue;
+				if (!qp->migration_captured) {
+					err = -EINVAL;
+					goto out_rcu;
+				}
+				resource_length = sizeof(struct rxe_vhca_record_header) +
+						  sizeof(struct rxe_vhca_resp_resource);
+				if (check_mul_overflow((size_t)qp->attr.max_dest_rd_atomic,
+						       resource_length, &qp_length) ||
+				    check_add_overflow(qp_length,
+						       sizeof(struct rxe_vhca_record_header) +
+						       sizeof(struct rxe_vhca_qp),
+						       &qp_length) ||
+				    check_add_overflow(qp_image_length, qp_length,
+						       &qp_image_length)) {
+					err = -EOVERFLOW;
+					goto out_rcu;
+				}
+			}
+		}
 		context_count++;
 	}
 	rcu_read_unlock();
@@ -106,7 +141,8 @@ static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t
 	    check_add_overflow(image_length,
 			       sizeof(struct rxe_vhca_image_header),
 			       &image_length) ||
-	    check_add_overflow(image_length, cq_image_length, &image_length)) {
+	    check_add_overflow(image_length, cq_image_length, &image_length) ||
+	    check_add_overflow(image_length, qp_image_length, &image_length)) {
 		err = -EOVERFLOW;
 		goto out_unlock;
 	}
@@ -130,6 +166,9 @@ static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t
 		struct rxe_pool_elem *cq_elem;
 		unsigned long cq_index = 0;
 		u32 uc_cq_count = 0;
+		struct rxe_pool_elem *qp_elem;
+		unsigned long qp_index = 0;
+		u32 uc_qp_count = 0;
 
 		for (cq_elem = xa_find(&rxe->cq_pool.xa, &cq_index, ULONG_MAX,
 				       XA_PRESENT);
@@ -142,9 +181,21 @@ static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t
 			    cq->migration_captured)
 				uc_cq_count++;
 		}
+		for (qp_elem = xa_find(&rxe->qp_pool.xa, &qp_index, ULONG_MAX,
+				       XA_PRESENT);
+		     qp_elem;
+		     qp_elem = xa_find_after(&rxe->qp_pool.xa, &qp_index,
+					     ULONG_MAX, XA_PRESENT)) {
+			struct rxe_qp *qp = qp_elem->obj;
+
+			if (ib_qp_ucontext(&qp->ibqp) == &uc->ibuc &&
+			    qp->migration_captured)
+				uc_qp_count++;
+		}
 
 		context.ufile_id = cpu_to_le32(uc->migration_ufile_id);
 		context.cq_count = cpu_to_le32(uc_cq_count);
+		context.qp_count = cpu_to_le32(uc_qp_count);
 		err = rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_CONTEXT, 0,
 					    &context, sizeof(context));
 		if (err)
@@ -172,6 +223,45 @@ static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t
 						    sizeof(image_cq));
 			if (err)
 				goto out_free_rcu;
+		}
+
+		qp_index = 0;
+		for (qp_elem = xa_find(&rxe->qp_pool.xa, &qp_index, ULONG_MAX,
+				       XA_PRESENT);
+		     qp_elem;
+		     qp_elem = xa_find_after(&rxe->qp_pool.xa, &qp_index,
+					     ULONG_MAX, XA_PRESENT)) {
+			struct rxe_vhca_qp image_qp = {};
+			struct rxe_qp *qp = qp_elem->obj;
+			u32 i;
+
+			if (ib_qp_ucontext(&qp->ibqp) != &uc->ibuc ||
+			    !qp->migration_captured)
+				continue;
+			image_qp.header.uobject_handle =
+				cpu_to_le32(qp->migration_uobject_handle);
+			image_qp.header.resp_resource_count =
+				cpu_to_le32(qp->attr.max_dest_rd_atomic);
+			image_qp.state = qp->migration_state;
+			err = rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_QP, 0,
+						    &image_qp,
+						    sizeof(image_qp));
+			if (err)
+				goto out_free_rcu;
+			for (i = 0; i < qp->attr.max_dest_rd_atomic; i++) {
+				struct rxe_vhca_resp_resource resource;
+				struct resp_res *resp_resource;
+				u32 type = RXE_VHCA_RECORD_RESP_RESOURCE;
+
+				resp_resource = &qp->resp.resources[i];
+				err = rxe_vhca_encode_resp_resource(&resource, i, resp_resource);
+				if (err)
+					goto out_free_rcu;
+				err = rxe_vhca_write_record(&writer, type, 0, &resource,
+							    sizeof(resource));
+				if (err)
+					goto out_free_rcu;
+			}
 		}
 	}
 	rcu_read_unlock();
@@ -767,6 +857,7 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	struct uverbs_attr_bundle *attrs)
 {
 	struct rxe_restore_qp_req blob = {};
+	struct ib_uobject *uobject;
 	struct ib_qp *ibqp;
 	u64 user_handle;
 	struct rxe_qp *qp;
@@ -781,6 +872,7 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 		return err;
 
 	qp = to_rqp(ibqp);
+	uobject = uverbs_attr_get_uobject(attrs, RXE_IB_ATTR_QUERY_QP_HANDLE);
 
 	/* No user-side wire state to emit for kernel QPs. */
 	if (!qp->is_user || !qp->sq.queue)
@@ -847,8 +939,15 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	if (err)
 		return err;
 
-	return rxe_query_emit_image(attrs, RXE_IB_ATTR_QUERY_QP_RESP_RES,
-				    qp->resp.resources, blob.res_image_bytes);
+	err = rxe_query_emit_image(attrs, RXE_IB_ATTR_QUERY_QP_RESP_RES,
+				   qp->resp.resources, blob.res_image_bytes);
+	if (err)
+		return err;
+
+	qp->migration_state = blob;
+	qp->migration_uobject_handle = uobject->id;
+	qp->migration_captured = true;
+	return 0;
 }
 
 static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(

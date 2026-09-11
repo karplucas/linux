@@ -684,33 +684,15 @@ err_out:
 static int rxe_stage_qp_restore(struct rxe_qp *qp,
 				const struct rxe_restore_qp_req *req,
 				enum ib_qp_state qp_state,
-				struct ib_udata *udata)
+				const struct resp_res *resources)
 {
-	const size_t hdr = sizeof(*req);
 	size_t bytes;
-	const void *resources = NULL;
-	void *buf = NULL;
-	int err;
 
 	bytes = (size_t)req->max_dest_rd_atomic * sizeof(struct resp_res);
-	if (bytes != req->res_image_bytes || udata->inlen != hdr + bytes)
+	if (bytes != req->res_image_bytes || (bytes && !resources))
 		return -EINVAL;
 
-	if (bytes) {
-		buf = kvmalloc(udata->inlen, GFP_KERNEL);
-		if (!buf)
-			return -ENOMEM;
-
-		err = ib_copy_from_udata(buf, udata, udata->inlen);
-		if (err)
-			goto out;
-		resources = buf + hdr;
-	}
-
-	err = rxe_qp_stage_restore(qp, req, qp_state, resources);
-out:
-	kvfree(buf);
-	return err;
+	return rxe_qp_stage_restore(qp, req, qp_state, resources);
 }
 
 static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
@@ -725,8 +707,8 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	struct rxe_restore_qp_req req = {};
 	struct ib_qp_init_attr init = {};
 	struct ib_ucontext *ucontext;
+	struct resp_res *resources = NULL;
 	int err, cleanup_err;
-	size_t n;
 
 	ucontext = ib_qp_ucontext(ibqp);
 	if (!ucontext) {
@@ -766,24 +748,13 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	uresp = udata->outbuf;
 	qp->is_user = true;
 
-	/*
-	 * UHW_IN carries the full rxe wire state (struct rxe_restore_qp_req).
-	 * Same inline-attr-threshold discipline as rxe_restore_cq: the
-	 * struct is sized strictly larger than __u64 so the dispatcher
-	 * takes the copy_from_user pointer path; reject anything in the
-	 * inline range to surface a malformed caller loudly.
-	 */
-	if (udata->inlen <= sizeof(__u64)) {
-		err = -EINVAL;
-		rxe_dbg_dev(rxe,
-			    "restore qp req inbuf must exceed inline-attr threshold (got %zu, need > %zu)\n",
-			    udata->inlen, sizeof(__u64));
-		goto err_out;
-	}
-	n = min_t(size_t, udata->inlen, sizeof(req));
-	err = ib_copy_from_udata(&req, udata, n);
+	mutex_lock(&rxe->vhca_lock);
+	err = rxe_vhca_find_qp(rxe->vhca_image, rxe->vhca_image_length,
+			       to_ruc(ucontext)->migration_ufile_id,
+			       target_handle, &req, &resources);
+	mutex_unlock(&rxe->vhca_lock);
 	if (err) {
-		rxe_dbg_dev(rxe, "bad restore qp req, err = %d\n", err);
+		rxe_dbg_dev(rxe, "missing vHCA QP record, err = %d\n", err);
 		goto err_out;
 	}
 	if (req.reserved || memchr_inv(req.reserved2, 0,
@@ -877,7 +848,9 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	 */
 	rxe_qp_pause(qp);
 
-	err = rxe_stage_qp_restore(qp, &req, qp_state, udata);
+	err = rxe_stage_qp_restore(qp, &req, qp_state, resources);
+	kvfree(resources);
+	resources = NULL;
 	if (err) {
 		rxe_dbg_qp(qp, "restore qp state staging failed, err = %d\n",
 			   err);
@@ -892,6 +865,7 @@ err_cleanup:
 	if (cleanup_err)
 		rxe_err_qp(qp, "cleanup failed, err = %d\n", cleanup_err);
 err_out:
+	kvfree(resources);
 	rxe_err_dev(rxe, "returned err = %d\n", err);
 	return err;
 }
