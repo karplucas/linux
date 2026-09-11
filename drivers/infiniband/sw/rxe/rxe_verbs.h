@@ -314,6 +314,9 @@ struct rxe_qp {
 	 * task reservation (num_sched > num_done).
 	 */
 	bool			dp_frozen;
+	struct rxe_restore_qp_req migration_state;
+	u32			migration_uobject_handle;
+	bool			migration_captured;
 	struct rxe_qp_restore_state *restore_state;
 	bool			restore_finalized;
 
