@@ -22,6 +22,7 @@ void rxe_mmap_release(struct kref *ref)
 
 	if (!list_empty(&ip->pending_mmaps))
 		list_del(&ip->pending_mmaps);
+	list_del(&ip->mmap_infos);
 
 	spin_unlock_bh(&rxe->pending_lock);
 
@@ -41,6 +42,8 @@ int rxe_mmap(struct ib_ucontext *context, struct vm_area_struct *vma)
 	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
 	unsigned long size = vma->vm_end - vma->vm_start;
 	struct rxe_mmap_info *ip, *pp;
+	unsigned long obj_pgoff = 0;
+	bool pending = false;
 	int ret;
 
 	/*
@@ -63,6 +66,20 @@ int rxe_mmap(struct ib_ucontext *context, struct vm_area_struct *vma)
 
 		goto found_it;
 	}
+	if (!to_ruc(context)->restore_mode)
+		goto not_found;
+	list_for_each_entry(ip, &rxe->mmap_infos, mmap_infos) {
+		u64 relative;
+
+		if (context != ip->context || offset < ip->info.offset)
+			continue;
+		relative = offset - ip->info.offset;
+		if (relative > ip->info.size || size > ip->info.size - relative)
+			continue;
+		obj_pgoff = relative >> PAGE_SHIFT;
+		goto found_it;
+	}
+not_found:
 	rxe_dbg_dev(rxe, "unable to find pending mmap info\n");
 	spin_unlock_bh(&rxe->pending_lock);
 	ret = -EINVAL;
@@ -79,10 +96,18 @@ found_it:
 		goto done;
 	}
 
-	list_del_init(&ip->pending_mmaps);
+	if (!list_empty(&ip->pending_mmaps)) {
+		list_del_init(&ip->pending_mmaps);
+		pending = true;
+	}
 	spin_unlock_bh(&rxe->pending_lock);
 
-	ret = remap_vmalloc_range(vma, ip->obj, 0);
+	ret = remap_vmalloc_range(vma, ip->obj, obj_pgoff);
+	if (ret && pending) {
+		spin_lock_bh(&rxe->pending_lock);
+		list_add(&ip->pending_mmaps, &rxe->pending_mmaps);
+		spin_unlock_bh(&rxe->pending_lock);
+	}
 	kref_put(&ip->ref, rxe_mmap_release);
 	if (ret)
 		rxe_dbg_dev(rxe, "err %d from remap_vmalloc_range\n", ret);
@@ -125,6 +150,7 @@ struct rxe_mmap_info *rxe_create_mmap_info(struct rxe_dev *rxe, u32 size,
 	size = PAGE_ALIGN(size);
 
 	INIT_LIST_HEAD(&ip->pending_mmaps);
+	INIT_LIST_HEAD(&ip->mmap_infos);
 	ip->info.size = size;
 	ip->context =
 		container_of(udata, struct uverbs_attr_bundle, driver_udata)
@@ -139,7 +165,7 @@ struct rxe_mmap_info *rxe_create_mmap_info(struct rxe_dev *rxe, u32 size,
 		rxe->mmap_offset = ALIGN(PAGE_SIZE, SHMLBA);
 
 	if (forced_offset) {
-		list_for_each_entry(cur, &rxe->pending_mmaps, pending_mmaps) {
+		list_for_each_entry(cur, &rxe->mmap_infos, mmap_infos) {
 			if (cur->info.offset == forced_offset) {
 				spin_unlock_bh(&rxe->mmap_offset_lock);
 				spin_unlock_bh(&rxe->pending_lock);
@@ -170,6 +196,7 @@ struct rxe_mmap_info *rxe_create_mmap_info(struct rxe_dev *rxe, u32 size,
 	spin_unlock_bh(&rxe->mmap_offset_lock);
 
 	list_add(&ip->pending_mmaps, &rxe->pending_mmaps);
+	list_add(&ip->mmap_infos, &rxe->mmap_infos);
 
 	spin_unlock_bh(&rxe->pending_lock);
 

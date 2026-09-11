@@ -476,6 +476,7 @@ struct rxe_dev {
 
 	spinlock_t		pending_lock; /* guard pending_mmaps */
 	struct list_head	pending_mmaps;
+	struct list_head	mmap_infos;
 
 	spinlock_t		mmap_offset_lock; /* guard mmap_offset */
 	u64			mmap_offset;
