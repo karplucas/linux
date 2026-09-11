@@ -13,9 +13,11 @@
 #include "rxe.h"
 #include "rxe_loc.h"
 #include "rxe_queue.h"
+#include "rxe_vhca.h"
 
 struct rxe_qp_restore_state {
 	struct rxe_restore_qp_req req;
+	struct rxe_vhca_qp_runtime runtime;
 	enum ib_qp_state qp_state;
 	u8 resources[];
 };
@@ -651,7 +653,8 @@ static int rxe_validate_restore_resources(const struct rxe_restore_qp_req *req,
 
 int rxe_qp_stage_restore(struct rxe_qp *qp,
 			 const struct rxe_restore_qp_req *req,
-			 enum ib_qp_state state, const void *res_image)
+			 enum ib_qp_state state, const void *res_image,
+			 const struct rxe_vhca_qp_runtime *runtime)
 {
 	struct rxe_qp_restore_state *restore;
 	size_t bytes = req->res_image_bytes;
@@ -668,6 +671,7 @@ int rxe_qp_stage_restore(struct rxe_qp *qp,
 		return -ENOMEM;
 
 	restore->req = *req;
+	restore->runtime = *runtime;
 	restore->qp_state = state;
 	if (bytes)
 		memcpy(restore->resources, res_image, bytes);
@@ -698,10 +702,32 @@ int rxe_qp_finalize_restore(struct rxe_qp *qp)
 			return err;
 	}
 
+	qp->resp.va = restore->runtime.resp_va;
+	qp->resp.offset = restore->runtime.resp_offset;
+	qp->resp.resid = restore->runtime.resp_resid;
+	qp->resp.rkey = restore->runtime.resp_rkey;
+	qp->resp.length = restore->runtime.resp_length;
+
 	kvfree(restore);
 	qp->restore_state = NULL;
 	qp->restore_finalized = true;
 	return 0;
+}
+
+void rxe_qp_restore_timers(struct rxe_qp *qp)
+{
+	unsigned long delay;
+
+	if (qp->restore_retrans_pending) {
+		delay = nsecs_to_jiffies(qp->restore_retrans_remaining_ns);
+		mod_timer(&qp->retrans_timer, jiffies + max(delay, 1UL));
+		qp->restore_retrans_pending = false;
+	}
+	if (qp->restore_rnr_pending) {
+		delay = nsecs_to_jiffies(qp->restore_rnr_remaining_ns);
+		mod_timer(&qp->rnr_nak_timer, jiffies + max(delay, 1UL));
+		qp->restore_rnr_pending = false;
+	}
 }
 
 /* called by the query qp verb */
