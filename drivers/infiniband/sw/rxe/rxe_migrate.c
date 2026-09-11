@@ -43,6 +43,89 @@ struct rxe_vhca_stream {
 	bool committed;
 };
 
+static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t *length)
+{
+	struct rxe_vhca_context_header context = {};
+	struct rxe_vhca_writer writer;
+	struct rxe_pool_elem *elem;
+	unsigned long index = 0;
+	size_t image_length;
+	u32 context_count = 0;
+	void *image;
+	int err;
+
+	mutex_lock(&rxe->vhca_lock);
+	rcu_read_lock();
+	for (elem = xa_find(&rxe->uc_pool.xa, &index, ULONG_MAX, XA_PRESENT);
+	     elem;
+	     elem = xa_find_after(&rxe->uc_pool.xa, &index, ULONG_MAX,
+				  XA_PRESENT)) {
+		struct rxe_ucontext *uc = elem->obj;
+
+		if (!uc->migration_registered) {
+			err = -EINVAL;
+			goto out_rcu;
+		}
+		context_count++;
+	}
+	rcu_read_unlock();
+
+	if (!context_count) {
+		err = -ENODATA;
+		goto out_unlock;
+	}
+	if (check_mul_overflow((size_t)context_count,
+			       sizeof(struct rxe_vhca_record_header) +
+			       sizeof(context), &image_length) ||
+	    check_add_overflow(image_length,
+			       sizeof(struct rxe_vhca_image_header),
+			       &image_length)) {
+		err = -EOVERFLOW;
+		goto out_unlock;
+	}
+
+	image = kvmalloc(image_length, GFP_KERNEL);
+	if (!image) {
+		err = -ENOMEM;
+		goto out_unlock;
+	}
+	err = rxe_vhca_writer_init(&writer, image, image_length);
+	if (err)
+		goto out_free;
+
+	index = 0;
+	rcu_read_lock();
+	for (elem = xa_find(&rxe->uc_pool.xa, &index, ULONG_MAX, XA_PRESENT);
+	     elem;
+	     elem = xa_find_after(&rxe->uc_pool.xa, &index, ULONG_MAX,
+				  XA_PRESENT)) {
+		struct rxe_ucontext *uc = elem->obj;
+
+		context.ufile_id = cpu_to_le32(uc->migration_ufile_id);
+		err = rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_CONTEXT, 0,
+					    &context, sizeof(context));
+		if (err)
+			goto out_free_rcu;
+	}
+	rcu_read_unlock();
+
+	*data = image;
+	*length = writer.length;
+	mutex_unlock(&rxe->vhca_lock);
+	return 0;
+
+out_free_rcu:
+	rcu_read_unlock();
+out_free:
+	kvfree(image);
+out_unlock:
+	mutex_unlock(&rxe->vhca_lock);
+	return err;
+out_rcu:
+	rcu_read_unlock();
+	goto out_unlock;
+}
+
 static ssize_t rxe_vhca_stream_read(struct file *file, char __user *buffer,
 				    size_t length, loff_t *offset)
 {
@@ -126,7 +209,6 @@ UVERBS_HANDLER(RXE_IB_METHOD_CREATE_SAVE_FD)(struct uverbs_attr_bundle *attrs)
 	struct ib_uobject *uobject;
 	struct rxe_vhca_stream *stream =
 		NULL;
-	struct rxe_vhca_writer writer;
 	struct ib_device *ibdev;
 	const u16 handle_attr = RXE_IB_ATTR_CREATE_SAVE_FD_HANDLE;
 	int err;
@@ -137,25 +219,70 @@ UVERBS_HANDLER(RXE_IB_METHOD_CREATE_SAVE_FD)(struct uverbs_attr_bundle *attrs)
 
 	uobject = uverbs_attr_get_uobject(attrs, handle_attr);
 	stream = container_of(uobject, struct rxe_vhca_stream, uobject);
-	stream->data = kvmalloc_obj(struct rxe_vhca_image_header, GFP_KERNEL);
-	if (!stream->data)
-		return -ENOMEM;
-
-	err = rxe_vhca_writer_init(&writer, stream->data,
-				   sizeof(struct rxe_vhca_image_header));
-	if (err) {
-		kvfree(stream->data);
-		stream->data = NULL;
+	err = rxe_vhca_build_context_image(to_rdev(ibdev), &stream->data,
+					   &stream->length);
+	if (err)
 		return err;
-	}
 
 	mutex_init(&stream->lock);
 	stream->rxe = to_rdev(ibdev);
-	stream->length = writer.length;
 	stream->mode = RXE_VHCA_STREAM_SAVE;
 	uverbs_finalize_uobj_create(attrs, RXE_IB_ATTR_CREATE_SAVE_FD_HANDLE);
 
 	return 0;
+}
+
+static int
+UVERBS_HANDLER(RXE_IB_METHOD_REGISTER_CONTEXT)(struct uverbs_attr_bundle *attrs)
+{
+	struct ib_ucontext *ucontext = ib_uverbs_get_ucontext(attrs);
+	struct rxe_ucontext *uc;
+	struct rxe_pool_elem *elem;
+	unsigned long index = 0;
+	struct rxe_dev *rxe;
+	u32 ufile_id;
+	int err;
+
+	if (IS_ERR(ucontext))
+		return PTR_ERR(ucontext);
+	err = uverbs_copy_from(&ufile_id, attrs,
+			       RXE_IB_ATTR_REGISTER_CONTEXT_UFILE_ID);
+	if (err)
+		return err;
+	if (!ufile_id)
+		return -EINVAL;
+
+	uc = to_ruc(ucontext);
+	rxe = to_rdev(ucontext->device);
+	mutex_lock(&rxe->vhca_lock);
+	rcu_read_lock();
+	for (elem = xa_find(&rxe->uc_pool.xa, &index, ULONG_MAX, XA_PRESENT);
+	     elem;
+	     elem = xa_find_after(&rxe->uc_pool.xa, &index, ULONG_MAX,
+				  XA_PRESENT)) {
+		struct rxe_ucontext *other = elem->obj;
+
+		if (other != uc && other->migration_registered &&
+		    other->migration_ufile_id == ufile_id) {
+			err = -EEXIST;
+			goto out_rcu;
+		}
+	}
+	rcu_read_unlock();
+	if (uc->migration_registered && uc->migration_ufile_id != ufile_id) {
+		err = -EALREADY;
+	} else {
+		uc->migration_ufile_id = ufile_id;
+		uc->migration_registered = true;
+		err = 0;
+	}
+	mutex_unlock(&rxe->vhca_lock);
+
+	return err;
+out_rcu:
+	rcu_read_unlock();
+	mutex_unlock(&rxe->vhca_lock);
+	return err;
 }
 
 static int
@@ -201,8 +328,6 @@ UVERBS_HANDLER(RXE_IB_METHOD_LOAD_VHCA)(struct uverbs_attr_bundle *attrs)
 {
 	const u16 handle_attr = RXE_IB_ATTR_LOAD_VHCA_HANDLE;
 	struct rxe_vhca_stream *stream;
-	struct rxe_vhca_record record;
-	struct rxe_vhca_reader reader;
 	struct ib_uobject *uobject;
 	struct ib_device *ibdev;
 	struct rxe_dev *rxe;
@@ -229,12 +354,7 @@ UVERBS_HANDLER(RXE_IB_METHOD_LOAD_VHCA)(struct uverbs_attr_bundle *attrs)
 		goto out_stream;
 	}
 
-	err = rxe_vhca_reader_init(&reader, stream->data, stream->length);
-	if (err)
-		goto out_stream;
-	do {
-		err = rxe_vhca_read_record(&reader, &record);
-	} while (err > 0);
+	err = rxe_vhca_validate_contexts(stream->data, stream->length);
 	if (err)
 		goto out_stream;
 
@@ -709,6 +829,11 @@ DECLARE_UVERBS_NAMED_METHOD(
 
 DECLARE_UVERBS_NAMED_METHOD(RXE_IB_METHOD_RESUME_VHCA);
 
+DECLARE_UVERBS_NAMED_METHOD(
+	RXE_IB_METHOD_REGISTER_CONTEXT,
+	UVERBS_ATTR_PTR_IN(RXE_IB_ATTR_REGISTER_CONTEXT_UFILE_ID,
+			   UVERBS_ATTR_TYPE(u32), UA_MANDATORY));
+
 DECLARE_UVERBS_NAMED_METHOD(RXE_IB_METHOD_CREATE_SAVE_FD,
 			    UVERBS_ATTR_FD(RXE_IB_ATTR_CREATE_SAVE_FD_HANDLE,
 				   RXE_IB_OBJECT_VHCA_STREAM,
@@ -768,7 +893,8 @@ DECLARE_UVERBS_GLOBAL_METHODS(
 	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_QP),
 	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_CQ),
 	&UVERBS_METHOD(RXE_IB_METHOD_FREEZE_CONTEXT),
-	&UVERBS_METHOD(RXE_IB_METHOD_RESUME_VHCA));
+	&UVERBS_METHOD(RXE_IB_METHOD_RESUME_VHCA),
+	&UVERBS_METHOD(RXE_IB_METHOD_REGISTER_CONTEXT));
 
 DECLARE_UVERBS_NAMED_OBJECT(RXE_IB_OBJECT_VHCA_STREAM,
 			   UVERBS_TYPE_ALLOC_FD(

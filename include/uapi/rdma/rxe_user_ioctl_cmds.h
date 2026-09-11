@@ -80,6 +80,11 @@ enum rxe_ib_migrate_methods {
 	RXE_IB_METHOD_QUERY_CQ = (1U << UVERBS_ID_NS_SHIFT) + 2,
 	RXE_IB_METHOD_FREEZE_CONTEXT = (1U << UVERBS_ID_NS_SHIFT) + 3,
 	RXE_IB_METHOD_RESUME_VHCA = (1U << UVERBS_ID_NS_SHIFT) + 4,
+	RXE_IB_METHOD_REGISTER_CONTEXT = (1U << UVERBS_ID_NS_SHIFT) + 5,
+};
+
+enum rxe_ib_register_context_attrs {
+	RXE_IB_ATTR_REGISTER_CONTEXT_UFILE_ID = (1U << UVERBS_ID_NS_SHIFT),
 };
 
 enum rxe_ib_vhca_stream_methods {

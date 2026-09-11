@@ -61,6 +61,7 @@ enum {
 
 struct rxe_alloc_ucontext_req {
 	__u32	flags;
+	__u32	ufile_id;
 	__u32	reserved;
 };
 

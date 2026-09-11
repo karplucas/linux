@@ -114,6 +114,8 @@ int rxe_vhca_reader_init(struct rxe_vhca_reader *reader, const void *data,
 			 size_t length);
 int rxe_vhca_read_record(struct rxe_vhca_reader *reader,
 			 struct rxe_vhca_record *record);
+int rxe_vhca_validate_contexts(const void *data, size_t length);
+bool rxe_vhca_has_context(const void *data, size_t length, u32 ufile_id);
 int rxe_vhca_encode_resp_resource(struct rxe_vhca_resp_resource *record,
 				  u32 slot, const struct resp_res *resource);
 int rxe_vhca_decode_resp_resource(const struct rxe_vhca_resp_resource *record,

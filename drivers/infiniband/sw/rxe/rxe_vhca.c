@@ -280,3 +280,57 @@ int rxe_vhca_read_record(struct rxe_vhca_reader *reader,
 
 	return 1;
 }
+
+bool rxe_vhca_has_context(const void *data, size_t length, u32 ufile_id)
+{
+	struct rxe_vhca_context_header context;
+	struct rxe_vhca_record record;
+	struct rxe_vhca_reader reader;
+	int err;
+
+	if (rxe_vhca_reader_init(&reader, data, length))
+		return false;
+
+	while ((err = rxe_vhca_read_record(&reader, &record)) > 0) {
+		if (record.type != RXE_VHCA_RECORD_CONTEXT ||
+		    record.length != sizeof(context))
+			continue;
+		memcpy(&context, record.payload, sizeof(context));
+		if (le32_to_cpu(context.ufile_id) == ufile_id)
+			return true;
+	}
+
+	return false;
+}
+
+int rxe_vhca_validate_contexts(const void *data, size_t length)
+{
+	struct rxe_vhca_context_header context;
+	struct rxe_vhca_record record;
+	struct rxe_vhca_reader reader;
+	u32 context_count = 0;
+	int err;
+
+	err = rxe_vhca_reader_init(&reader, data, length);
+	if (err)
+		return err;
+
+	while ((err = rxe_vhca_read_record(&reader, &record)) > 0) {
+		u32 ufile_id;
+
+		if (record.type != RXE_VHCA_RECORD_CONTEXT || record.flags ||
+		    record.length != sizeof(context))
+			return -EBADMSG;
+		memcpy(&context, record.payload, sizeof(context));
+		ufile_id = le32_to_cpu(context.ufile_id);
+		if (!ufile_id || le32_to_cpu(context.cq_count) ||
+		    le32_to_cpu(context.qp_count) ||
+		    le32_to_cpu(context.reserved))
+			return -EBADMSG;
+		context_count++;
+	}
+	if (err)
+		return err;
+
+	return context_count ? 0 : -ENODATA;
+}
