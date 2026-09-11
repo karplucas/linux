@@ -110,6 +110,47 @@ static void rxe_vhca_cq_lookup_test(struct kunit *test)
 			-ENOENT);
 }
 
+static void rxe_vhca_qp_lookup_test(struct kunit *test)
+{
+	struct rxe_vhca_context_header context = {
+		.ufile_id = cpu_to_le32(7),
+		.qp_count = cpu_to_le32(1),
+	};
+	struct rxe_vhca_qp qp = {
+		.header.uobject_handle = cpu_to_le32(13),
+		.header.resp_resource_count = cpu_to_le32(1),
+		.state.qpn = 19,
+		.state.max_dest_rd_atomic = 1,
+		.state.res_image_bytes = sizeof(struct resp_res),
+	};
+	struct rxe_vhca_resp_resource resource = {};
+	struct rxe_restore_qp_req state = {};
+	struct resp_res *resources;
+	struct rxe_vhca_writer writer;
+	u8 image[512];
+
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_writer_init(&writer, image, sizeof(image)), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_CONTEXT, 0,
+					      &context, sizeof(context)), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_QP, 0,
+					      &qp, sizeof(qp)), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_write_record(&writer,
+					      RXE_VHCA_RECORD_RESP_RESOURCE, 0,
+					      &resource, sizeof(resource)), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_validate_contexts(image, writer.length), 0);
+	KUNIT_ASSERT_EQ(test,
+			rxe_vhca_find_qp(image, writer.length, 7, 13, &state,
+					 &resources), 0);
+	KUNIT_EXPECT_EQ(test, state.qpn, 19U);
+	KUNIT_EXPECT_EQ(test, resources[0].type, 0);
+	kfree(resources);
+}
+
 static void rxe_vhca_resp_resource_roundtrip_test(struct kunit *test)
 {
 	static const int types[] = {
@@ -188,6 +229,7 @@ static struct kunit_case rxe_vhca_test_cases[] = {
 	KUNIT_CASE(rxe_vhca_truncated_record_test),
 	KUNIT_CASE(rxe_vhca_record_length_test),
 	KUNIT_CASE(rxe_vhca_cq_lookup_test),
+	KUNIT_CASE(rxe_vhca_qp_lookup_test),
 	KUNIT_CASE(rxe_vhca_resp_resource_roundtrip_test),
 	KUNIT_CASE(rxe_vhca_resp_resource_validation_test),
 	{}
