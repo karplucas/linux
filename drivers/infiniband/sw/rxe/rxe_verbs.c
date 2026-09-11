@@ -666,7 +666,7 @@ err_out:
  *
  * The responder-resources array follows the fixed request in UHW_IN. SQ and
  * RQ contents remain in their mapped pages and are synchronized by
- * FINALIZE_CONTEXT. The restored QP is installed datapath-frozen so replay
+ * RESUME_VHCA. The restored QP is installed datapath-frozen so replay
  * cannot start before that operation completes.
  */
 static int rxe_stage_qp_restore(struct rxe_qp *qp,

@@ -9,7 +9,7 @@
  * RXE_IB_OBJECT_MIGRATE carries the rxe arm of the CRIU dump-side
  * choreography. Its methods run on a per-process uverbs fd. Method id +0
  * is FREEZE_DATAPATH; QUERY_QP is +1, QUERY_CQ is +2 and FREEZE_CONTEXT
- * is +3. FINALIZE_CONTEXT is +4.
+ * is +3. RESUME_VHCA is +4.
  *
  *   FREEZE_DATAPATH  non-destructively park (freeze=1) or unpark
  *             (freeze=0) a QP's requester/responder tasks so the dumper
@@ -43,10 +43,10 @@
  *             QUERY_QP, never popped -- so a CQ could pop a QP ring's
  *             offset).
  *
- *   FINALIZE_CONTEXT  validate restored queue headers and synchronize the
- *             kernel-owned queue indices after CRIU has copied all RXE queue
- *             mappings. Valid only on a restore-mode ucontext while its QPs
- *             remain frozen.
+ *   RESUME_VHCA  validate restored queue headers, synchronize kernel-owned
+ *             queue indices, apply staged private state, and resume every
+ *             restored context on the RXE device. Valid only on a
+ *             restore-mode ucontext.
  */
 #ifndef RXE_USER_IOCTL_CMDS_H
 #define RXE_USER_IOCTL_CMDS_H
@@ -64,7 +64,7 @@ enum rxe_ib_migrate_methods {
 	RXE_IB_METHOD_QUERY_QP = (1U << UVERBS_ID_NS_SHIFT) + 1,
 	RXE_IB_METHOD_QUERY_CQ = (1U << UVERBS_ID_NS_SHIFT) + 2,
 	RXE_IB_METHOD_FREEZE_CONTEXT = (1U << UVERBS_ID_NS_SHIFT) + 3,
-	RXE_IB_METHOD_FINALIZE_CONTEXT = (1U << UVERBS_ID_NS_SHIFT) + 4,
+	RXE_IB_METHOD_RESUME_VHCA = (1U << UVERBS_ID_NS_SHIFT) + 4,
 };
 
 enum rxe_ib_freeze_datapath_attrs {

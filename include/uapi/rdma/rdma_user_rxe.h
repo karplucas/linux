@@ -232,7 +232,7 @@ struct rxe_resize_cq_resp {
  *
  * CRIU restores CQ contents and cursors through the mapped queue pages.
  * @producer, @consumer, and @cqe_image_bytes are retained for source
- * compatibility and must be zero. FINALIZE_CONTEXT validates the restored
+ * compatibility and must be zero. RESUME_VHCA validates the restored
  * queue header and imports the kernel-owned producer index.
  *
  * Size note: must stay strictly larger than sizeof(__u64) (== 8B).
@@ -262,7 +262,7 @@ struct rxe_restore_cq_req {
  * the CQ ring's mmap byte offset (cq->queue->ip->info.offset) that the
  * dumper replays into RESTORE_CQ, and @cqe is the user-visible entry
  * count. @notify contains the CQ arm state. Queue contents and cursors are
- * read from the mapping by CRIU and synchronized with FINALIZE_CONTEXT.
+ * read from the mapping by CRIU and synchronized with RESUME_VHCA.
  */
 struct rxe_query_cq_resp {
 	__aligned_u64 vm_pgoff;
@@ -289,7 +289,7 @@ struct rxe_create_qp_resp {
  * rxe has no firmware. Every byte of wire-relevant QP state that the
  * destination cannot re-derive from the generic RESTORE_QP method attrs
  * (cap / type / state / create_flags / pd / cqs) must travel in this
- * blob and be staged by rxe_restore_qp. FINALIZE_CONTEXT applies it after
+ * blob and be staged by rxe_restore_qp. RESUME_VHCA applies it after
  * queue mappings are restored. This is the rxe
  * mirror of "mlx5 sources it from FW": same logical QP state, different
  * backing store per driver. Finalization lands the QP directly at its
@@ -341,7 +341,7 @@ struct rxe_create_qp_resp {
  *   @ssn  send sequence number (qp->ssn).
  *
  * In-flight responder state. SQ and RQ entries and their cursors are copied
- * as mapped memory by CRIU, then synchronized with FINALIZE_CONTEXT.
+ * as mapped memory by CRIU, then synchronized with RESUME_VHCA.
  * @sq_producer, @sq_consumer, @rq_producer, @rq_consumer,
  * @sq_image_bytes, and @rq_image_bytes are retained for source compatibility
  * and must be zero.

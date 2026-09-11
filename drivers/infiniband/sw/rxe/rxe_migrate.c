@@ -155,8 +155,7 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_CONTEXT)(
 	return ret;
 }
 
-static int rxe_finalize_context_cqs(struct rxe_dev *rxe,
-				    struct ib_ucontext *ucontext)
+static int rxe_resume_vhca_cqs(struct rxe_dev *rxe)
 {
 	struct rxe_pool *pool = &rxe->cq_pool;
 	struct rxe_pool_elem *elem;
@@ -174,7 +173,8 @@ static int rxe_finalize_context_cqs(struct rxe_dev *rxe,
 			continue;
 		rcu_read_unlock();
 
-		if (cq->is_user && ib_cq_ucontext(&cq->ibcq) == ucontext) {
+		if (cq->is_user && ib_cq_ucontext(&cq->ibcq) &&
+		    to_ruc(ib_cq_ucontext(&cq->ibcq))->restore_mode) {
 			if (!cq->queue) {
 				err = -EINVAL;
 			} else {
@@ -205,8 +205,7 @@ static int rxe_finalize_context_cqs(struct rxe_dev *rxe,
 	return 0;
 }
 
-static int rxe_finalize_context_qps(struct rxe_dev *rxe,
-				    struct ib_ucontext *ucontext)
+static int rxe_resume_vhca_qps(struct rxe_dev *rxe)
 {
 	struct rxe_pool *pool = &rxe->qp_pool;
 	struct rxe_pool_elem *elem;
@@ -224,7 +223,8 @@ static int rxe_finalize_context_qps(struct rxe_dev *rxe,
 			continue;
 		rcu_read_unlock();
 
-		if (!qp->is_user || ib_qp_ucontext(&qp->ibqp) != ucontext)
+		if (!qp->is_user || !ib_qp_ucontext(&qp->ibqp) ||
+		    !to_ruc(ib_qp_ucontext(&qp->ibqp))->restore_mode)
 			goto next;
 
 		spin_lock_irqsave(&qp->state_lock, flags);
@@ -252,7 +252,51 @@ next:
 	return 0;
 }
 
-static int UVERBS_HANDLER(RXE_IB_METHOD_FINALIZE_CONTEXT)(struct uverbs_attr_bundle *attrs)
+static void rxe_resume_vhca_contexts(struct rxe_dev *rxe)
+{
+	struct rxe_pool *pool = &rxe->uc_pool;
+	struct rxe_pool_elem *elem;
+	unsigned long index = 0;
+
+	rcu_read_lock();
+	for (elem = xa_find(&pool->xa, &index, ULONG_MAX, XA_PRESENT);
+	     elem;
+	     elem = xa_find_after(&pool->xa, &index, ULONG_MAX, XA_PRESENT)) {
+		struct rxe_ucontext *uc = elem->obj;
+
+		if (uc->restore_mode)
+			WRITE_ONCE(uc->restore_finalized, true);
+	}
+	rcu_read_unlock();
+}
+
+static void rxe_resume_vhca_datapath(struct rxe_dev *rxe)
+{
+	struct rxe_pool *pool = &rxe->qp_pool;
+	struct rxe_pool_elem *elem;
+	unsigned long index = 0;
+
+	rcu_read_lock();
+	for (elem = xa_find(&pool->xa, &index, ULONG_MAX, XA_PRESENT);
+	     elem;
+	     elem = xa_find_after(&pool->xa, &index, ULONG_MAX, XA_PRESENT)) {
+		struct rxe_qp *qp = elem->obj;
+
+		if (!kref_get_unless_zero(&elem->ref_cnt))
+			continue;
+		rcu_read_unlock();
+
+		if (qp->is_user && ib_qp_ucontext(&qp->ibqp) &&
+		    to_ruc(ib_qp_ucontext(&qp->ibqp))->restore_mode)
+			rxe_qp_resume(qp);
+
+		rxe_put(qp);
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
+}
+
+static int UVERBS_HANDLER(RXE_IB_METHOD_RESUME_VHCA)(struct uverbs_attr_bundle *attrs)
 {
 	struct ib_ucontext *ucontext = ib_uverbs_get_ucontext(attrs);
 	struct rxe_dev *rxe;
@@ -262,19 +306,19 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_FINALIZE_CONTEXT)(struct uverbs_attr_bun
 		return PTR_ERR(ucontext);
 	if (!to_ruc(ucontext)->restore_mode)
 		return -EACCES;
-	if (READ_ONCE(to_ruc(ucontext)->restore_finalized))
-		return 0;
 
 	rxe = to_rdev(ucontext->device);
-	err = rxe_finalize_context_cqs(rxe, ucontext);
+	err = rxe_resume_vhca_cqs(rxe);
 	if (err)
 		return err;
 
-	err = rxe_finalize_context_qps(rxe, ucontext);
+	err = rxe_resume_vhca_qps(rxe);
 	if (err)
 		return err;
 
-	WRITE_ONCE(to_ruc(ucontext)->restore_finalized, true);
+	/* Do not make any restored context runnable until all are ready. */
+	rxe_resume_vhca_contexts(rxe);
+	rxe_resume_vhca_datapath(rxe);
 	return 0;
 }
 
@@ -431,7 +475,7 @@ DECLARE_UVERBS_NAMED_METHOD(
 			   UVERBS_ATTR_TYPE(u8),
 			   UA_MANDATORY));
 
-DECLARE_UVERBS_NAMED_METHOD(RXE_IB_METHOD_FINALIZE_CONTEXT);
+DECLARE_UVERBS_NAMED_METHOD(RXE_IB_METHOD_RESUME_VHCA);
 
 DECLARE_UVERBS_NAMED_METHOD(
 	RXE_IB_METHOD_QUERY_QP,
@@ -474,7 +518,7 @@ DECLARE_UVERBS_GLOBAL_METHODS(
 	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_QP),
 	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_CQ),
 	&UVERBS_METHOD(RXE_IB_METHOD_FREEZE_CONTEXT),
-	&UVERBS_METHOD(RXE_IB_METHOD_FINALIZE_CONTEXT));
+	&UVERBS_METHOD(RXE_IB_METHOD_RESUME_VHCA));
 
 const struct uapi_definition rxe_migrate_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(RXE_IB_OBJECT_MIGRATE),
