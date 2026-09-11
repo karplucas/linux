@@ -43,9 +43,72 @@ struct rxe_vhca_qp_header {
 	__le32 resp_resource_count;
 };
 
+struct rxe_vhca_ip_address {
+	__le16 family;
+	__le16 port;
+	__le32 flowinfo;
+	u8 address[16];
+	__le32 scope_id;
+};
+
+struct rxe_vhca_av {
+	u8 port_num;
+	u8 network_type;
+	u8 dmac[6];
+	u8 dgid[16];
+	__le32 flow_label;
+	u8 sgid_index;
+	u8 hop_limit;
+	u8 traffic_class;
+	u8 reserved;
+	struct rxe_vhca_ip_address sgid_addr;
+	struct rxe_vhca_ip_address dgid_addr;
+};
+
+struct rxe_vhca_qp_state {
+	struct rxe_vhca_av av;
+	__le64 sq_vm_pgoff;
+	__le64 rq_vm_pgoff;
+	__le32 qpn;
+	__le32 dest_qp_num;
+	__le32 qkey;
+	__le32 sq_psn;
+	__le32 rq_psn;
+	__le32 qp_access_flags;
+	__le32 max_rd_atomic;
+	__le32 max_dest_rd_atomic;
+	__le32 req_psn;
+	__le32 comp_psn;
+	__le32 resp_psn;
+	__le32 resp_msn;
+	__le32 req_wqe_index;
+	__le32 ssn;
+	__le32 resp_ack_psn;
+	__le32 resp_opcode;
+	__le32 resp_status;
+	__le32 res_head;
+	__le32 res_tail;
+	__le16 pkey_index;
+	u8 path_mtu;
+	u8 retry_cnt;
+	u8 rnr_retry;
+	u8 retry_cnt_left;
+	u8 rnr_retry_left;
+	u8 min_rnr_timer;
+	u8 timeout;
+	u8 port_num;
+	u8 sq_sig_all;
+	u8 resp_aeth_syndrome;
+	u8 retrans_pending;
+	u8 rnr_pending;
+	u8 reserved[2];
+	__le64 retrans_remaining_ns;
+	__le64 rnr_remaining_ns;
+};
+
 struct rxe_vhca_qp {
 	struct rxe_vhca_qp_header header;
-	struct rxe_restore_qp_req state;
+	struct rxe_vhca_qp_state state;
 };
 
 enum rxe_vhca_resp_resource_type {
@@ -139,5 +202,9 @@ int rxe_vhca_encode_resp_resource(struct rxe_vhca_resp_resource *record,
 				  u32 slot, const struct resp_res *resource);
 int rxe_vhca_decode_resp_resource(const struct rxe_vhca_resp_resource *record,
 				  u32 slots, struct resp_res *resource);
+int rxe_vhca_encode_qp_state(struct rxe_vhca_qp_state *image,
+			     const struct rxe_restore_qp_req *state);
+int rxe_vhca_decode_qp_state(const struct rxe_vhca_qp_state *image,
+			     struct rxe_restore_qp_req *state);
 
 #endif /* RXE_VHCA_H */
