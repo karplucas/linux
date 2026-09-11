@@ -81,6 +81,11 @@ enum rxe_ib_migrate_methods {
 	RXE_IB_METHOD_FREEZE_CONTEXT = (1U << UVERBS_ID_NS_SHIFT) + 3,
 	RXE_IB_METHOD_RESUME_VHCA = (1U << UVERBS_ID_NS_SHIFT) + 4,
 	RXE_IB_METHOD_REGISTER_CONTEXT = (1U << UVERBS_ID_NS_SHIFT) + 5,
+	RXE_IB_METHOD_SUSPEND_VHCA = (1U << UVERBS_ID_NS_SHIFT) + 6,
+};
+
+enum rxe_ib_suspend_vhca_attrs {
+	RXE_IB_ATTR_SUSPEND_VHCA = (1U << UVERBS_ID_NS_SHIFT),
 };
 
 enum rxe_ib_register_context_attrs {

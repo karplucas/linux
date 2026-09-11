@@ -484,6 +484,7 @@ struct rxe_dev {
 	void			*vhca_image;
 	size_t			vhca_image_length;
 	struct xarray		vhca_contexts;
+	bool			vhca_source_suspended;
 
 	atomic64_t		stats_counters[RXE_NUM_OF_COUNTERS];
 
