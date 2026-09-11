@@ -66,6 +66,11 @@ int rxe_vhca_encode_resp_resource(struct rxe_vhca_resp_resource *record,
 
 	if (!record || !resource)
 		return -EINVAL;
+	if (!resource->type) {
+		memset(record, 0, sizeof(*record));
+		record->slot = cpu_to_le32(slot);
+		return 0;
+	}
 
 	if (resource->state < rdatm_res_state_next ||
 	    resource->state > rdatm_res_state_replay)
@@ -139,6 +144,14 @@ int rxe_vhca_decode_resp_resource(const struct rxe_vhca_resp_resource *record,
 		return -EBADMSG;
 
 	memset(resource, 0, sizeof(*resource));
+	if (type == RXE_VHCA_RESP_RESOURCE_EMPTY) {
+		if (flags || state || le32_to_cpu(record->first_psn) ||
+		    le32_to_cpu(record->last_psn) ||
+		    le32_to_cpu(record->cur_psn) ||
+		    memchr_inv(record->data.raw, 0, sizeof(record->data.raw)))
+			return -EBADMSG;
+		return 0;
+	}
 	err = rxe_vhca_decode_resource_type(type, &resource->type);
 	if (err)
 		return err;
@@ -339,6 +352,91 @@ int rxe_vhca_find_cq(const void *data, size_t length, u32 ufile_id,
 	return err ?: -ENOENT;
 }
 
+int rxe_vhca_find_qp(const void *data, size_t length, u32 ufile_id,
+		     u32 uobject_handle, struct rxe_restore_qp_req *state,
+		     struct resp_res **resources)
+{
+	struct rxe_vhca_context_header context;
+	struct rxe_vhca_record record;
+	struct rxe_vhca_reader reader;
+	u32 cqs = 0, qps = 0;
+	bool match = false;
+	int err;
+
+	*resources = NULL;
+	err = rxe_vhca_reader_init(&reader, data, length);
+	if (err)
+		return err;
+
+	while ((err = rxe_vhca_read_record(&reader, &record)) > 0) {
+		struct rxe_vhca_qp qp;
+		u32 count, i;
+
+		if (record.type == RXE_VHCA_RECORD_CONTEXT) {
+			if (record.length != sizeof(context))
+				return -EBADMSG;
+			memcpy(&context, record.payload, sizeof(context));
+			cqs = le32_to_cpu(context.cq_count);
+			qps = le32_to_cpu(context.qp_count);
+			match = le32_to_cpu(context.ufile_id) == ufile_id;
+			continue;
+		}
+		if (record.type == RXE_VHCA_RECORD_CQ && cqs) {
+			cqs--;
+			continue;
+		}
+		if (record.type != RXE_VHCA_RECORD_QP || cqs || !qps ||
+		    record.length != sizeof(qp))
+			return -EBADMSG;
+		qps--;
+		memcpy(&qp, record.payload, sizeof(qp));
+		count = le32_to_cpu(qp.header.resp_resource_count);
+		if (match && le32_to_cpu(qp.header.uobject_handle) ==
+		    uobject_handle && count) {
+			*resources = kcalloc(count, sizeof(**resources), GFP_KERNEL);
+			if (!*resources)
+				return -ENOMEM;
+		}
+		for (i = 0; i < count; i++) {
+			struct rxe_vhca_resp_resource image_resource;
+			struct resp_res *resource;
+			u32 slot;
+
+			err = rxe_vhca_read_record(&reader, &record);
+			if (err <= 0 || record.type != RXE_VHCA_RECORD_RESP_RESOURCE ||
+			    record.length != sizeof(image_resource)) {
+				err = -EBADMSG;
+				goto err_free;
+			}
+			if (!*resources)
+				continue;
+			memcpy(&image_resource, record.payload,
+			       sizeof(image_resource));
+			slot = le32_to_cpu(image_resource.slot);
+			if (slot >= count) {
+				err = -EBADMSG;
+				goto err_free;
+			}
+			resource = *resources + slot;
+			err = rxe_vhca_decode_resp_resource(&image_resource, count, resource);
+			if (err)
+				goto err_free;
+		}
+		if (match && le32_to_cpu(qp.header.uobject_handle) ==
+		    uobject_handle) {
+			memcpy(state, &qp.state, sizeof(*state));
+			return 0;
+		}
+	}
+
+	return err ?: -ENOENT;
+
+err_free:
+	kfree(*resources);
+	*resources = NULL;
+	return err;
+}
+
 int rxe_vhca_validate_contexts(const void *data, size_t length)
 {
 	struct rxe_vhca_context_header context;
@@ -346,6 +444,8 @@ int rxe_vhca_validate_contexts(const void *data, size_t length)
 	struct rxe_vhca_reader reader;
 	u32 context_count = 0;
 	u32 cq_count = 0;
+	u32 qp_count = 0;
+	u32 resource_count = 0;
 	int err;
 
 	err = rxe_vhca_reader_init(&reader, data, length);
@@ -355,6 +455,27 @@ int rxe_vhca_validate_contexts(const void *data, size_t length)
 	while ((err = rxe_vhca_read_record(&reader, &record)) > 0) {
 		u32 ufile_id;
 
+		if (record.type == RXE_VHCA_RECORD_RESP_RESOURCE) {
+			if (!resource_count || record.flags ||
+			    record.length != sizeof(struct rxe_vhca_resp_resource))
+				return -EBADMSG;
+			resource_count--;
+			continue;
+		}
+		if (record.type == RXE_VHCA_RECORD_QP) {
+			struct rxe_vhca_qp qp;
+
+			if (cq_count || !qp_count || resource_count || record.flags ||
+			    record.length != sizeof(qp))
+				return -EBADMSG;
+			memcpy(&qp, record.payload, sizeof(qp));
+			resource_count =
+				le32_to_cpu(qp.header.resp_resource_count);
+			if (resource_count != qp.state.max_dest_rd_atomic)
+				return -EBADMSG;
+			qp_count--;
+			continue;
+		}
 		if (record.type == RXE_VHCA_RECORD_CQ) {
 			struct rxe_vhca_cq cq;
 
@@ -368,19 +489,20 @@ int rxe_vhca_validate_contexts(const void *data, size_t length)
 			continue;
 		}
 		if (record.type != RXE_VHCA_RECORD_CONTEXT || record.flags ||
-		    record.length != sizeof(context) || cq_count)
+		    record.length != sizeof(context) || cq_count || qp_count ||
+		    resource_count)
 			return -EBADMSG;
 		memcpy(&context, record.payload, sizeof(context));
 		ufile_id = le32_to_cpu(context.ufile_id);
-		if (!ufile_id || le32_to_cpu(context.qp_count) ||
-		    le32_to_cpu(context.reserved))
+		if (!ufile_id || le32_to_cpu(context.reserved))
 			return -EBADMSG;
 		cq_count = le32_to_cpu(context.cq_count);
+		qp_count = le32_to_cpu(context.qp_count);
 		context_count++;
 	}
 	if (err)
 		return err;
-	if (cq_count)
+	if (cq_count || qp_count || resource_count)
 		return -EBADMSG;
 
 	return context_count ? 0 : -ENODATA;

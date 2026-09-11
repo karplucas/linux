@@ -4,6 +4,7 @@
 
 #include <linux/bits.h>
 #include <linux/types.h>
+#include <rdma/rdma_user_rxe.h>
 
 #define RXE_VHCA_IMAGE_MAGIC	0x56455852
 
@@ -41,8 +42,14 @@ struct rxe_vhca_qp_header {
 	__le32 resp_resource_count;
 };
 
+struct rxe_vhca_qp {
+	struct rxe_vhca_qp_header header;
+	struct rxe_restore_qp_req state;
+};
+
 enum rxe_vhca_resp_resource_type {
-	RXE_VHCA_RESP_RESOURCE_READ = 1,
+	RXE_VHCA_RESP_RESOURCE_EMPTY,
+	RXE_VHCA_RESP_RESOURCE_READ,
 	RXE_VHCA_RESP_RESOURCE_ATOMIC,
 	RXE_VHCA_RESP_RESOURCE_ATOMIC_WRITE,
 	RXE_VHCA_RESP_RESOURCE_FLUSH,
@@ -123,6 +130,9 @@ int rxe_vhca_validate_contexts(const void *data, size_t length);
 bool rxe_vhca_has_context(const void *data, size_t length, u32 ufile_id);
 int rxe_vhca_find_cq(const void *data, size_t length, u32 ufile_id,
 		     u32 uobject_handle, struct rxe_vhca_cq *cq);
+int rxe_vhca_find_qp(const void *data, size_t length, u32 ufile_id,
+		     u32 uobject_handle, struct rxe_restore_qp_req *state,
+		     struct resp_res **resources);
 int rxe_vhca_encode_resp_resource(struct rxe_vhca_resp_resource *record,
 				  u32 slot, const struct resp_res *resource);
 int rxe_vhca_decode_resp_resource(const struct rxe_vhca_resp_resource *record,
