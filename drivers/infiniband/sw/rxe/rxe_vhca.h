@@ -111,6 +111,13 @@ struct rxe_vhca_qp {
 	struct rxe_vhca_qp_state state;
 };
 
+struct rxe_vhca_qp_timers {
+	bool retrans_pending;
+	bool rnr_pending;
+	u64 retrans_remaining_ns;
+	u64 rnr_remaining_ns;
+};
+
 enum rxe_vhca_resp_resource_type {
 	RXE_VHCA_RESP_RESOURCE_EMPTY,
 	RXE_VHCA_RESP_RESOURCE_READ,
@@ -195,8 +202,9 @@ bool rxe_vhca_has_context(const void *data, size_t length, u32 ufile_id);
 int rxe_vhca_find_cq(void *data, size_t length, u32 ufile_id,
 		     u32 uobject_handle, struct rxe_vhca_cq *cq);
 int rxe_vhca_find_qp(void *data, size_t length, u32 ufile_id,
-		     u32 uobject_handle, struct rxe_restore_qp_req *state,
-		     struct resp_res **resources);
+			     u32 uobject_handle, struct rxe_restore_qp_req *state,
+			     struct resp_res **resources,
+			     struct rxe_vhca_qp_timers *timers);
 bool rxe_vhca_all_objects_consumed(const void *data, size_t length);
 int rxe_vhca_encode_resp_resource(struct rxe_vhca_resp_resource *record,
 				  u32 slot, const struct resp_res *resource);

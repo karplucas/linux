@@ -317,6 +317,10 @@ struct rxe_qp {
 	struct rxe_restore_qp_req migration_state;
 	u32			migration_uobject_handle;
 	bool			migration_captured;
+	bool			restore_retrans_pending;
+	bool			restore_rnr_pending;
+	u64			restore_retrans_remaining_ns;
+	u64			restore_rnr_remaining_ns;
 	struct rxe_qp_restore_state *restore_state;
 	bool			restore_finalized;
 

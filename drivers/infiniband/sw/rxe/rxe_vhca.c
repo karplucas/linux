@@ -533,8 +533,9 @@ int rxe_vhca_find_cq(void *data, size_t length, u32 ufile_id,
 }
 
 int rxe_vhca_find_qp(void *data, size_t length, u32 ufile_id,
-		     u32 uobject_handle, struct rxe_restore_qp_req *state,
-		     struct resp_res **resources)
+			     u32 uobject_handle, struct rxe_restore_qp_req *state,
+			     struct resp_res **resources,
+			     struct rxe_vhca_qp_timers *timers)
 {
 	struct rxe_vhca_context_header context;
 	struct rxe_vhca_record record;
@@ -610,6 +611,12 @@ int rxe_vhca_find_qp(void *data, size_t length, u32 ufile_id,
 			err = rxe_vhca_decode_qp_state(&qp.state, state);
 			if (err)
 				goto err_free;
+			timers->retrans_pending = qp.state.retrans_pending;
+			timers->rnr_pending = qp.state.rnr_pending;
+			timers->retrans_remaining_ns =
+				le64_to_cpu(qp.state.retrans_remaining_ns);
+			timers->rnr_remaining_ns =
+				le64_to_cpu(qp.state.rnr_remaining_ns);
 			if (le32_to_cpu(qp_record_header->flags) &
 			    RXE_VHCA_RECORD_F_CONSUMED) {
 				err = -EALREADY;
@@ -679,6 +686,12 @@ int rxe_vhca_validate_contexts(const void *data, size_t length)
 			    record.length != sizeof(qp))
 				return -EBADMSG;
 			memcpy(&qp, record.payload, sizeof(qp));
+			if (qp.state.retrans_pending > 1 || qp.state.rnr_pending > 1 ||
+			    (!qp.state.retrans_pending &&
+			     le64_to_cpu(qp.state.retrans_remaining_ns)) ||
+			    (!qp.state.rnr_pending &&
+			     le64_to_cpu(qp.state.rnr_remaining_ns)))
+				return -EBADMSG;
 			resource_count =
 				le32_to_cpu(qp.header.resp_resource_count);
 			if (resource_count !=

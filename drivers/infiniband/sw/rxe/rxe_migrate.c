@@ -246,6 +246,24 @@ static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t
 						       &qp->migration_state);
 			if (err)
 				goto out_free_rcu;
+			if (timer_pending(&qp->retrans_timer)) {
+				unsigned long remaining = 0;
+
+				if (time_after(qp->retrans_timer.expires, jiffies))
+					remaining = qp->retrans_timer.expires - jiffies;
+				image_qp.state.retrans_pending = 1;
+				image_qp.state.retrans_remaining_ns =
+					cpu_to_le64(jiffies_to_nsecs(remaining));
+			}
+			if (timer_pending(&qp->rnr_nak_timer)) {
+				unsigned long remaining = 0;
+
+				if (time_after(qp->rnr_nak_timer.expires, jiffies))
+					remaining = qp->rnr_nak_timer.expires - jiffies;
+				image_qp.state.rnr_pending = 1;
+				image_qp.state.rnr_remaining_ns =
+					cpu_to_le64(jiffies_to_nsecs(remaining));
+			}
 			err = rxe_vhca_write_record(&writer, RXE_VHCA_RECORD_QP, 0,
 						    &image_qp,
 						    sizeof(image_qp));
@@ -799,8 +817,10 @@ static void rxe_resume_vhca_datapath(struct rxe_dev *rxe)
 		rcu_read_unlock();
 
 		if (qp->is_user && ib_qp_ucontext(&qp->ibqp) &&
-		    to_ruc(ib_qp_ucontext(&qp->ibqp))->restore_mode)
+		    to_ruc(ib_qp_ucontext(&qp->ibqp))->restore_mode) {
+			rxe_qp_restore_timers(qp);
 			rxe_qp_resume(qp);
+		}
 
 		rxe_put(qp);
 		rcu_read_lock();

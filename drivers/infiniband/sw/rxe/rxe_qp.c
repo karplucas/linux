@@ -704,6 +704,22 @@ int rxe_qp_finalize_restore(struct rxe_qp *qp)
 	return 0;
 }
 
+void rxe_qp_restore_timers(struct rxe_qp *qp)
+{
+	unsigned long delay;
+
+	if (qp->restore_retrans_pending) {
+		delay = nsecs_to_jiffies(qp->restore_retrans_remaining_ns);
+		mod_timer(&qp->retrans_timer, jiffies + max(delay, 1UL));
+		qp->restore_retrans_pending = false;
+	}
+	if (qp->restore_rnr_pending) {
+		delay = nsecs_to_jiffies(qp->restore_rnr_remaining_ns);
+		mod_timer(&qp->rnr_nak_timer, jiffies + max(delay, 1UL));
+		qp->restore_rnr_pending = false;
+	}
+}
+
 /* called by the query qp verb */
 int rxe_qp_to_init(struct rxe_qp *qp, struct ib_qp_init_attr *init)
 {

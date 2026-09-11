@@ -115,6 +115,7 @@ int rxe_qp_stage_restore(struct rxe_qp *qp,
 			 const struct rxe_restore_qp_req *req,
 			 enum ib_qp_state state, const void *res_image);
 int rxe_qp_finalize_restore(struct rxe_qp *qp);
+void rxe_qp_restore_timers(struct rxe_qp *qp);
 int rxe_qp_to_init(struct rxe_qp *qp, struct ib_qp_init_attr *init);
 int rxe_qp_chk_attr(struct rxe_dev *rxe, struct rxe_qp *qp,
 		    struct ib_qp_attr *attr, int mask);
