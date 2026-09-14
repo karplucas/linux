@@ -273,9 +273,11 @@ static int rxe_alloc_ucontext(struct ib_ucontext *ibuc, struct ib_udata *udata)
 			mutex_unlock(&rxe->vhca_lock);
 		}
 		rxe_err_dev(rxe, "unable to create uc\n");
+		return err;
 	}
+	rxe_finalize(uc);
 
-	return err;
+	return 0;
 }
 
 static bool rxe_ucontext_is_restore_mode(struct ib_ucontext *ibuc)
@@ -1392,6 +1394,7 @@ static int rxe_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 		rxe_dbg_cq(cq, "create cq failed, err = %d\n", err);
 		goto err_cleanup;
 	}
+	rxe_finalize(cq);
 
 	return 0;
 
@@ -1569,6 +1572,7 @@ static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 	}
 	cq->restore_notify = req.notify;
 	cq->restore_pending = true;
+	rxe_finalize(cq);
 
 	rxe_dbg_cq(cq,
 		   "restore cq: cqe=%d forced_vm_pgoff=0x%llx\n",
