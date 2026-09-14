@@ -742,9 +742,9 @@ int rxe_vhca_validate_contexts(const void *data, size_t length)
 	struct rxe_vhca_context_header context;
 	struct rxe_vhca_record record;
 	struct rxe_vhca_reader reader;
-	DEFINE_XARRAY(context_ids);
-	DEFINE_XARRAY(cq_ids);
-	DEFINE_XARRAY(qp_ids);
+	struct xarray context_ids;
+	struct xarray cq_ids;
+	struct xarray qp_ids;
 	unsigned long *resource_slots = NULL;
 	u32 resource_slot_count = 0;
 	u32 context_count = 0;
@@ -753,9 +753,13 @@ int rxe_vhca_validate_contexts(const void *data, size_t length)
 	u32 resource_count = 0;
 	int err;
 
+	xa_init(&context_ids);
+	xa_init(&cq_ids);
+	xa_init(&qp_ids);
+
 	err = rxe_vhca_reader_init(&reader, data, length);
 	if (err)
-		return err;
+		goto out;
 
 	while ((err = rxe_vhca_read_record(&reader, &record)) > 0) {
 		u32 ufile_id;
