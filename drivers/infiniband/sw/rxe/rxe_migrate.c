@@ -527,10 +527,13 @@ UVERBS_HANDLER(RXE_IB_METHOD_CREATE_LOAD_FD)(struct uverbs_attr_bundle *attrs)
 	err = uverbs_copy_from(&length, attrs,
 			       RXE_IB_ATTR_CREATE_LOAD_FD_LENGTH);
 	if (err)
-		return err;
-	if (length < sizeof(struct rxe_vhca_image_header) ||
-	    length > RXE_VHCA_MAX_IMAGE_LENGTH || length > SIZE_MAX)
-		return -EINVAL;
+		return err == -EINVAL ? -EMSGSIZE : err;
+	if (length < sizeof(struct rxe_vhca_image_header))
+		return -ENODATA;
+	if (length > RXE_VHCA_MAX_IMAGE_LENGTH)
+		return -E2BIG;
+	if (length > SIZE_MAX)
+		return -EOVERFLOW;
 
 	ibdev = uverbs_attr_get_ibdev(attrs);
 	if (!ibdev)
