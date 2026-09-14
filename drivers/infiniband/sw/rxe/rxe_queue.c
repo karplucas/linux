@@ -236,6 +236,8 @@ int rxe_queue_sync_for_restore(struct rxe_queue *queue)
 	default:
 		return -EINVAL;
 	}
+	rxe_dbg("restore queue type=%u producer=%u consumer=%u index=%u\n",
+		queue->type, producer, consumer, queue->index);
 
 	return 0;
 }
