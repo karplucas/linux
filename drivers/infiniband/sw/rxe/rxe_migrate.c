@@ -643,7 +643,9 @@ UVERBS_HANDLER(RXE_IB_METHOD_LOAD_VHCA)(struct uverbs_attr_bundle *attrs)
 	if (!err)
 		err = rxe_vhca_bind_preloaded_contexts(rxe);
 	if (err) {
-		rxe_vhca_clear_image(rxe);
+		rxe_vhca_clear_contexts(rxe);
+		rxe->vhca_image = NULL;
+		rxe->vhca_image_length = 0;
 		goto out_vhca;
 	}
 	stream->data = NULL;
@@ -1037,7 +1039,10 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_RESUME_VHCA)(struct uverbs_attr_bundle *
 	rxe_resume_vhca_datapath(rxe);
 
 	mutex_lock(&rxe->vhca_lock);
-	rxe_vhca_clear_image(rxe);
+	rxe_vhca_clear_contexts(rxe);
+	kvfree(rxe->vhca_image);
+	rxe->vhca_image = NULL;
+	rxe->vhca_image_length = 0;
 	mutex_unlock(&rxe->vhca_lock);
 	return 0;
 }

@@ -202,7 +202,6 @@ int rxe_vhca_validate_contexts(const void *data, size_t length);
 bool rxe_vhca_has_context(const void *data, size_t length, u32 ufile_id);
 int rxe_vhca_index_contexts(struct rxe_dev *rxe);
 void rxe_vhca_clear_contexts(struct rxe_dev *rxe);
-void rxe_vhca_clear_image(struct rxe_dev *rxe);
 int rxe_vhca_bind_context(struct rxe_dev *rxe, u32 ufile_id);
 void rxe_vhca_unbind_context(struct rxe_dev *rxe, u32 ufile_id);
 int rxe_vhca_find_cq(void *data, size_t length, u32 ufile_id,
