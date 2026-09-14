@@ -551,6 +551,48 @@ UVERBS_HANDLER(RXE_IB_METHOD_CREATE_LOAD_FD)(struct uverbs_attr_bundle *attrs)
 	return 0;
 }
 
+static int rxe_vhca_bind_preloaded_contexts(struct rxe_dev *rxe)
+{
+	struct rxe_pool_elem *elem;
+	unsigned long index = 0;
+	int err = 0;
+
+	rcu_read_lock();
+	for (elem = xa_find(&rxe->uc_pool.xa, &index, ULONG_MAX, XA_PRESENT);
+	     elem;
+	     elem = xa_find_after(&rxe->uc_pool.xa, &index, ULONG_MAX,
+				  XA_PRESENT)) {
+		struct rxe_ucontext *uc = elem->obj;
+
+		if (!uc->restore_mode) {
+			err = -EBUSY;
+			break;
+		}
+		err = rxe_vhca_bind_context(rxe, uc->migration_ufile_id);
+		if (err)
+			break;
+		uc->restore_bound = true;
+	}
+	if (err) {
+		index = 0;
+		for (elem = xa_find(&rxe->uc_pool.xa, &index, ULONG_MAX,
+				    XA_PRESENT);
+		     elem;
+		     elem = xa_find_after(&rxe->uc_pool.xa, &index, ULONG_MAX,
+					  XA_PRESENT)) {
+			struct rxe_ucontext *uc = elem->obj;
+
+			if (!uc->restore_bound)
+				continue;
+			rxe_vhca_unbind_context(rxe, uc->migration_ufile_id);
+			uc->restore_bound = false;
+		}
+	}
+	rcu_read_unlock();
+
+	return err;
+}
+
 static int
 UVERBS_HANDLER(RXE_IB_METHOD_LOAD_VHCA)(struct uverbs_attr_bundle *attrs)
 {
@@ -587,7 +629,7 @@ UVERBS_HANDLER(RXE_IB_METHOD_LOAD_VHCA)(struct uverbs_attr_bundle *attrs)
 		goto out_stream;
 
 	mutex_lock(&rxe->vhca_lock);
-	if (rxe->vhca_image || !xa_empty(&rxe->uc_pool.xa)) {
+	if (rxe->vhca_image) {
 		err = -EBUSY;
 		goto out_vhca;
 	}
@@ -595,7 +637,10 @@ UVERBS_HANDLER(RXE_IB_METHOD_LOAD_VHCA)(struct uverbs_attr_bundle *attrs)
 	rxe->vhca_image = stream->data;
 	rxe->vhca_image_length = stream->length;
 	err = rxe_vhca_index_contexts(rxe);
+	if (!err)
+		err = rxe_vhca_bind_preloaded_contexts(rxe);
 	if (err) {
+		rxe_vhca_clear_contexts(rxe);
 		rxe->vhca_image = NULL;
 		rxe->vhca_image_length = 0;
 		goto out_vhca;

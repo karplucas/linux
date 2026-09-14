@@ -253,21 +253,26 @@ static int rxe_alloc_ucontext(struct ib_ucontext *ibuc, struct ib_udata *udata)
 		if (req.reserved)
 			return -EINVAL;
 		if (req.flags & RXE_ALLOC_UCTX_RESTORE_MODE) {
-			mutex_lock(&rxe->vhca_lock);
-			err = rxe_vhca_bind_context(rxe, req.ufile_id);
-			if (err) {
-				mutex_unlock(&rxe->vhca_lock);
-				return err;
-			}
-			mutex_unlock(&rxe->vhca_lock);
+			if (!req.ufile_id)
+				return -EINVAL;
 			uc->restore_mode = true;
 			uc->migration_ufile_id = req.ufile_id;
+			mutex_lock(&rxe->vhca_lock);
+			if (rxe->vhca_image) {
+				err = rxe_vhca_bind_context(rxe, req.ufile_id);
+				if (err) {
+					mutex_unlock(&rxe->vhca_lock);
+					return err;
+				}
+				uc->restore_bound = true;
+			}
+			mutex_unlock(&rxe->vhca_lock);
 		}
 	}
 
 	err = rxe_add_to_pool(&rxe->uc_pool, uc);
 	if (err) {
-		if (uc->restore_mode) {
+		if (uc->restore_bound) {
 			mutex_lock(&rxe->vhca_lock);
 			rxe_vhca_unbind_context(rxe, uc->migration_ufile_id);
 			mutex_unlock(&rxe->vhca_lock);
@@ -288,8 +293,14 @@ static bool rxe_ucontext_is_restore_mode(struct ib_ucontext *ibuc)
 static void rxe_dealloc_ucontext(struct ib_ucontext *ibuc)
 {
 	struct rxe_ucontext *uc = to_ruc(ibuc);
+	struct rxe_dev *rxe = to_rdev(ibuc->device);
 	int err;
 
+	if (uc->restore_bound) {
+		mutex_lock(&rxe->vhca_lock);
+		rxe_vhca_unbind_context(rxe, uc->migration_ufile_id);
+		mutex_unlock(&rxe->vhca_lock);
+	}
 	err = rxe_cleanup(uc);
 	if (err)
 		rxe_err_uc(uc, "cleanup failed, err = %d\n", err);
