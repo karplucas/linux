@@ -7,6 +7,8 @@
 #ifndef RXE_LOC_H
 #define RXE_LOC_H
 
+struct rxe_vhca_qp_runtime;
+
 /* rxe_av.c */
 void rxe_init_av(struct rdma_ah_attr *attr, struct rxe_av *av);
 int rxe_av_chk_attr(struct rxe_qp *qp, struct rdma_ah_attr *attr);
@@ -114,7 +116,8 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
 			      enum ib_qp_state state);
 int rxe_qp_stage_restore(struct rxe_qp *qp,
 			 const struct rxe_restore_qp_req *req,
-			 enum ib_qp_state state, const void *res_image);
+			 enum ib_qp_state state, const void *res_image,
+			 const struct rxe_vhca_qp_runtime *runtime);
 int rxe_qp_finalize_restore(struct rxe_qp *qp);
 void rxe_qp_restore_timers(struct rxe_qp *qp);
 int rxe_qp_to_init(struct rxe_qp *qp, struct ib_qp_init_attr *init);

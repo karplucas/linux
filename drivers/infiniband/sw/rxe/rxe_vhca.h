@@ -86,6 +86,12 @@ struct rxe_vhca_qp_state {
 	__le32 resp_ack_psn;
 	__le32 resp_opcode;
 	__le32 resp_status;
+	__le64 resp_va;
+	__le64 resp_offset;
+	__le32 resp_resid;
+	__le32 resp_rkey;
+	__le32 resp_length;
+	__le32 reserved3;
 	__le32 res_head;
 	__le32 res_tail;
 	__le16 pkey_index;
@@ -116,6 +122,14 @@ struct rxe_vhca_qp_timers {
 	bool rnr_pending;
 	u64 retrans_remaining_ns;
 	u64 rnr_remaining_ns;
+};
+
+struct rxe_vhca_qp_runtime {
+	u64 resp_va;
+	u64 resp_offset;
+	u32 resp_resid;
+	u32 resp_rkey;
+	u32 resp_length;
 };
 
 enum rxe_vhca_resp_resource_type {
@@ -209,7 +223,8 @@ int rxe_vhca_find_cq(void *data, size_t length, u32 ufile_id,
 int rxe_vhca_find_qp(void *data, size_t length, u32 ufile_id,
 			     u32 uobject_handle, struct rxe_restore_qp_req *state,
 			     struct resp_res **resources,
-			     struct rxe_vhca_qp_timers *timers);
+			     struct rxe_vhca_qp_timers *timers,
+			     struct rxe_vhca_qp_runtime *runtime);
 bool rxe_vhca_all_objects_consumed(const void *data, size_t length);
 int rxe_vhca_encode_resp_resource(struct rxe_vhca_resp_resource *record,
 				  u32 slot, const struct resp_res *resource);

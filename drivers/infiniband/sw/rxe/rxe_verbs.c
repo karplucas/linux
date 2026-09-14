@@ -708,7 +708,8 @@ err_out:
 static int rxe_stage_qp_restore(struct rxe_qp *qp,
 				const struct rxe_restore_qp_req *req,
 				enum ib_qp_state qp_state,
-				const struct resp_res *resources)
+				const struct resp_res *resources,
+				const struct rxe_vhca_qp_runtime *runtime)
 {
 	size_t bytes;
 
@@ -716,7 +717,7 @@ static int rxe_stage_qp_restore(struct rxe_qp *qp,
 	if (bytes != req->res_image_bytes || (bytes && !resources))
 		return -EINVAL;
 
-	return rxe_qp_stage_restore(qp, req, qp_state, resources);
+	return rxe_qp_stage_restore(qp, req, qp_state, resources, runtime);
 }
 
 static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
@@ -730,6 +731,7 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	struct rxe_create_qp_resp __user *uresp = NULL;
 	struct rxe_restore_qp_req req = {};
 	struct rxe_vhca_qp_timers timers = {};
+	struct rxe_vhca_qp_runtime runtime = {};
 	struct ib_qp_init_attr init = {};
 	struct ib_ucontext *ucontext;
 	struct resp_res *resources = NULL;
@@ -776,7 +778,8 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	mutex_lock(&rxe->vhca_lock);
 	err = rxe_vhca_find_qp(rxe->vhca_image, rxe->vhca_image_length,
 			       to_ruc(ucontext)->migration_ufile_id,
-			       target_handle, &req, &resources, &timers);
+			       target_handle, &req, &resources, &timers,
+			       &runtime);
 	mutex_unlock(&rxe->vhca_lock);
 	if (err) {
 		rxe_dbg_dev(rxe, "missing vHCA QP record, err = %d\n", err);
@@ -877,7 +880,7 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	 */
 	rxe_qp_pause(qp);
 
-	err = rxe_stage_qp_restore(qp, &req, qp_state, resources);
+	err = rxe_stage_qp_restore(qp, &req, qp_state, resources, &runtime);
 	kvfree(resources);
 	resources = NULL;
 	if (err) {

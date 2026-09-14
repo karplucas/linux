@@ -136,8 +136,8 @@ int rxe_vhca_decode_qp_state(const struct rxe_vhca_qp_state *image,
 {
 	int err;
 
-	if (image->av.reserved || memchr_inv(image->reserved, 0,
-					     sizeof(image->reserved)))
+	if (image->av.reserved || image->reserved3 ||
+	    memchr_inv(image->reserved, 0, sizeof(image->reserved)))
 		return -EBADMSG;
 	memset(state, 0, sizeof(*state));
 	state->av.port_num = image->av.port_num;
@@ -612,7 +612,8 @@ int rxe_vhca_find_cq(void *data, size_t length, u32 ufile_id,
 int rxe_vhca_find_qp(void *data, size_t length, u32 ufile_id,
 			     u32 uobject_handle, struct rxe_restore_qp_req *state,
 			     struct resp_res **resources,
-			     struct rxe_vhca_qp_timers *timers)
+			     struct rxe_vhca_qp_timers *timers,
+			     struct rxe_vhca_qp_runtime *runtime)
 {
 	struct rxe_vhca_context_header context;
 	struct rxe_vhca_record record;
@@ -694,6 +695,11 @@ int rxe_vhca_find_qp(void *data, size_t length, u32 ufile_id,
 				le64_to_cpu(qp.state.retrans_remaining_ns);
 			timers->rnr_remaining_ns =
 				le64_to_cpu(qp.state.rnr_remaining_ns);
+			runtime->resp_va = le64_to_cpu(qp.state.resp_va);
+			runtime->resp_offset = le64_to_cpu(qp.state.resp_offset);
+			runtime->resp_resid = le32_to_cpu(qp.state.resp_resid);
+			runtime->resp_rkey = le32_to_cpu(qp.state.resp_rkey);
+			runtime->resp_length = le32_to_cpu(qp.state.resp_length);
 			if (le32_to_cpu(qp_record_header->flags) &
 			    RXE_VHCA_RECORD_F_CONSUMED) {
 				err = -EALREADY;

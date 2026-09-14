@@ -123,10 +123,16 @@ static void rxe_vhca_qp_lookup_test(struct kunit *test)
 		.state.max_dest_rd_atomic = cpu_to_le32(1),
 		.state.retrans_pending = 1,
 		.state.retrans_remaining_ns = cpu_to_le64(5000),
+		.state.resp_va = cpu_to_le64(0x12340000),
+		.state.resp_offset = cpu_to_le64(1024),
+		.state.resp_resid = cpu_to_le32(3072),
+		.state.resp_rkey = cpu_to_le32(0x1234),
+		.state.resp_length = cpu_to_le32(4096),
 	};
 	struct rxe_vhca_resp_resource resource = {};
 	struct rxe_restore_qp_req state = {};
 	struct rxe_vhca_qp_timers timers = {};
+	struct rxe_vhca_qp_runtime runtime = {};
 	struct resp_res *resources;
 	struct rxe_vhca_writer writer;
 	u8 image[512];
@@ -147,11 +153,16 @@ static void rxe_vhca_qp_lookup_test(struct kunit *test)
 			rxe_vhca_validate_contexts(image, writer.length), 0);
 	KUNIT_ASSERT_EQ(test,
 			rxe_vhca_find_qp(image, writer.length, 7, 13, &state,
-					 &resources, &timers), 0);
+					 &resources, &timers, &runtime), 0);
 	KUNIT_EXPECT_EQ(test, state.qpn, 19U);
 	KUNIT_EXPECT_EQ(test, resources[0].type, 0);
 	KUNIT_EXPECT_TRUE(test, timers.retrans_pending);
 	KUNIT_EXPECT_EQ(test, timers.retrans_remaining_ns, 5000ULL);
+	KUNIT_EXPECT_EQ(test, runtime.resp_va, 0x12340000ULL);
+	KUNIT_EXPECT_EQ(test, runtime.resp_offset, 1024ULL);
+	KUNIT_EXPECT_EQ(test, runtime.resp_resid, 3072U);
+	KUNIT_EXPECT_EQ(test, runtime.resp_rkey, 0x1234U);
+	KUNIT_EXPECT_EQ(test, runtime.resp_length, 4096U);
 	kfree(resources);
 }
 

@@ -294,6 +294,11 @@ static int rxe_vhca_build_context_image(struct rxe_dev *rxe, void **data, size_t
 						       &qp->migration_state);
 			if (err)
 				goto out_free_rcu;
+			image_qp.state.resp_va = cpu_to_le64(qp->resp.va);
+			image_qp.state.resp_offset = cpu_to_le64(qp->resp.offset);
+			image_qp.state.resp_resid = cpu_to_le32(qp->resp.resid);
+			image_qp.state.resp_rkey = cpu_to_le32(qp->resp.rkey);
+			image_qp.state.resp_length = cpu_to_le32(qp->resp.length);
 			if (timer_pending(&qp->retrans_timer)) {
 				unsigned long remaining = 0;
 
