@@ -58,9 +58,9 @@
  *             destination RXE device. The device remains stopped until
  *             RESUME_VHCA.
  *
- * The stream methods may run before GET_CONTEXT. This preserves the ordering
- * in which device state is loaded before application ucontexts and uobjects
- * are replayed.
+ * CREATE_LOAD_FD runs on a restore-mode ucontext because FD uobjects require
+ * one. LOAD_VHCA binds that bootstrap context to its image record before any
+ * application uobjects are replayed.
  */
 #ifndef RXE_USER_IOCTL_CMDS_H
 #define RXE_USER_IOCTL_CMDS_H

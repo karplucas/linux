@@ -44,6 +44,7 @@ struct rxe_ucontext {
 	 * include/rdma/ib_verbs.h:ib_device_ops.ucontext_is_restore_mode.
 	 */
 	bool restore_mode;
+	bool restore_bound;
 	bool restore_finalized;
 	bool migration_registered;
 	u32 migration_ufile_id;
