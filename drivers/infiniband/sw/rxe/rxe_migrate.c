@@ -768,7 +768,7 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_SUSPEND_VHCA)(struct uverbs_attr_bundle 
 					  XA_PRESENT)) {
 			struct rxe_ucontext *uc = elem->obj;
 
-			if (!uc->migration_registered || uc->restore_mode) {
+			if (uc->restore_mode) {
 				rcu_read_unlock();
 				mutex_unlock(&rxe->vhca_lock);
 				return -EBUSY;
