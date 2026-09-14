@@ -258,6 +258,8 @@ static int rxe_alloc_ucontext(struct ib_ucontext *ibuc, struct ib_udata *udata)
 			uc->restore_mode = true;
 			uc->migration_ufile_id = req.ufile_id;
 			mutex_lock(&rxe->vhca_lock);
+			if (rxe->vhca_image && xa_empty(&rxe->uc_pool.xa))
+				rxe_vhca_clear_image(rxe);
 			if (rxe->vhca_image) {
 				err = rxe_vhca_bind_context(rxe, req.ufile_id);
 				if (err) {
@@ -304,6 +306,12 @@ static void rxe_dealloc_ucontext(struct ib_ucontext *ibuc)
 	err = rxe_cleanup(uc);
 	if (err)
 		rxe_err_uc(uc, "cleanup failed, err = %d\n", err);
+	if (uc->restore_mode) {
+		mutex_lock(&rxe->vhca_lock);
+		if (xa_empty(&rxe->uc_pool.xa))
+			rxe_vhca_clear_image(rxe);
+		mutex_unlock(&rxe->vhca_lock);
+	}
 }
 
 static void rxe_disassociate_ucontext(struct ib_ucontext *ibuc)

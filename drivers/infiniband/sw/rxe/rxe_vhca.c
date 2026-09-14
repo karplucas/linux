@@ -506,6 +506,16 @@ void rxe_vhca_clear_contexts(struct rxe_dev *rxe)
 	xa_init(&rxe->vhca_contexts);
 }
 
+void rxe_vhca_clear_image(struct rxe_dev *rxe)
+{
+	lockdep_assert_held(&rxe->vhca_lock);
+
+	rxe_vhca_clear_contexts(rxe);
+	kvfree(rxe->vhca_image);
+	rxe->vhca_image = NULL;
+	rxe->vhca_image_length = 0;
+}
+
 int rxe_vhca_index_contexts(struct rxe_dev *rxe)
 {
 	struct rxe_vhca_context_header header;
