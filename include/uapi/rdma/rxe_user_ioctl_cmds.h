@@ -43,10 +43,10 @@
  *             QUERY_QP, never popped -- so a CQ could pop a QP ring's
  *             offset).
  *
- *   RESUME_VHCA  validate restored queue headers and synchronize the
- *             kernel-owned queue indices after CRIU has copied all RXE queue
- *             mappings. Valid only on a restore-mode ucontext while its QPs
- *             remain frozen.
+ *   RESUME_VHCA  validate restored queue headers, synchronize kernel-owned
+ *             queue indices, apply staged private state, and resume every
+ *             restored context on the RXE device. Valid only on a
+ *             restore-mode ucontext.
  */
 #ifndef RXE_USER_IOCTL_CMDS_H
 #define RXE_USER_IOCTL_CMDS_H
