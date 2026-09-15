@@ -29,3 +29,4 @@ rdma_rxe-y := \
 	rxe_ns.o
 
 rdma_rxe-$(CONFIG_INFINIBAND_ON_DEMAND_PAGING) += rxe_odp.o
+rdma_rxe-$(CONFIG_KUNIT) += rxe_vhca_test.o
