@@ -1473,6 +1473,12 @@ static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 					    "restore cq queue images are unsupported\n");
 				goto err_out;
 			}
+			if (req.notify & ~IB_CQ_SOLICITED_MASK) {
+				err = -EINVAL;
+				rxe_dbg_dev(rxe,
+					    "restore cq notify value is invalid\n");
+				goto err_out;
+			}
 			forced_vm_pgoff = req.vm_pgoff;
 		} else if (udata->inlen != 0) {
 			err = -EINVAL;
@@ -1504,6 +1510,8 @@ static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 		rxe_dbg_cq(cq, "restore cq failed, err = %d\n", err);
 		goto err_cleanup;
 	}
+	cq->restore_notify = req.notify;
+	cq->restore_pending = true;
 
 	rxe_dbg_cq(cq,
 		   "restore cq: cqe=%d forced_vm_pgoff=0x%llx\n",

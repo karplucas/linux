@@ -72,6 +72,9 @@ struct rxe_cq {
 	struct rxe_queue	*queue;
 	spinlock_t		cq_lock;
 	u8			notify;
+	u8			restore_notify;
+	bool			restore_pending;
+	bool			restore_finalized;
 	bool			is_user;
 	atomic_t		num_wq;
 };
